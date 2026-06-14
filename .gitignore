@@ -1,0 +1,36 @@
+# ── API Keys & Secrets ──────────────────────────────────────────
+.env
+*.pem
+*.key
+
+# ── Generated output (runtime artifacts) ─────────────────────────
+output/
+!output/.gitkeep
+
+# ── API config archives (contains keys) ──────────────────────────
+settings_ui.json
+projects.json
+
+# ── Python ───────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyc.bak
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── IDE / Editor ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Checkpoints ──────────────────────────────────────────────────
+*.db

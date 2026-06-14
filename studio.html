@@ -1,0 +1,1085 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 短剧创作平台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #12121a; color: #fff; overflow-x: hidden;
+  }
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: #1e1e2e; }
+  ::-webkit-scrollbar-thumb { background: #3f3f5c; border-radius: 3px; }
+  /* 侧边栏 */
+  .sidebar {
+    width: 200px; height: 100vh; position: fixed; left: 0; top: 0;
+    background: #16162a; border-right: 1px solid #2a2a40;
+    display: flex; flex-direction: column; z-index: 100;
+  }
+  .sidebar-brand { padding: 20px 16px; border-bottom: 1px solid #2a2a40; }
+  .sidebar-nav { flex: 1; padding: 12px 0; }
+  .sidebar-nav a {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 20px; color: #a1a1aa; text-decoration: none;
+    font-size: 13px; transition: all 0.2s;
+    border-left: 3px solid transparent;
+  }
+  .sidebar-nav a:hover, .sidebar-nav a.active {
+    color: #fff; background: rgba(99,102,241,0.1);
+    border-left-color: #6366f1;
+  }
+  .sidebar-footer { padding: 12px 20px; border-top: 1px solid #2a2a40; font-size: 11px; color: #71717a; }
+  /* 主区 */
+  .main { margin-left: 200px; min-height: 100vh; }
+  /* 步骤导航 */
+  .steps { display: flex; gap: 0; padding: 14px 24px; background: #1a1a2e; border-bottom: 1px solid #2a2a40; align-items: center; }
+  .step-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #71717a; padding: 4px 8px; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
+  .step-item.done { color: #10b981; }
+  .step-item.active { color: #fff; background: rgba(99,102,241,0.2); font-weight: 600; }
+  .step-divider { width: 20px; height: 0; border-top: 1px dashed #3f3f5c; margin: 0 2px; }
+  .step-divider.done { border-color: #10b981; }
+  /* 页面容器 */
+  .page { display: none; padding: 24px; }
+  .page.active { display: block; }
+  /* 卡片 */
+  .card {
+    background: #1e1e2e; border: 1px solid #2a2a40; border-radius: 12px;
+    padding: 20px; transition: all 0.2s;
+  }
+  .card:hover { border-color: #6366f1; }
+  /* 按钮 */
+  .btn-primary {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: #fff; border: none; border-radius: 8px;
+    padding: 10px 24px; font-size: 14px; font-weight: 600;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .btn-primary:hover { transform: scale(1.02); box-shadow: 0 4px 16px rgba(99,102,241,0.4); }
+  .btn-secondary {
+    background: #2a2a40; color: #a1a1aa; border: 1px solid #3f3f5c;
+    border-radius: 8px; padding: 8px 20px; font-size: 13px; cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn-secondary:hover { background: #3f3f5c; color: #fff; }
+  .btn-sm { padding: 6px 14px; font-size: 11px; }
+  /* 标签 */
+  .tag {
+    display: inline-block; padding: 4px 12px; border-radius: 6px;
+    font-size: 11px; cursor: pointer; transition: all 0.2s;
+    background: #2a2a40; color: #a1a1aa; border: 1px solid #3f3f5c;
+  }
+  .tag.selected { background: #4f46e5; color: #fff; border-color: #6366f1; }
+  /* 模态 */
+  .modal-overlay {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.6); display: flex; align-items: center;
+    justify-content: center; z-index: 200;
+  }
+  .modal { background: #1e1e2e; border-radius: 16px; padding: 32px; min-width: 480px; max-width: 600px; border: 1px solid #3f3f5c; }
+  /* 输入框 */
+  input[type="text"], textarea, select {
+    background: #12121a; border: 1px solid #3f3f5c; border-radius: 8px;
+    color: #fff; padding: 10px 14px; font-size: 13px; width: 100%;
+    font-family: inherit;
+  }
+  input:focus, textarea:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.1); }
+  textarea { resize: vertical; }
+  /* 网格 */
+  .grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
+  /* Player 占位 */
+  .player-placeholder {
+    background: #000; aspect-ratio: 9/16; max-height: 520px; max-width: 300px;
+    margin: 0 auto; border-radius: 12px; display: flex; align-items: center;
+    justify-content: center; color: #71717a; font-size: 14px;
+    border: 1px solid #2a2a40;
+  }
+  /* Spin */
+  .spin {
+    display: inline-block; width: 16px; height: 16px; border: 2px solid #3f3f5c;
+    border-top-color: #6366f1; border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* Status */
+  .status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; }
+  .status-dot.green { background: #10b981; }
+  .status-dot.yellow { background: #f59e0b; }
+  .status-dot.gray { background: #71717a; }
+</style>
+</head>
+<body>
+
+<!-- ═══ 左侧导航 ═══ -->
+<aside class="sidebar">
+  <div class="sidebar-brand">
+    <div style="font-size:16px;font-weight:700;background:linear-gradient(135deg,#4f46e5,#7c3aed);-webkit-background-clip:text;-webkit-text-fill-color:transparent">
+      🎬 AI 短剧工作室
+    </div>
+    <div style="font-size:10px;color:#71717a;margin-top:4px">7 Agent 协作管线</div>
+  </div>
+  <nav class="sidebar-nav">
+    <a href="#" class="active" data-page="home">🏠 工作台首页</a>
+    <a href="#" data-page="script">📝 剧本编辑</a>
+    <a href="#" data-page="characters">👤 角色设置</a>
+    <a href="#" data-page="scenes">🏙️ 场景设置</a>
+    <a href="#" data-page="shots">🎬 分镜列表</a>
+    <a href="#" data-page="produce">⚙️ 制作预览</a>
+    <a href="#" data-page="works">🎞️ 作品管理</a>
+    <a href="#" data-page="settings" style="margin-top:12px;border-top:1px solid #2a2a40;padding-top:14px">🔧 API 配置</a>
+  </nav>
+  <div class="sidebar-footer">
+    API: <span id="api-status">● 离线</span><br>
+    v1.0 · Mock 模式
+  </div>
+</aside>
+
+<!-- ═══ 主内容区 ═══ -->
+<div class="main">
+  <!-- 步骤导航 -->
+  <div class="steps" id="step-nav">
+    <span class="step-item active" data-page="script">1 剧本</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="characters">2 角色</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="scenes">3 场景</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="shots">4 分镜</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="produce">5 制作</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="works">6 作品</span>
+  </div>
+
+  <!-- ═══════════ 页面 0: 工作台首页 ═══════════ -->
+  <div class="page active" id="page-home">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+      <h2 style="font-size:20px;font-weight:700">我的项目</h2>
+      <button class="btn-primary" onclick="openNewProjectModal()">+ 新建项目</button>
+    </div>
+    <div class="grid-cards" id="project-list">
+      <div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">
+        暂无项目，点击「新建项目」开始创作
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 2: 剧本编辑 ═══════════ -->
+  <div class="page" id="page-script">
+    <div style="display:flex;gap:24px">
+      <div style="flex:2">
+        <h3 style="margin-bottom:12px">剧本输入</h3>
+        <textarea id="script-input" rows="18" maxlength="3000"
+          placeholder="输入你的故事创意，或粘贴已有的完整剧本……&#10;&#10;示例：一个穿越到古代的程序员，用代码思维破解了宫斗迷局……"
+          style="font-size:14px;line-height:1.7"></textarea>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+          <span style="color:#71717a;font-size:12px" id="char-count">0 / 3000 字</span>
+          <div style="display:flex;gap:8px">
+            <button class="btn-secondary" onclick="generateScript()" id="btn-gen-script">
+              🤖 AI 生成剧本
+            </button>
+            <button class="btn-primary" onclick="extractNext('characters')">
+              提取角色和场景 →
+            </button>
+          </div>
+        </div>
+        <div id="script-result" style="margin-top:16px"></div>
+      </div>
+      <div style="flex:1;min-width:200px">
+        <div class="card" style="margin-bottom:12px">
+          <h4 style="font-size:13px;margin-bottom:8px;color:#a1a1aa">当前项目</h4>
+          <div id="project-info" style="font-size:12px">未创建项目</div>
+        </div>
+        <div class="card">
+          <h4 style="font-size:13px;margin-bottom:8px;color:#a1a1aa">AI 生成状态</h4>
+          <div id="gen-status" style="font-size:12px;color:#71717a">等待输入</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 3: 角色设置 ═══════════ -->
+  <div class="page" id="page-characters">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3>角色列表</h3>
+      <div style="display:flex;gap:8px">
+        <button class="btn-secondary btn-sm" onclick="reExtractRoles()">🔄 重新提取</button>
+        <button class="btn-primary btn-sm" onclick="generateRoleImages()">🎨 生成形象图</button>
+        <button class="btn-secondary btn-sm" onclick="addManualRole()">+ 手动添加</button>
+      </div>
+    </div>
+    <div class="grid-cards" id="role-cards">
+      <div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">
+        请先在剧本编辑页生成剧本并提取角色
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 4: 场景设置 ═══════════ -->
+  <div class="page" id="page-scenes">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3>场景列表</h3>
+      <div style="display:flex;gap:8px">
+        <button class="btn-secondary btn-sm" onclick="reExtractScenes()">🔄 重新提取</button>
+        <button class="btn-primary btn-sm" onclick="generateSceneImages()">🖼️ 生成背景图</button>
+        <button class="btn-secondary btn-sm" onclick="addManualScene()">+ 手动添加</button>
+      </div>
+    </div>
+    <div class="grid-cards" id="scene-cards">
+      <div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">
+        请先在剧本编辑页生成剧本并提取场景
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 5: 分镜列表 ═══════════ -->
+  <div class="page" id="page-shots">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3>分镜列表</h3>
+      <div style="display:flex;gap:8px">
+        <button class="btn-secondary btn-sm" onclick="extractShots()">📋 提取分镜</button>
+        <button class="btn-secondary btn-sm" onclick="insertShot()">+ 插入分镜</button>
+      </div>
+    </div>
+    <div id="shot-list">
+      <div style="color:#71717a;padding:40px;text-align:center">
+        请先在剧本编辑页生成剧本，然后提取分镜
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 6: 制作预览 ═══════════ -->
+  <div class="page" id="page-produce">
+    <div style="display:flex;gap:24px">
+      <div style="flex:1;max-width:260px">
+        <h4 style="margin-bottom:8px">分镜时长</h4>
+        <div id="shot-duration-list" style="color:#71717a;font-size:12px">暂无分镜数据</div>
+      </div>
+      <div style="flex:2;text-align:center">
+        <div class="player-placeholder" id="preview-player">
+          <span>📺 预览区<br><span style="font-size:11px">生成后显示</span></span>
+        </div>
+      </div>
+      <div style="flex:1;min-width:220px">
+        <div class="card" style="margin-bottom:12px">
+          <h4 style="font-size:13px;margin-bottom:8px;color:#a1a1aa">参数配置</h4>
+          <div style="font-size:12px">
+            <label style="color:#71717a">镜头类型</label>
+            <select id="shot-type" style="margin-bottom:8px">
+              <option>close-up</option><option>medium shot</option><option>wide shot</option>
+            </select>
+            <label style="color:#71717a">提示词</label>
+            <textarea id="shot-prompt" rows="4" style="font-size:11px" placeholder="编辑提示词…"></textarea>
+          </div>
+        </div>
+        <button class="btn-primary" onclick="generateVideos()" style="width:100%">🎬 批量生成</button>
+        <div id="gen-progress" style="margin-top:8px;font-size:12px;color:#71717a"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 7: 作品管理 ═══════════ -->
+  <div class="page" id="page-works">
+    <h3 style="margin-bottom:16px">我的作品</h3>
+    <div class="grid-cards" id="works-list">
+      <div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">
+        📺 暂无作品<br><span style="font-size:12px">完成全部制作流程后，合成的短剧将在这里展示</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 8: API 配置 ═══════════ -->
+  <div class="page" id="page-settings">
+    <h3 style="margin-bottom:4px">API 配置</h3>
+    <p style="color:#71717a;font-size:11px;margin-bottom:14px">配置保存后提示重启；支持多组档案切换、导入导出；服务商切换时自动联动字段</p>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px" id="settings-grid">
+
+      <!-- ══ 全局代理 ══ -->
+      <div class="card" style="grid-column:1/-1">
+        <h4 style="font-size:13px;margin-bottom:8px;color:#a1a1aa">🌐 全局代理</h4>
+        <div style="display:flex;gap:12px;align-items:center">
+          <label style="font-size:11px;color:#71717a;white-space:nowrap">HTTP 代理</label>
+          <input type="text" id="cfg-proxy" placeholder="http://127.0.0.1:7890" style="flex:1">
+          <span style="font-size:10px;color:#71717a">国内用户访问海外 API 需配置</span>
+        </div>
+      </div>
+
+      <!-- ══ LLM ══ -->
+      <div class="card" id="card-llm">
+        <h4 style="font-size:13px;margin-bottom:10px;color:#a1a1aa">🧠 大语言模型</h4>
+        <div class="cfg-row"><label>服务商</label><select id="cfg-llm-provider" onchange="onProviderChange('llm')">
+          <option value="anthropic">Anthropic</option><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option>
+        </select></div>
+        <div class="cfg-row"><label>模型</label><select id="cfg-llm-model"><option value="">--</option></select></div>
+        <div class="cfg-row"><label>API Key</label><span style="position:relative;flex:1"><input type="password" id="cfg-llm-key" placeholder="sk-..."><span class="eye-toggle" onclick="togglePwd('cfg-llm-key')">👁</span></span></div>
+        <div class="cfg-row"><label>Base URL</label><input type="text" id="cfg-llm-base" placeholder="留空使用默认"></div>
+        <div class="cfg-row-3">
+          <span><label>温度</label><input type="number" id="cfg-llm-temp" value="0.7" step="0.1" min="0" max="2"></span>
+          <span><label>Top P</label><input type="number" id="cfg-llm-topp" value="0.9" step="0.05" min="0" max="1"></span>
+          <span><label>超时(s)</label><input type="number" id="cfg-llm-timeout" value="60"></span>
+        </div>
+        <div class="cfg-row"><label>流式输出</label><select id="cfg-llm-stream"><option value="true">开启</option><option value="false">关闭</option></select></div>
+        <button class="btn-secondary btn-sm" onclick="testConnection('llm')">🧪 测试连接</button>
+        <span id="cfg-llm-test" style="font-size:10px;margin-left:8px"></span>
+      </div>
+
+      <!-- ══ TTS ══ -->
+      <div class="card" id="card-tts">
+        <h4 style="font-size:13px;margin-bottom:10px;color:#a1a1aa">🔊 TTS 语音合成</h4>
+        <div class="cfg-row"><label>服务商</label><select id="cfg-tts-provider" onchange="onProviderChange('tts')">
+          <option value="edge">Edge-TTS (免费)</option><option value="openai">OpenAI TTS</option><option value="azure">Azure TTS</option>
+        </select></div>
+        <div class="cfg-row"><label>API Key</label><span style="position:relative;flex:1"><input type="password" id="cfg-tts-key" placeholder="Edge-TTS 无需 Key"><span class="eye-toggle" onclick="togglePwd('cfg-tts-key')">👁</span></span></div>
+        <div class="cfg-row"><label>Base URL</label><input type="text" id="cfg-tts-base" placeholder="留空使用默认"></div>
+        <div class="cfg-row"><label>声音</label><select id="cfg-tts-voice">
+          <option value="zh-CN-XiaoxiaoNeural">晓晓 (女声)</option><option value="zh-CN-YunxiNeural">云希 (男声)</option><option value="zh-CN-YunyangNeural">云扬 (男声)</option><option value="alloy">OpenAI alloy</option><option value="nova">OpenAI nova</option>
+        </select></div>
+        <div class="cfg-row-2">
+          <span><label>语速</label><input type="number" id="cfg-tts-speed" value="1.0" step="0.1" min="0.5" max="2.0"></span>
+          <span><label>超时(s)</label><input type="number" id="cfg-tts-timeout" value="30"></span>
+        </div>
+        <button class="btn-secondary btn-sm" onclick="testConnection('tts')">🧪 测试连接</button>
+        <span id="cfg-tts-test" style="font-size:10px;margin-left:8px"></span>
+      </div>
+
+      <!-- ══ BGM ══ -->
+      <div class="card" id="card-bgm">
+        <h4 style="font-size:13px;margin-bottom:10px;color:#a1a1aa">🎵 BGM 背景音乐</h4>
+        <div class="cfg-row"><label>服务商</label><select id="cfg-bgm-provider" onchange="onProviderChange('bgm')">
+          <option value="mock">Mock (静音占位)</option><option value="suno">Suno AI</option>
+        </select></div>
+        <div class="cfg-row"><label>API Key</label><span style="position:relative;flex:1"><input type="password" id="cfg-bgm-key" placeholder="Mock 无需 Key"><span class="eye-toggle" onclick="togglePwd('cfg-bgm-key')">👁</span></span></div>
+        <div class="cfg-row"><label>Base URL</label><input type="text" id="cfg-bgm-base" placeholder="留空使用默认"></div>
+        <div class="cfg-row-2">
+          <span><label>默认时长(s)</label><input type="number" id="cfg-bgm-dur" value="60"></span>
+          <span><label>超时(s)</label><input type="number" id="cfg-bgm-timeout" value="120"></span>
+        </div>
+        <button class="btn-secondary btn-sm" onclick="testConnection('bgm')">🧪 测试连接</button>
+        <span id="cfg-bgm-test" style="font-size:10px;margin-left:8px"></span>
+      </div>
+
+      <!-- ══ 视频 ══ -->
+      <div class="card" id="card-video">
+        <h4 style="font-size:13px;margin-bottom:10px;color:#a1a1aa">🎬 视频生成 API</h4>
+        <div id="video-mock-warn" style="display:none;background:#7f1d1d;color:#fca5a5;padding:6px 10px;border-radius:6px;font-size:10px;margin-bottom:8px">⚠ Mock模式，无法生成真实视频，请切换服务商并配置密钥</div>
+        <div class="cfg-row"><label>服务商</label><select id="cfg-video-api" onchange="onProviderChange('video')">
+          <option value="mock">Mock (免费占位)</option><option value="kling">可灵 Kling</option><option value="pika">Pika</option>
+        </select></div>
+        <div class="cfg-row" id="row-video-key1"><label id="lbl-video-key1">Access Key</label><span style="position:relative;flex:1"><input type="password" id="cfg-video-key1" placeholder="可灵 AK"><span class="eye-toggle" onclick="togglePwd('cfg-video-key1')">👁</span></span></div>
+        <div class="cfg-row" id="row-video-key2"><label id="lbl-video-key2">Secret Key</label><span style="position:relative;flex:1"><input type="password" id="cfg-video-key2" placeholder="可灵 SK"><span class="eye-toggle" onclick="togglePwd('cfg-video-key2')">👁</span></span></div>
+        <div class="cfg-row"><label>Base URL</label><input type="text" id="cfg-video-base" placeholder="留空使用默认"></div>
+        <div class="cfg-row"><label>模型</label><select id="cfg-video-model"><option value="kling-v2-6">kling-v2-6</option><option value="kling-v2-6-pro">kling-v2-6-pro</option><option value="pika-1.0">pika-1.0</option></select></div>
+        <div class="cfg-row"><label>分辨率</label><select id="cfg-video-mode"><option value="std">标准 720p</option><option value="pro">专业 1080p</option></select></div>
+        <div class="cfg-row-3">
+          <span><label>帧率</label><input type="number" id="cfg-video-fps" value="24"></span>
+          <span><label>最大时长(s)</label><input type="number" id="cfg-video-maxdur" value="10"></span>
+          <span><label>超时(s)</label><input type="number" id="cfg-video-timeout" value="300"></span>
+        </div>
+        <div class="cfg-row"><label>逐帧优化</label><select id="cfg-video-motion"><option value="false">关闭</option><option value="true">开启</option></select></div>
+        <button class="btn-secondary btn-sm" onclick="testConnection('video')">🧪 测试连接</button>
+        <span id="cfg-video-test" style="font-size:10px;margin-left:8px"></span>
+      </div>
+
+      <!-- ══ 图片 ══ -->
+      <div class="card" id="card-image">
+        <h4 style="font-size:13px;margin-bottom:10px;color:#a1a1aa">🖼️ 图片生成 API</h4>
+        <div id="img-mock-warn" style="display:none;background:#7f1d1d;color:#fca5a5;padding:6px 10px;border-radius:6px;font-size:10px;margin-bottom:8px">⚠ Mock模式，无法生成真实图片，请切换服务商并配置密钥</div>
+        <div class="cfg-row"><label>服务商</label><select id="cfg-img-api" onchange="onProviderChange('image')">
+          <option value="mock">Mock (免费占位)</option><option value="openai">OpenAI DALL-E</option><option value="sd">Stable Diffusion</option>
+        </select></div>
+        <div class="cfg-row"><label>API Key</label><span style="position:relative;flex:1"><input type="password" id="cfg-img-key" placeholder="可复用 LLM Key"><span class="eye-toggle" onclick="togglePwd('cfg-img-key')">👁</span></span></div>
+        <div class="cfg-row"><label>Base URL</label><input type="text" id="cfg-img-base" placeholder="自建 SD API 填此"></div>
+        <div class="cfg-row"><label>模型</label><select id="cfg-img-model"><option value="dall-e-3">dall-e-3</option><option value="dall-e-2">dall-e-2</option><option value="sd-xl">SD XL</option></select></div>
+        <div class="cfg-row"><label>正向提示词前缀</label><input type="text" id="cfg-img-prefix" placeholder="所有图片自动加此前缀，如 anime screencap, 8k"></div>
+        <div class="cfg-row"><label>负面提示词</label><input type="text" id="cfg-img-neg" value="low quality, blurry, ugly, deformed"></div>
+        <div class="cfg-row-2">
+          <span><label>角色图尺寸</label><input type="text" id="cfg-img-char-size" value="1024x1024"></span>
+          <span><label>场景图尺寸</label><input type="text" id="cfg-img-scene-size" value="1080x1920"></span>
+        </div>
+        <div class="cfg-row"><label>超时(s)</label><input type="number" id="cfg-img-timeout" value="60"></div>
+        <button class="btn-secondary btn-sm" onclick="testConnection('image')">🧪 测试连接</button>
+        <span id="cfg-img-test" style="font-size:10px;margin-left:8px"></span>
+      </div>
+
+      <!-- ══ 档案管理 ══ -->
+      <div class="card" style="grid-column:1/-1">
+        <h4 style="font-size:13px;margin-bottom:10px;color:#a1a1aa">💾 配置档案管理</h4>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div style="flex:1;min-width:140px"><label style="font-size:10px;color:#71717a">档案名称</label><input type="text" id="cfg-profile-name" placeholder="我的Claude"></div>
+          <div style="flex:2;min-width:200px"><label style="font-size:10px;color:#71717a">已保存档案</label><select id="cfg-profile-select" onchange="loadApiProfile()"><option value="">-- 选择 --</option></select></div>
+          <button class="btn-primary btn-sm" onclick="saveApiConfig()">💾 保存</button>
+          <button class="btn-secondary btn-sm" onclick="deleteApiProfile()">🗑️ 删除</button>
+          <button class="btn-secondary btn-sm" onclick="exportProfile()">📤 导出</button>
+          <button class="btn-secondary btn-sm" onclick="document.getElementById('import-file').click()">📥 导入</button>
+          <input type="file" id="import-file" style="display:none" accept=".json" onchange="importProfile(this)">
+        </div>
+        <div id="cfg-status" style="font-size:11px;margin-top:8px;color:#71717a"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<style>
+.cfg-row { display:flex;align-items:center;gap:8px;margin-bottom:6px }
+.cfg-row label { font-size:11px;color:#71717a;width:80px;flex-shrink:0 }
+.cfg-row input,.cfg-row select { flex:1;font-size:12px;padding:6px 8px }
+.cfg-row-2 { display:flex;gap:10px;margin-bottom:6px }
+.cfg-row-2 span { flex:1 }
+.cfg-row-2 label { font-size:10px;color:#71717a;display:block;margin-bottom:2px }
+.cfg-row-2 input { width:100%;font-size:12px;padding:5px 6px }
+.cfg-row-3 { display:flex;gap:8px;margin-bottom:6px }
+.cfg-row-3 span { flex:1 }
+.cfg-row-3 label { font-size:10px;color:#71717a;display:block;margin-bottom:2px }
+.cfg-row-3 input { width:100%;font-size:12px;padding:5px 6px }
+.eye-toggle { position:absolute;right:8px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:14px;user-select:none;opacity:0.6 }
+.eye-toggle:hover { opacity:1 }
+</style>
+
+<!-- ═══════════ 项目编辑弹窗 ═══════════ -->
+<div class="modal-overlay" id="modal-new-project" style="display:none">
+  <div class="modal">
+    <h3 style="margin-bottom:20px;font-size:18px">新建项目</h3>
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">项目名称</label>
+      <input type="text" id="proj-name" placeholder="输入项目名称" style="margin-top:4px">
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">视频比例</label>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <span class="tag selected" data-ratio="9:16" onclick="selectRatio(this)">竖屏 9:16</span>
+        <span class="tag" data-ratio="16:9" onclick="selectRatio(this)">横屏 16:9</span>
+      </div>
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">剧集类型</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px" id="genre-tags">
+        <span class="tag" onclick="toggleTag(this)">甜宠</span>
+        <span class="tag" onclick="toggleTag(this)">逆袭</span>
+        <span class="tag" onclick="toggleTag(this)">悬疑</span>
+        <span class="tag" onclick="toggleTag(this)">古装</span>
+        <span class="tag" onclick="toggleTag(this)">科幻</span>
+        <span class="tag" onclick="toggleTag(this)">都市</span>
+        <span class="tag" onclick="toggleTag(this)">校园</span>
+      </div>
+    </div>
+    <div style="margin-bottom:20px">
+      <label style="font-size:12px;color:#a1a1aa">艺术风格</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px" id="style-tags">
+        <span class="tag" onclick="toggleTag(this)">写实</span>
+        <span class="tag" onclick="toggleTag(this)">动漫</span>
+        <span class="tag" onclick="toggleTag(this)">赛博朋克</span>
+        <span class="tag" onclick="toggleTag(this)">日系</span>
+        <span class="tag" onclick="toggleTag(this)">国风</span>
+        <span class="tag" onclick="toggleTag(this)">清新</span>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn-secondary" onclick="closeModal('modal-new-project')">取消</button>
+      <button class="btn-primary" onclick="createProject()">创建项目</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  内置 AI 提示词模板（7 套，与后端 src/prompts/templates.py 同步）
+// ═══════════════════════════════════════════════════════════════
+const PROMPT_TEMPLATES = {
+  generateScript: `你是一名资深的AI短剧编剧...（完整模板见后端 prompts/templates.py）`,
+  extractRoles: `你是一名专业的剧本信息提取工程师...（见后端）`,
+  extractScenes: `你是一名专业的剧本信息提取工程师...（见后端）`,
+  extractShots: `你是一名专业的分镜师...（见后端）`,
+  generateRolePrompt: `你是一名专业的AI绘图提示词工程师...（见后端）`,
+  generateScenePrompt: `你是一名专业的AI绘图提示词工程师...（见后端）`,
+  generateShotPrompt: `你是一名专业的AI绘图提示词工程师...（见后端）`
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  全局状态
+// ═══════════════════════════════════════════════════════════════
+// 自动检测：前端与 API 同服务器，直接用当前页面 origin
+const API_BASE = window.location.origin;
+let appState = {
+  projectId: '',
+  projectName: '',
+  videoRatio: '9:16',
+  genreTags: [],
+  artStyle: '',
+  stateJson: '',         // 后端管线状态（JSON 字符串）
+  scriptText: '',
+  roles: [],
+  scenes: [],
+  shots: [],
+  characterImages: [],
+  sceneImages: [],
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  页面导航
+// ═══════════════════════════════════════════════════════════════
+function navigateTo(pageName) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const target = document.getElementById('page-' + pageName);
+  if (target) target.classList.add('active');
+
+  // 侧边栏高亮
+  document.querySelectorAll('.sidebar-nav a').forEach(a => a.classList.remove('active'));
+  const link = document.querySelector(`[data-page="${pageName}"]`);
+  if (link) link.classList.add('active');
+
+  // 步骤导航更新
+  updateStepNav(pageName);
+}
+
+document.querySelectorAll('.sidebar-nav a').forEach(a => {
+  a.addEventListener('click', e => { e.preventDefault(); navigateTo(a.dataset.page); });
+});
+document.querySelectorAll('.step-item').forEach(s => {
+  s.addEventListener('click', e => navigateTo(s.dataset.page));
+});
+
+function updateStepNav(current) {
+  const steps = ['script','characters','scenes','shots','produce','works'];
+  const idx = steps.indexOf(current);
+  document.querySelectorAll('.step-item').forEach((el, i) => {
+    el.classList.remove('active','done');
+    if (i < idx) el.classList.add('done');
+    if (i === idx) el.classList.add('active');
+  });
+  document.querySelectorAll('.step-divider').forEach((el, i) => {
+    el.classList.toggle('done', i < idx);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  模态弹窗
+// ═══════════════════════════════════════════════════════════════
+function openNewProjectModal() { document.getElementById('modal-new-project').style.display = 'flex'; }
+function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+
+function toggleTag(el) { el.classList.toggle('selected'); }
+function selectRatio(el) {
+  el.parentElement.querySelectorAll('.tag').forEach(t => t.classList.remove('selected'));
+  el.classList.add('selected');
+  appState.videoRatio = el.dataset.ratio;
+}
+
+function createProject() {
+  const name = document.getElementById('proj-name').value || '未命名项目';
+  const genres = [...document.querySelectorAll('#genre-tags .selected')].map(t => t.textContent);
+  const styles = [...document.querySelectorAll('#style-tags .selected')].map(t => t.textContent);
+
+  appState.projectName = name;
+  appState.genreTags = genres;
+  appState.artStyle = styles.join('、') || '写实';
+  appState.videoRatio = document.querySelector('[data-ratio].selected')?.dataset?.ratio || '9:16';
+
+  document.getElementById('project-info').innerHTML = `
+    <b>${name}</b><br>
+    类型: ${genres.join('、') || '未选择'}<br>
+    风格: ${appState.artStyle}<br>
+    比例: ${appState.videoRatio}
+  `;
+
+  closeModal('modal-new-project');
+  navigateTo('script');
+  updateStatus('项目已创建，请输入剧本或点击 AI 生成');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  字数统计
+// ═══════════════════════════════════════════════════════════════
+document.getElementById('script-input').addEventListener('input', function() {
+  document.getElementById('char-count').textContent = `${this.value.length} / 3000 字`;
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  API 调用辅助
+// ═══════════════════════════════════════════════════════════════
+async function apiCall(endpoint, data) {
+  updateStatus('⏳ 调用 AI 中…');
+  try {
+    const res = await fetch(`${API_BASE}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) { const err = await res.json(); throw new Error(err.detail || '请求失败'); }
+    const json = await res.json();
+    updateStatus('✅ 完成');
+    return json;
+  } catch (e) {
+    updateStatus('❌ 错误: ' + e.message);
+    console.error(e);
+    return null;
+  }
+}
+
+function updateStatus(msg) {
+  document.getElementById('gen-status').innerHTML = msg;
+  // 更新 API 状态灯
+  fetch(`${API_BASE}/api/health`).then(r => r.json()).then(j => {
+    document.getElementById('api-status').innerHTML = '<span class="status-dot green"></span>已连接';
+  }).catch(() => {
+    document.getElementById('api-status').innerHTML = '<span class="status-dot gray"></span>离线(Mock)';
+  });
+}
+
+function showLoading(btnId) {
+  const btn = document.getElementById(btnId);
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 生成中…'; }
+}
+function hideLoading(btnId, text) {
+  const btn = document.getElementById(btnId);
+  if (btn) { btn.disabled = false; btn.innerHTML = text; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  核心功能：AI 生成剧本
+// ═══════════════════════════════════════════════════════════════
+async function generateScript() {
+  const userInput = document.getElementById('script-input').value;
+  if (!userInput) return updateStatus('⚠️ 请先输入故事创意');
+
+  showLoading('btn-gen-script');
+  const result = await apiCall('/api/script', {
+    user_input: userInput,
+    genre_tags: appState.genreTags.join('、') || '都市',
+    art_style: appState.artStyle || '写实',
+    video_ratio: appState.videoRatio,
+  });
+
+  if (result) {
+    appState.projectId = result.project_id;
+    if (result.script) {
+      document.getElementById('script-input').value = JSON.stringify(result.script, null, 2);
+      document.getElementById('char-count').textContent =
+        `${document.getElementById('script-input').value.length} / 3000 字`;
+      appState.scriptText = JSON.stringify(result.script, null, 2);
+      // 提取角色
+      if (result.visual_design?.global_character_descriptions) {
+        const chars = result.visual_design.global_character_descriptions;
+        appState.roles = Object.entries(chars).map(([name, desc]) => ({
+          name, gender: '未知', age: '成年', identity: '', personality: desc, clothes: '', description: desc
+        }));
+        renderRoles();
+      }
+      // 提取场景
+      if (result.script?.scenes) {
+        appState.scenes = result.script.scenes.map(s => ({
+          name: `${s.location}-${s.emotion_tone}`,
+          time: s.emotion_tone,
+          environment: s.action_description,
+          camera: s.camera_direction,
+          description: s.action_description,
+        }));
+        renderScenes();
+        // 提取分镜
+        appState.shots = result.script.scenes.map(s => ({
+          desc: s.action_description,
+          role: (s.characters || [])[0] || '',
+          scene: `${s.location}-${s.emotion_tone}`,
+          duration: s.duration_sec,
+        }));
+        renderShots();
+      }
+    }
+    document.getElementById('gen-status').innerHTML =
+      `<span style="color:#10b981">✅ 剧本已生成 (ID: ${result.project_id})</span>`;
+  }
+  hideLoading('btn-gen-script', '🤖 AI 生成剧本');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  角色渲染
+// ═══════════════════════════════════════════════════════════════
+function renderRoles() {
+  const container = document.getElementById('role-cards');
+  if (!appState.roles.length) {
+    container.innerHTML = '<div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">暂无角色</div>';
+    return;
+  }
+  container.innerHTML = appState.roles.map((r, i) => `
+    <div class="card" style="position:relative">
+      <div class="player-placeholder" style="max-height:180px;margin-bottom:12px;font-size:11px">
+        ${appState.characterImages[i]?.path
+          ? `<img src="${appState.characterImages[i].path}" style="width:100%;height:100%;object-fit:cover;border-radius:8px">`
+          : `👤 ${r.name}`}
+      </div>
+      <h4 style="margin-bottom:4px">${r.name}</h4>
+      <div style="font-size:11px;color:#a1a1aa;display:flex;flex-wrap:wrap;gap:4px">
+        <span class="tag">${r.gender || '未知'}</span>
+        <span class="tag">${r.identity || '角色'}</span>
+        <span class="tag">${r.personality?.slice(0,12) || ''}</span>
+      </div>
+      <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.5">${r.description?.slice(0,80) || ''}</div>
+    </div>
+  `).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  场景渲染
+// ═══════════════════════════════════════════════════════════════
+function renderScenes() {
+  const container = document.getElementById('scene-cards');
+  if (!appState.scenes.length) {
+    container.innerHTML = '<div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">暂无场景</div>';
+    return;
+  }
+  container.innerHTML = appState.scenes.map((s, i) => `
+    <div class="card">
+      <div class="player-placeholder" style="max-height:160px;margin-bottom:12px;font-size:11px">
+        🏙️ ${s.name}
+      </div>
+      <h4 style="margin-bottom:4px">${s.name}</h4>
+      <div style="font-size:11px;color:#a1a1aa">⏰ ${s.time || ''} · 📷 ${s.camera || ''}</div>
+      <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.5">${s.description?.slice(0,60) || ''}</div>
+    </div>
+  `).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  分镜渲染
+// ═══════════════════════════════════════════════════════════════
+function renderShots() {
+  const container = document.getElementById('shot-list');
+  if (!appState.shots.length) {
+    container.innerHTML = '<div style="color:#71717a;padding:40px;text-align:center">暂无分镜</div>';
+    return;
+  }
+  container.innerHTML = appState.shots.map((s, i) => `
+    <div class="card" style="display:flex;gap:16px;margin-bottom:12px;align-items:center">
+      <div style="width:80px;height:120px;background:#12121a;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:20px">
+        🎬
+      </div>
+      <div style="flex:1">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <span class="tag">镜头 ${i+1}</span>
+          <span class="tag">${s.duration || 5}s</span>
+          <span class="tag">${s.scene || ''}</span>
+        </div>
+        <p style="font-size:12px;color:#a1a1aa;line-height:1.5;margin-bottom:6px">${s.desc?.slice(0,100) || ''}</p>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <span style="font-size:10px;color:#71717a">角色: ${s.role || '未绑定'}</span>
+          <span style="font-size:10px;color:#71717a">场景: ${s.scene || '未绑定'}</span>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  功能占位（连接后端 / Mock 演示）
+// ═══════════════════════════════════════════════════════════════
+function extractNext(target) {
+  const input = document.getElementById('script-input').value;
+  if (!input) return updateStatus('⚠️ 请先生成或输入剧本');
+  if (!appState.roles.length) updateStatus('⚠️ 请先 AI 生成剧本以提取角色和场景');
+  else navigateTo(target);
+}
+
+async function generateRoleImages() {
+  if (!appState.stateJson && !appState.projectId) return updateStatus('⚠️ 请先运行 AI 生成剧本');
+  await apiCall('/api/characters', { state_json: appState.stateJson });
+  renderRoles();
+}
+
+async function generateSceneImages() {
+  await apiCall('/api/scenes', { state_json: appState.stateJson });
+  renderScenes();
+}
+
+async function extractShots() {
+  // 使用剧本中的 scenes 数据作为分镜
+  if (appState.shots.length) { renderShots(); return; }
+  updateStatus('⚠️ 请先 AI 生成剧本');
+}
+
+async function generateVideos() {
+  if (!appState.stateJson) return updateStatus('⚠️ 请先完成前序步骤');
+  updateStatus('⏳ 正在生成视频片段…');
+  const result = await apiCall('/api/videos', { state_json: appState.stateJson });
+  if (result) appState.stateJson = result.state_json;
+  document.getElementById('gen-progress').innerHTML = result
+    ? '<span style="color:#10b981">✅ 视频生成完成</span>'
+    : '<span style="color:#ef4444">❌ 生成失败</span>';
+}
+
+function reExtractRoles() { updateStatus('🔄 重新提取角色（此功能需后端支持）'); }
+function reExtractScenes() { updateStatus('🔄 重新提取场景（此功能需后端支持）'); }
+function addManualRole() { updateStatus('📝 手动添加角色表单（待实现）'); }
+function addManualScene() { updateStatus('📝 手动添加场景表单（待实现）'); }
+function insertShot() { updateStatus('📋 插入分镜表单（待实现）'); }
+
+// ═══════════════════════════════════════════════════════════════
+//  启动
+// ═══════════════════════════════════════════════════════════════
+// 检查 API 连接
+fetch(`${API_BASE}/api/health`).then(r => r.json()).then(j => {
+  document.getElementById('api-status').innerHTML = '<span class="status-dot green"></span>已连接';
+  loadProfileList();
+}).catch(() => {});
+
+// ═══════════════════════════════════════════════════════════════
+//  API 配置功能
+// ═══════════════════════════════════════════════════════════════
+
+// ── 服务商联动配置 ──
+const PROVIDER_MODELS = {
+  llm: {
+    anthropic: ['claude-sonnet-4-6','claude-opus-4-8','claude-haiku-4-5-20251001'],
+    openai: ['gpt-4o','gpt-4o-mini','gpt-4-turbo'],
+    deepseek: ['deepseek-chat','deepseek-reasoner'],
+  },
+};
+
+function onProviderChange(type) {
+  if (type === 'llm') {
+    const p = document.getElementById('cfg-llm-provider').value;
+    const sel = document.getElementById('cfg-llm-model');
+    const models = PROVIDER_MODELS.llm[p] || [];
+    sel.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
+    document.getElementById('cfg-llm-base').placeholder = p === 'deepseek' ? 'https://api.deepseek.com' : '留空使用默认';
+  }
+  if (type === 'tts') {
+    const p = document.getElementById('cfg-tts-provider').value;
+    document.getElementById('cfg-tts-key').placeholder = p === 'edge' ? 'Edge-TTS 无需 Key' : 'sk-...';
+  }
+  if (type === 'video') {
+    const p = document.getElementById('cfg-video-api').value;
+    const isKling = p === 'kling';
+    document.getElementById('row-video-key1').style.display = isKling ? 'flex' : 'none';
+    document.getElementById('row-video-key2').style.display = isKling ? 'flex' : 'none';
+    document.getElementById('lbl-video-key1').textContent = isKling ? 'Access Key' : 'API Key';
+    document.getElementById('lbl-video-key2').textContent = isKling ? 'Secret Key' : '';
+    document.getElementById('video-mock-warn').style.display = p === 'mock' ? 'block' : 'none';
+    if (!isKling && p !== 'mock') {
+      document.getElementById('row-video-key1').style.display = 'flex';
+      document.getElementById('lbl-video-key1').textContent = 'API Key';
+    }
+  }
+  if (type === 'image') {
+    const p = document.getElementById('cfg-img-api').value;
+    document.getElementById('img-mock-warn').style.display = p === 'mock' ? 'block' : 'none';
+  }
+  if (type === 'bgm') {
+    const p = document.getElementById('cfg-bgm-provider').value;
+  }
+}
+
+// ── 密码显示切换 ──
+function togglePwd(id) {
+  const el = document.getElementById(id);
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+// ── 收集所有配置字段 ──
+function collectSettings(profileName) {
+  return {
+    profile_name: profileName || document.getElementById('cfg-profile-name').value || '默认配置',
+    http_proxy: document.getElementById('cfg-proxy').value,
+    llm_provider: document.getElementById('cfg-llm-provider').value,
+    llm_model: document.getElementById('cfg-llm-model').value,
+    llm_key: document.getElementById('cfg-llm-key').value,
+    llm_base_url: document.getElementById('cfg-llm-base').value,
+    llm_timeout: document.getElementById('cfg-llm-timeout').value,
+    llm_stream: document.getElementById('cfg-llm-stream').value,
+    llm_temperature: document.getElementById('cfg-llm-temp').value,
+    llm_top_p: document.getElementById('cfg-llm-topp').value,
+    tts_provider: document.getElementById('cfg-tts-provider').value,
+    tts_key: document.getElementById('cfg-tts-key').value,
+    tts_base_url: document.getElementById('cfg-tts-base').value,
+    tts_voice: document.getElementById('cfg-tts-voice').value,
+    tts_speed: document.getElementById('cfg-tts-speed').value,
+    tts_timeout: document.getElementById('cfg-tts-timeout').value,
+    bgm_provider: document.getElementById('cfg-bgm-provider').value,
+    bgm_key: document.getElementById('cfg-bgm-key').value,
+    bgm_base_url: document.getElementById('cfg-bgm-base').value,
+    bgm_duration: document.getElementById('cfg-bgm-dur').value,
+    bgm_timeout: document.getElementById('cfg-bgm-timeout').value,
+    default_video_api: document.getElementById('cfg-video-api').value,
+    video_base_url: document.getElementById('cfg-video-base').value,
+    kling_access_key: document.getElementById('cfg-video-key1').value,
+    kling_secret_key: document.getElementById('cfg-video-key2').value,
+    kling_model: document.getElementById('cfg-video-model').value,
+    kling_mode: document.getElementById('cfg-video-mode').value,
+    video_fps: document.getElementById('cfg-video-fps').value,
+    video_max_duration: document.getElementById('cfg-video-maxdur').value,
+    video_motion_opt: document.getElementById('cfg-video-motion').value,
+    video_timeout: document.getElementById('cfg-video-timeout').value,
+    image_gen_api: document.getElementById('cfg-img-api').value,
+    image_gen_key: document.getElementById('cfg-img-key').value,
+    image_gen_base_url: document.getElementById('cfg-img-base').value,
+    image_gen_model: document.getElementById('cfg-img-model').value,
+    image_prefix_prompt: document.getElementById('cfg-img-prefix').value,
+    image_negative_prompt: document.getElementById('cfg-img-neg').value,
+    image_char_size: document.getElementById('cfg-img-char-size').value,
+    image_scene_size: document.getElementById('cfg-img-scene-size').value,
+    image_timeout: document.getElementById('cfg-img-timeout').value,
+  };
+}
+
+function populateSettings(p) {
+  const set = (id, val) => { const el = document.getElementById(id); if (el && val !== undefined) el.value = val; };
+  set('cfg-proxy', p.http_proxy || '');
+  set('cfg-llm-provider', p.llm_provider || 'anthropic'); onProviderChange('llm');
+  set('cfg-llm-model', p.llm_model || '');
+  set('cfg-llm-key', p.llm_key || '');
+  set('cfg-llm-base', p.llm_base_url || '');
+  set('cfg-llm-timeout', p.llm_timeout || '60');
+  set('cfg-llm-stream', p.llm_stream || 'true');
+  set('cfg-llm-temp', p.llm_temperature || '0.7');
+  set('cfg-llm-topp', p.llm_top_p || '0.9');
+  set('cfg-tts-provider', p.tts_provider || 'edge'); onProviderChange('tts');
+  set('cfg-tts-key', p.tts_key || '');
+  set('cfg-tts-base', p.tts_base_url || '');
+  set('cfg-tts-voice', p.tts_voice || 'zh-CN-XiaoxiaoNeural');
+  set('cfg-tts-speed', p.tts_speed || '1.0');
+  set('cfg-tts-timeout', p.tts_timeout || '30');
+  set('cfg-bgm-provider', p.bgm_provider || 'mock'); onProviderChange('bgm');
+  set('cfg-bgm-key', p.bgm_key || '');
+  set('cfg-bgm-base', p.bgm_base_url || '');
+  set('cfg-bgm-dur', p.bgm_duration || '60');
+  set('cfg-bgm-timeout', p.bgm_timeout || '120');
+  set('cfg-video-api', p.default_video_api || 'mock'); onProviderChange('video');
+  set('cfg-video-base', p.video_base_url || '');
+  set('cfg-video-key1', p.kling_access_key || '');
+  set('cfg-video-key2', p.kling_secret_key || '');
+  set('cfg-video-model', p.kling_model || 'kling-v2-6');
+  set('cfg-video-mode', p.kling_mode || 'std');
+  set('cfg-video-fps', p.video_fps || '24');
+  set('cfg-video-maxdur', p.video_max_duration || '10');
+  set('cfg-video-motion', p.video_motion_opt || 'false');
+  set('cfg-video-timeout', p.video_timeout || '300');
+  set('cfg-img-api', p.image_gen_api || 'mock'); onProviderChange('image');
+  set('cfg-img-key', p.image_gen_key || '');
+  set('cfg-img-base', p.image_gen_base_url || '');
+  set('cfg-img-model', p.image_gen_model || '');
+  set('cfg-img-prefix', p.image_prefix_prompt || '');
+  set('cfg-img-neg', p.image_negative_prompt || 'low quality, blurry, ugly, deformed');
+  set('cfg-img-char-size', p.image_char_size || '1024x1024');
+  set('cfg-img-scene-size', p.image_scene_size || '1080x1920');
+  set('cfg-img-timeout', p.image_timeout || '60');
+}
+
+// ── 保存 / 加载 / 删除 ──
+async function saveApiConfig() {
+  const data = collectSettings();
+  try {
+    const res = await fetch(`${API_BASE}/api/settings`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data),
+    });
+    const r = await res.json();
+    document.getElementById('cfg-status').innerHTML = `<span style="color:#10b981">${r.message}</span> <button class="btn-primary btn-sm" onclick="if(confirm('确定重启服务？')){fetch('${API_BASE}/api/health').then(()=>alert('请手动重启 python api_server.py'))}" style="margin-left:8px">🔄 立即重启</button>`;
+    loadProfileList();
+  } catch(e) {
+    document.getElementById('cfg-status').innerHTML = `<span style="color:#ef4444">保存失败: ${e.message}</span>`;
+  }
+}
+
+async function loadApiProfile() {
+  const name = document.getElementById('cfg-profile-select').value;
+  if (!name) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/settings/${encodeURIComponent(name)}`);
+    const p = await res.json();
+    populateSettings(p);
+    document.getElementById('cfg-profile-name').value = name;
+    document.getElementById('cfg-status').innerHTML = '<span style="color:#10b981">已加载</span>';
+  } catch(e) {
+    document.getElementById('cfg-status').innerHTML = '<span style="color:#ef4444">加载失败</span>';
+  }
+}
+
+async function deleteApiProfile() {
+  const name = document.getElementById('cfg-profile-select').value;
+  if (!name || !confirm('确认删除档案 "' + name + '"？')) return;
+  try {
+    await fetch(`${API_BASE}/api/settings/${encodeURIComponent(name)}`, {method:'DELETE'});
+    document.getElementById('cfg-status').innerHTML = '<span style="color:#10b981">已删除</span>';
+    loadProfileList();
+  } catch(e) {
+    document.getElementById('cfg-status').innerHTML = '<span style="color:#ef4444">删除失败</span>';
+  }
+}
+
+async function loadProfileList() {
+  try {
+    const res = await fetch(`${API_BASE}/api/settings`);
+    const data = await res.json();
+    const sel = document.getElementById('cfg-profile-select');
+    const names = Object.keys(data.profiles || {});
+    sel.innerHTML = names.length
+      ? '<option value="">-- 选择档案 --</option>' + names.map(n => `<option value="${n}">${n}</option>`).join('')
+      : '<option value="">-- 暂无档案 --</option>';
+  } catch(e) {}
+}
+
+// ── 导入导出 ──
+function exportProfile() {
+  const name = document.getElementById('cfg-profile-select').value;
+  if (!name) return alert('请先选择要导出的档案');
+  window.open(`${API_BASE}/api/settings/${encodeURIComponent(name)}/export`, '_blank');
+}
+
+function importProfile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async function(e) {
+    try {
+      const data = JSON.parse(e.target.result);
+      data.profile_name = data.profile_name || file.name.replace('.json','');
+      const res = await fetch(`${API_BASE}/api/settings/import`, {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data),
+      });
+      const r = await res.json();
+      document.getElementById('cfg-status').innerHTML = `<span style="color:#10b981">${r.message}</span>`;
+      populateSettings(data);
+      loadProfileList();
+    } catch(ex) {
+      alert('导入失败: ' + ex.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ── 测试连接 ──
+async function testConnection(type) {
+  const statusEl = document.getElementById(`cfg-${type}-test`);
+  statusEl.innerHTML = '<span class="spin"></span>';
+  let body = {};
+  if (type === 'llm') {
+    body = { provider: document.getElementById('cfg-llm-provider').value, key: document.getElementById('cfg-llm-key').value, base_url: document.getElementById('cfg-llm-base').value };
+  } else if (type === 'tts') {
+    body = { provider: document.getElementById('cfg-tts-provider').value, key: document.getElementById('cfg-tts-key').value };
+  } else if (type === 'image') {
+    body = { provider: document.getElementById('cfg-img-api').value, key: document.getElementById('cfg-img-key').value || document.getElementById('cfg-llm-key').value, base_url: document.getElementById('cfg-img-base').value };
+  } else if (type === 'video') {
+    body = { provider: document.getElementById('cfg-video-api').value, key: document.getElementById('cfg-video-key1').value, base_url: document.getElementById('cfg-video-key2').value };
+  } else if (type === 'bgm') {
+    body = { provider: document.getElementById('cfg-bgm-provider').value, key: document.getElementById('cfg-bgm-key').value };
+  }
+  try {
+    const res = await fetch(`${API_BASE}/api/test/${type}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const r = await res.json();
+    statusEl.innerHTML = r.success
+      ? '<span style="color:#10b981">✅ 连接正常</span>'
+      : `<span style="color:#ef4444">❌ ${r.detail||'失败'}</span>`;
+  } catch(e) {
+    statusEl.innerHTML = `<span style="color:#ef4444">❌ ${e.message}</span>`;
+  }
+}
+
+// ── 初始化 ──
+onProviderChange('llm');
+onProviderChange('tts');
+onProviderChange('video');
+onProviderChange('image');
+onProviderChange('bgm');
+
+console.log('🎬 AI 短剧创作平台已就绪');
+console.log('   API 地址:', API_BASE);
+console.log('   内置提示词模板:', Object.keys(PROMPT_TEMPLATES).length, '套');
+</script>
+</body>
+</html>
