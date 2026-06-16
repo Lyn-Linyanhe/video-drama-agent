@@ -8,6 +8,10 @@ class SceneImage(BaseModel):
 
     scene_id: int = Field(description="对应的场景编号")
     location: str = Field(description="场景地点描述")
+    view_type: str = Field(
+        default="wide",
+        description="景别类型: wide(全景建立), medium(中景细节)"
+    )
     image_prompt: str = Field(description="用于生成该场景图的英文提示词")
     image_path: str = Field(description="本地文件路径")
     seed: int = Field(description="生成使用的随机种子")

@@ -26,7 +26,11 @@ class VisualDesign(BaseModel):
     aspect_ratio: str = Field(default="9:16", description="Aspect ratio: 9:16 or 16:9")
     global_character_descriptions: dict[str, str] = Field(
         default_factory=dict,
-        description="Master character appearance registry. Each scene's character_appearance "
-                    "MUST reference and stay consistent with these descriptions."
+        description="Master character appearance registry (English, for API use). "
+                    "Each scene's character_appearance MUST reference and stay consistent with these descriptions."
+    )
+    global_character_descriptions_cn: dict[str, str] = Field(
+        default_factory=dict,
+        description="中文版本的角色外貌描述（供前端展示使用）"
     )
     scenes: list[SceneVisual] = Field(description="Visual design per scene")

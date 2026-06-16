@@ -25,9 +25,8 @@ import uuid
 import json
 
 from src.agents import (
-    ScriptAgent, VisualDesignAgent, PromptEngineeringAgent,
+    ScriptAgent, VisualPromptAgent, ImageGenerationAgent,
     VideoGenerationAgent, ReviewAgent, AudioAgent, AssemblyAgent,
-    CharacterAgent, SceneImageAgent,
 )
 from src.graph.orchestrator import DramaOrchestrator
 from src.graph.state import DramaState
@@ -39,10 +38,8 @@ from src.utils.project_store import ProjectStore
 
 # ── 智能体单例（进程内复用，避免重复初始化） ────────────────────
 script_agent = ScriptAgent()
-visual_agent = VisualDesignAgent()
-prompt_agent = PromptEngineeringAgent()
-character_agent = CharacterAgent(api_client=MockImageClient())
-scene_image_agent = SceneImageAgent(api_client=MockImageClient())
+visual_prompt_agent = VisualPromptAgent()
+image_gen_agent = ImageGenerationAgent(api_client=MockImageClient())
 
 if DEFAULT_API == "kling" and KLING_ACCESS_KEY and KLING_SECRET_KEY:
     video_gen_agent = VideoGenerationAgent(api_client=KlingVideoClient(
@@ -57,11 +54,13 @@ audio_agent = AudioAgent()
 assembly_agent = AssemblyAgent()
 
 orchestrator = DramaOrchestrator(
-    script_agent=script_agent, visual_agent=visual_agent,
-    prompt_agent=prompt_agent, video_gen_agent=video_gen_agent,
-    review_agent=review_agent, audio_agent=audio_agent,
+    script_agent=script_agent,
+    visual_prompt_agent=visual_prompt_agent,
+    image_gen_agent=image_gen_agent,
+    video_gen_agent=video_gen_agent,
+    review_agent=review_agent,
+    audio_agent=audio_agent,
     assembly_agent=assembly_agent,
-    character_agent=character_agent, scene_image_agent=scene_image_agent,
 )
 
 project_store = ProjectStore()

@@ -31,6 +31,10 @@ class CharacterImage(BaseModel):
     """A generated character portrait image."""
 
     character_name: str = Field(description="角色名称")
+    view_type: str = Field(
+        default="portrait",
+        description="视角类型: portrait(正面肖像), profile(3/4侧面), full_body(全身)"
+    )
     image_prompt: str = Field(description="用于生成该图的英文提示词")
     image_path: str = Field(description="本地文件路径")
     seed: int = Field(description="生成使用的随机种子")
@@ -38,6 +42,15 @@ class CharacterImage(BaseModel):
     height: int = Field(default=1024, description="图片高度")
     api_provider: str = Field(default="mock", description="使用的API")
     cost: float = Field(default=0.0, description="生成费用(USD)")
+
+    def is_portrait(self) -> bool:
+        return self.view_type == "portrait"
+
+    def is_profile(self) -> bool:
+        return self.view_type == "profile"
+
+    def is_full_body(self) -> bool:
+        return self.view_type == "full_body"
 
 
 class CharacterImageAssets(BaseModel):

@@ -1,8 +1,12 @@
 """LangGraph orchestrator — builds and runs the multi-agent pipeline.
 
 Supports two modes:
-1. Full pipeline (backward compatible): script → visual → ... → assembly
+1. Full pipeline: script → visual_prompt → image_gen → video_gen → review → audio → assembly
 2. Segmented pipeline: 6 independent stages for interactive UI control
+
+Architecture (7 agents, down from 9):
+  - VisualPromptAgent merges VisualDesign + PromptEngineering (1 LLM call instead of 2)
+  - ImageGenerationAgent merges Character + Scene image generation
 """
 
 from typing import Literal
@@ -15,27 +19,20 @@ from src.config import MAX_REVIEW_LOOPS
 
 def build_drama_graph(
     script_agent,
-    visual_agent,
-    prompt_agent,
+    visual_prompt_agent,
+    image_gen_agent,
     video_gen_agent,
     review_agent,
     audio_agent,
     assembly_agent,
-    character_agent=None,
-    scene_image_agent=None,
 ) -> StateGraph:
     """Build the full LangGraph StateGraph for the video drama pipeline.
 
-    Pipeline flow:
-        script → visual → character_images → scene_images → prompt
-            → video_gen → review
-                ├── pass → audio → assembly → END
-                └── fail (under limit) → prompt (retry)
-                └── fail (over limit) → audio → assembly → END
-
-    Args:
-        All agent instances. character_agent and scene_image_agent are optional
-        (if omitted, their nodes become no-ops).
+    Pipeline flow (7 nodes):
+        script → visual_prompt → image_gen → video_gen → review
+            ├── pass → audio → assembly → END
+            └── fail (under limit) → visual_prompt (retry)
+            └── fail (over limit) → audio → assembly → END
     """
     # ── Node wrappers ──────────────────────────────────────────
 
@@ -45,66 +42,47 @@ def build_drama_graph(
         state.log(f"   剧本标题: {script.title} | {len(script.scenes)} 个场景 | 预估 {script.duration_sec}s")
         return {"script": script}
 
-    async def node_visual(state: DramaState) -> dict:
-        state.log("🎨 视觉设计 Agent: 设计视觉风格...")
-        visual = await visual_agent.run(state.script)
-        state.log(f"   风格: {visual.overall_style} | 色调: {visual.color_palette}")
-        return {"visual_design": visual}
-
-    async def node_character(state: DramaState) -> dict:
-        if character_agent is None:
-            state.log("🎭 角色形象 Agent: (跳过) 未配置")
-            return {}
-        state.log("🎭 角色形象 Agent: 分析角色并生成形象图...")
-        images = await character_agent.run(
+    async def node_visual_prompt(state: DramaState) -> dict:
+        state.log("🎨🔧 视觉与提示 Agent: 设计视觉风格 + 生成视频 prompt...")
+        visual, prompts = await visual_prompt_agent.run(
             state.script,
-            state.visual_design,
-            project_id=state.project_id,
-        )
-        state.log(f"   角色形象图: {len(images.characters)} 个 | 成本: ${images.total_cost:.2f}")
-        return {
-            "character_images": images,
-            "total_cost": state.total_cost + images.total_cost,
-        }
-
-    async def node_scene_image(state: DramaState) -> dict:
-        if scene_image_agent is None:
-            state.log("🖼️ 场景图 Agent: (跳过) 未配置")
-            return {}
-        state.log("🖼️ 场景图 Agent: 生成场景环境图...")
-        images = await scene_image_agent.run(
-            state.script,
-            state.visual_design,
-            project_id=state.project_id,
-        )
-        state.log(f"   场景图: {len(images.scenes)} 个 | 成本: ${images.total_cost:.2f}")
-        return {
-            "scene_images": images,
-            "total_cost": state.total_cost + images.total_cost,
-        }
-
-    async def node_prompt(state: DramaState) -> dict:
-        state.log("🔧 提示工程 Agent: 生成视频 prompt...")
-        prompts = await prompt_agent.run(
-            state.script,
-            state.visual_design,
             character_images=state.character_images,
             scene_images=state.scene_images,
             prompt_overrides=state.prompt_overrides,
         )
-        state.log(f"   目标 API: {prompts.api_provider} | {len(prompts.shots)} 个镜头")
-        return {"generation_prompts": prompts}
+        state.log(f"   风格: {visual.overall_style} | 色调: {visual.color_palette}")
+        state.log(f"   目标 API: {prompts.api_provider} | {len(prompts.shots)} 个镜头 prompt")
+        return {"visual_design": visual, "generation_prompts": prompts}
+
+    async def node_image_gen(state: DramaState) -> dict:
+        state.log("🎭🖼️ 图像生成 Agent: 生成角色形象图 + 场景环境图...")
+        char_assets, scene_assets = await image_gen_agent.run(
+            state.script,
+            state.visual_design,
+            project_id=state.project_id,
+        )
+        state.log(f"   角色形象图: {len(char_assets.characters)} 个 | 场景图: {len(scene_assets.scenes)} 个")
+        cost = char_assets.total_cost + scene_assets.total_cost
+        state.log(f"   图像成本: ${cost:.2f}")
+        return {
+            "character_images": char_assets,
+            "scene_images": scene_assets,
+            "total_cost": state.total_cost + cost,
+        }
 
     async def node_video_gen(state: DramaState) -> dict:
         state.log("🎬 视频生成 Agent: 调用 API 生成视频...")
-        # Apply prompt overrides to the prompts before generation
         if state.prompt_overrides and state.generation_prompts:
             for i, shot in enumerate(state.generation_prompts.shots):
                 if str(i) in state.prompt_overrides:
                     shot.prompt = state.prompt_overrides[str(i)]
                     state.log(f"   ✏️ 镜头 {i+1} 使用了用户修改的 prompt")
 
-        assets = await video_gen_agent.run(state.generation_prompts)
+        assets = await video_gen_agent.run(
+            state.generation_prompts,
+            character_images=state.character_images,
+            scene_images=state.scene_images,
+        )
         success_count = sum(1 for s in assets.shots if s.success)
         state.log(f"   成功: {success_count}/{len(assets.shots)} | 成本: ${assets.total_cost:.2f}")
         return {
@@ -143,14 +121,14 @@ def build_drama_graph(
 
     # ── Routing ───────────────────────────────────────────────
 
-    def route_after_review(state: DramaState) -> Literal["prompt", "audio", "__end__"]:
+    def route_after_review(state: DramaState) -> Literal["visual_prompt", "audio", "__end__"]:
         if state.review_result is None:
             return "audio"
         if state.review_result.passed:
             return "audio"
         if state.review_loop_count < MAX_REVIEW_LOOPS:
-            state.log(f"   ↩️ 返回提示工程 Agent 重试 (第 {state.review_loop_count} 次)")
-            return "prompt"
+            state.log(f"   ↩️ 返回视觉与提示 Agent 重试 (第 {state.review_loop_count} 次)")
+            return "visual_prompt"
         state.log(f"   ⚠️ 已达最大重试次数 ({MAX_REVIEW_LOOPS})，使用现有素材继续")
         return "audio"
 
@@ -159,27 +137,23 @@ def build_drama_graph(
     graph = StateGraph(DramaState)
 
     graph.add_node("script", node_script)
-    graph.add_node("visual", node_visual)
-    graph.add_node("character_images", node_character)
-    graph.add_node("scene_images", node_scene_image)
-    graph.add_node("prompt", node_prompt)
+    graph.add_node("visual_prompt", node_visual_prompt)
+    graph.add_node("image_gen", node_image_gen)
     graph.add_node("video_gen", node_video_gen)
     graph.add_node("review", node_review)
     graph.add_node("audio", node_audio)
     graph.add_node("assembly", node_assembly)
 
     graph.set_entry_point("script")
-    graph.add_edge("script", "visual")
-    graph.add_edge("visual", "character_images")
-    graph.add_edge("character_images", "scene_images")
-    graph.add_edge("scene_images", "prompt")
-    graph.add_edge("prompt", "video_gen")
+    graph.add_edge("script", "visual_prompt")
+    graph.add_edge("visual_prompt", "image_gen")
+    graph.add_edge("image_gen", "video_gen")
     graph.add_edge("video_gen", "review")
 
     graph.add_conditional_edges(
         "review",
         route_after_review,
-        {"prompt": "prompt", "audio": "audio"},
+        {"visual_prompt": "visual_prompt", "audio": "audio"},
     )
 
     graph.add_edge("audio", "assembly")
@@ -189,8 +163,11 @@ def build_drama_graph(
     return graph.compile(checkpointer=memory)
 
 
-def create_stage1_graph(script_agent, visual_agent):
-    """Stage 1 graph: script → visual → END"""
+# ── Segmented graphs (for interactive UI) ────────────────────────
+
+
+def create_stage1_graph(script_agent, visual_prompt_agent):
+    """Stage 1: script → visual_prompt → END"""
     graph = StateGraph(DramaState)
 
     async def node_script(state: DramaState) -> dict:
@@ -199,83 +176,70 @@ def create_stage1_graph(script_agent, visual_agent):
         state.log(f"   剧本标题: {script.title} | {len(script.scenes)} 个场景")
         return {"script": script}
 
-    async def node_visual(state: DramaState) -> dict:
-        state.log("🎨 视觉设计 Agent: 设计视觉风格...")
-        visual = await visual_agent.run(state.script)
-        state.log(f"   风格: {visual.overall_style}")
-        return {"visual_design": visual}
-
-    graph.add_node("script", node_script)
-    graph.add_node("visual", node_visual)
-    graph.set_entry_point("script")
-    graph.add_edge("script", "visual")
-    graph.add_edge("visual", END)
-    return graph.compile(checkpointer=MemorySaver())
-
-
-def create_stage2_graph(character_agent, scene_image_agent):
-    """Stage 2 graph: character_images → scene_images → END"""
-    graph = StateGraph(DramaState)
-
-    async def node_character(state: DramaState) -> dict:
-        if character_agent is None:
-            state.log("🎭 (跳过) 未配置角色 Agent")
-            return {}
-        state.log("🎭 角色形象 Agent: 分析角色并生成形象图...")
-        images = await character_agent.run(
-            state.script, state.visual_design, project_id=state.project_id,
-        )
-        state.log(f"   角色形象图: {len(images.characters)} 个")
-        return {
-            "character_images": images,
-            "total_cost": state.total_cost + images.total_cost,
-        }
-
-    async def node_scene(state: DramaState) -> dict:
-        if scene_image_agent is None:
-            state.log("🖼️ (跳过) 未配置场景 Agent")
-            return {}
-        state.log("🖼️ 场景图 Agent: 生成场景环境图...")
-        images = await scene_image_agent.run(
-            state.script, state.visual_design, project_id=state.project_id,
-        )
-        state.log(f"   场景图: {len(images.scenes)} 个")
-        return {
-            "scene_images": images,
-            "total_cost": state.total_cost + images.total_cost,
-        }
-
-    graph.add_node("character_images", node_character)
-    graph.add_node("scene_images", node_scene)
-    graph.set_entry_point("character_images")
-    graph.add_edge("character_images", "scene_images")
-    graph.add_edge("scene_images", END)
-    return graph.compile(checkpointer=MemorySaver())
-
-
-def create_stage3_graph(prompt_agent):
-    """Stage 3 graph: prompt generation → END"""
-    graph = StateGraph(DramaState)
-
-    async def node_prompt(state: DramaState) -> dict:
-        state.log("🔧 提示工程 Agent: 生成视频 prompt...")
-        prompts = await prompt_agent.run(
-            state.script, state.visual_design,
-            character_images=state.character_images,
-            scene_images=state.scene_images,
+    async def node_visual_prompt(state: DramaState) -> dict:
+        state.log("🎨🔧 视觉与提示 Agent: 设计视觉风格 + 生成视频 prompt...")
+        visual, prompts = await visual_prompt_agent.run(
+            state.script,
             prompt_overrides=state.prompt_overrides,
         )
-        state.log(f"   {len(prompts.shots)} 个镜头 prompt 已生成")
-        return {"generation_prompts": prompts}
+        state.log(f"   风格: {visual.overall_style} | {len(prompts.shots)} 个镜头 prompt")
+        return {"visual_design": visual, "generation_prompts": prompts}
 
-    graph.add_node("prompt", node_prompt)
-    graph.set_entry_point("prompt")
-    graph.add_edge("prompt", END)
+    graph.add_node("script", node_script)
+    graph.add_node("visual_prompt", node_visual_prompt)
+    graph.set_entry_point("script")
+    graph.add_edge("script", "visual_prompt")
+    graph.add_edge("visual_prompt", END)
+    return graph.compile(checkpointer=MemorySaver())
+
+
+def create_stage2_graph(image_gen_agent):
+    """Stage 2: image_gen → END (generates both characters and scenes)"""
+    graph = StateGraph(DramaState)
+
+    async def node_image_gen(state: DramaState) -> dict:
+        state.log("🎭🖼️ 图像生成 Agent: 生成角色形象图 + 场景环境图...")
+        char_assets, scene_assets = await image_gen_agent.run(
+            state.script,
+            state.visual_design,
+            project_id=state.project_id,
+        )
+        state.log(f"   角色形象图: {len(char_assets.characters)} 个 | 场景图: {len(scene_assets.scenes)} 个")
+        cost = char_assets.total_cost + scene_assets.total_cost
+        return {
+            "character_images": char_assets,
+            "scene_images": scene_assets,
+            "total_cost": state.total_cost + cost,
+        }
+
+    graph.add_node("image_gen", node_image_gen)
+    graph.set_entry_point("image_gen")
+    graph.add_edge("image_gen", END)
+    return graph.compile(checkpointer=MemorySaver())
+
+
+def create_stage3_graph():
+    """Stage 3: pass-through no-op (prompts already generated in stage 1).
+
+    Kept for backward compatibility with the 6-stage API. Simply logs and returns.
+    """
+    graph = StateGraph(DramaState)
+
+    async def node_pass_through(state: DramaState) -> dict:
+        if state.generation_prompts:
+            state.log(f"🔧 提示词: {len(state.generation_prompts.shots)} 个镜头 prompt (已在 Stage 1 生成)")
+        else:
+            state.log("🔧 提示词: 尚未生成，请先执行 Stage 1")
+        return {}
+
+    graph.add_node("pass_through", node_pass_through)
+    graph.set_entry_point("pass_through")
+    graph.add_edge("pass_through", END)
     return graph.compile(checkpointer=MemorySaver())
 
 
 def create_stage4_graph(video_gen_agent):
-    """Stage 4 graph: video generation → END"""
+    """Stage 4: video generation → END"""
     graph = StateGraph(DramaState)
 
     async def node_video(state: DramaState) -> dict:
@@ -284,7 +248,11 @@ def create_stage4_graph(video_gen_agent):
             for i, shot in enumerate(state.generation_prompts.shots):
                 if str(i) in state.prompt_overrides:
                     shot.prompt = state.prompt_overrides[str(i)]
-        assets = await video_gen_agent.run(state.generation_prompts)
+        assets = await video_gen_agent.run(
+            state.generation_prompts,
+            character_images=state.character_images,
+            scene_images=state.scene_images,
+        )
         success_count = sum(1 for s in assets.shots if s.success)
         state.log(f"   成功: {success_count}/{len(assets.shots)} | 成本: ${assets.total_cost:.2f}")
         return {
@@ -299,7 +267,7 @@ def create_stage4_graph(video_gen_agent):
 
 
 def create_stage5_graph(audio_agent):
-    """Stage 5 graph: audio generation → END"""
+    """Stage 5: audio generation → END"""
     graph = StateGraph(DramaState)
 
     async def node_audio(state: DramaState) -> dict:
@@ -315,7 +283,7 @@ def create_stage5_graph(audio_agent):
 
 
 def create_stage6_graph(assembly_agent):
-    """Stage 6 graph: assembly → END"""
+    """Stage 6: assembly → END"""
     graph = StateGraph(DramaState)
 
     async def node_assembly(state: DramaState) -> dict:
@@ -332,47 +300,63 @@ def create_stage6_graph(assembly_agent):
     return graph.compile(checkpointer=MemorySaver())
 
 
+# ── Orchestrator ─────────────────────────────────────────────────
+
+
 class DramaOrchestrator:
     """High-level orchestrator for the drama generation pipeline.
 
     Supports two modes:
     - Full pipeline via generate()
     - Segmented pipeline via 6 stage graphs for interactive UI
+
+    Accepts either merged agents (visual_prompt_agent, image_gen_agent) or
+    legacy agents (visual_agent, prompt_agent, character_agent, scene_image_agent).
     """
 
     def __init__(
         self,
         script_agent,
-        visual_agent,
-        prompt_agent,
         video_gen_agent,
         review_agent,
         audio_agent,
         assembly_agent,
+        # Merged agents (preferred)
+        visual_prompt_agent=None,
+        image_gen_agent=None,
+        # Legacy agents (for backward compat)
+        visual_agent=None,
+        prompt_agent=None,
         character_agent=None,
         scene_image_agent=None,
     ):
         self.script_agent = script_agent
-        self.visual_agent = visual_agent
-        self.prompt_agent = prompt_agent
         self.video_gen_agent = video_gen_agent
         self.review_agent = review_agent
         self.audio_agent = audio_agent
         self.assembly_agent = assembly_agent
-        self.character_agent = character_agent
-        self.scene_image_agent = scene_image_agent
+
+        # Use merged agents or wrap legacy ones
+        self.visual_prompt_agent = visual_prompt_agent
+        self.image_gen_agent = image_gen_agent
+
+        if visual_prompt_agent is None and visual_agent is not None:
+            # Legacy mode: wrap visual_agent + prompt_agent as VisualPromptAgent
+            self.visual_prompt_agent = _LegacyVisualPromptWrapper(visual_agent, prompt_agent)
+        if image_gen_agent is None and character_agent is not None:
+            # Legacy mode: wrap character_agent + scene_image_agent as ImageGenerationAgent
+            self.image_gen_agent = _LegacyImageGenWrapper(character_agent, scene_image_agent)
 
         # Full pipeline graph
         self.graph = build_drama_graph(
-            script_agent, visual_agent, prompt_agent,
+            script_agent, self.visual_prompt_agent, self.image_gen_agent,
             video_gen_agent, review_agent, audio_agent, assembly_agent,
-            character_agent, scene_image_agent,
         )
 
         # Segment graphs
-        self.stage1 = create_stage1_graph(script_agent, visual_agent)
-        self.stage2 = create_stage2_graph(character_agent, scene_image_agent)
-        self.stage3 = create_stage3_graph(prompt_agent)
+        self.stage1 = create_stage1_graph(script_agent, self.visual_prompt_agent)
+        self.stage2 = create_stage2_graph(self.image_gen_agent)
+        self.stage3 = create_stage3_graph()
         self.stage4 = create_stage4_graph(video_gen_agent)
         self.stage5 = create_stage5_graph(audio_agent)
         self.stage6 = create_stage6_graph(assembly_agent)
@@ -403,7 +387,7 @@ class DramaOrchestrator:
 
         Args:
             stage: Stage number 1-6.
-            state: Current DramaState (must contain outputs from previous stages).
+            state: Current DramaState.
 
         Returns:
             Updated DramaState after the stage completes.
@@ -434,3 +418,37 @@ class DramaOrchestrator:
             state.log(f"❌ Stage {stage} 失败: {e}")
             state.error_message = str(e)
             return state
+
+
+# ── Legacy wrappers (backward compat) ─────────────────────────────
+
+
+class _LegacyVisualPromptWrapper:
+    """Wraps legacy VisualDesignAgent + PromptEngineeringAgent as unified interface."""
+
+    def __init__(self, visual_agent, prompt_agent):
+        self._visual = visual_agent
+        self._prompt = prompt_agent
+
+    async def run(self, script, character_images=None, scene_images=None, prompt_overrides=None):
+        visual = await self._visual.run(script)
+        prompts = await self._prompt.run(
+            script, visual,
+            character_images=character_images,
+            scene_images=scene_images,
+            prompt_overrides=prompt_overrides,
+        )
+        return visual, prompts
+
+
+class _LegacyImageGenWrapper:
+    """Wraps legacy CharacterAgent + SceneImageAgent as unified interface."""
+
+    def __init__(self, character_agent, scene_image_agent):
+        self._character = character_agent
+        self._scene = scene_image_agent
+
+    async def run(self, script, visual, project_id=""):
+        char_assets = await self._character.run(script, visual, project_id=project_id)
+        scene_assets = await self._scene.run(script, visual, project_id=project_id)
+        return char_assets, scene_assets

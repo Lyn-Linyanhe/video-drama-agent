@@ -16,7 +16,9 @@ from src.config import OUTPUT_DIR
 # ============================================================
 KLING_BASE_URL = "https://api-beijing.klingai.com"
 KLING_T2V_URL = f"{KLING_BASE_URL}/v1/videos/text2video"       # submit
+KLING_I2V_URL = f"{KLING_BASE_URL}/v1/videos/image2video"      # image-to-video
 KLING_QUERY_URL = f"{KLING_BASE_URL}/v1/videos/text2video"     # + /{task_id}
+KLING_IMAGE_UPLOAD_URL = f"{KLING_BASE_URL}/v1/images/upload"  # upload reference image
 
 # Polling config
 POLL_INTERVAL = 5       # seconds between status checks
@@ -62,19 +64,30 @@ class KlingVideoClient(VideoAPIClient):
         seed: int | None = None,
         aspect_ratio: str = "9:16",
         motion_strength: float = 0.7,
+        image_reference: str | None = None,
     ) -> VideoGenResult:
-        """Submit a text-to-video task, poll for completion, download result.
+        """Submit a generation task, poll for completion, download result.
+
+        When image_reference is provided (path to a local image file),
+        the image-to-video endpoint is used instead of text-to-video.
+        The image is uploaded to Kling first, then used as visual anchor.
 
         Returns VideoGenResult with local_path pointing to the downloaded mp4.
         """
         try:
-            # 1. Submit task
+            # Upload reference image if provided
+            image_url = ""
+            if image_reference:
+                image_url = await self._upload_image(image_reference)
+
+            # 1. Submit task (text2video or image2video)
             task_id = await self._submit_task(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 duration=duration_sec,
                 aspect_ratio=aspect_ratio,
                 seed=seed,
+                image_url=image_url,
             )
 
             # 2. Poll until done
@@ -89,6 +102,7 @@ class KlingVideoClient(VideoAPIClient):
                 local_path=local_path,
                 duration_sec=float(duration_sec),
                 api_cost=self._estimate_cost(duration_sec),
+                reference_image_used=image_reference or "",
             )
 
         except Exception as e:
@@ -131,8 +145,13 @@ class KlingVideoClient(VideoAPIClient):
         duration: int,
         aspect_ratio: str,
         seed: int | None,
+        image_url: str = "",
     ) -> str:
-        """Submit a text-to-video generation task. Returns task_id."""
+        """Submit a generation task. Returns task_id.
+
+        Uses image2video endpoint when image_url is provided,
+        text2video endpoint otherwise.
+        """
         # Kling API only accepts 5 or 10
         duration = 5 if duration <= 7 else 10
 
@@ -141,8 +160,20 @@ class KlingVideoClient(VideoAPIClient):
             "mode": self.mode,
             "duration": str(duration),
             "aspect_ratio": aspect_ratio,
-            "prompt": prompt,
         }
+
+        if image_url:
+            # Image-to-video mode: use image as visual anchor
+            body["image"] = image_url
+            body["image_tail"] = prompt  # prompt describes motion/scene context
+            endpoint = KLING_I2V_URL
+            mode_label = "i2v"
+        else:
+            # Text-to-video mode
+            body["prompt"] = prompt
+            endpoint = KLING_T2V_URL
+            mode_label = "t2v"
+
         if negative_prompt:
             body["negative_prompt"] = negative_prompt
         if seed is not None:
@@ -150,7 +181,7 @@ class KlingVideoClient(VideoAPIClient):
 
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                KLING_T2V_URL,
+                endpoint,
                 json=body,
                 headers=self._auth_headers(),
             )
@@ -158,10 +189,10 @@ class KlingVideoClient(VideoAPIClient):
 
         if resp.status_code != 200 or data.get("code") != 0:
             msg = data.get("message", data)
-            raise RuntimeError(f"Kling submit failed [{resp.status_code}]: {msg}")
+            raise RuntimeError(f"Kling submit ({mode_label}) failed [{resp.status_code}]: {msg}")
 
         task_id = data["data"]["task_id"]
-        print(f"  🎬 Kling task submitted: {task_id}")
+        print(f"  🎬 Kling task submitted ({mode_label}): {task_id}")
         return task_id
 
     # ---- Poll -------------------------------------------------------
@@ -199,6 +230,51 @@ class KlingVideoClient(VideoAPIClient):
 
                 # Still pending/running — wait and retry
                 await asyncio.sleep(POLL_INTERVAL)
+
+    # ---- Upload ------------------------------------------------------
+
+    async def _upload_image(self, image_path: str) -> str:
+        """Upload a local image to Kling for use as image-to-video reference.
+
+        Returns the uploaded image URL.
+        """
+        import os
+        from pathlib import Path
+        import base64
+
+        path = Path(image_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Reference image not found: {image_path}")
+
+        # Read and encode the image
+        image_data = path.read_bytes()
+        ext = path.suffix.lower().lstrip('.')
+        mime_types = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+        mime_type = mime_types.get(ext, "image/png")
+
+        b64 = base64.b64encode(image_data).decode("ascii")
+        data_uri = f"data:{mime_type};base64,{b64}"
+
+        body = {
+            "model_name": self.model,
+            "image": data_uri,
+        }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                KLING_IMAGE_UPLOAD_URL,
+                json=body,
+                headers=self._auth_headers(),
+            )
+            data = resp.json()
+
+        if resp.status_code != 200 or data.get("code") != 0:
+            msg = data.get("message", data)
+            raise RuntimeError(f"Kling image upload failed [{resp.status_code}]: {msg}")
+
+        image_url = data["data"]["url"]
+        print(f"  📤 Image uploaded: {image_path} → {image_url[:60]}...")
+        return image_url
 
     # ---- Download ---------------------------------------------------
 

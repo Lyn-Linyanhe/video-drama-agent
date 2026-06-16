@@ -28,8 +28,13 @@ class MockVideoClient(VideoAPIClient):
         seed: int | None = None,
         aspect_ratio: str = "9:16",
         motion_strength: float = 0.7,
+        image_reference: str | None = None,
     ) -> VideoGenResult:
-        """Generate a mock video with a solid color and text overlay."""
+        """Generate a mock video with a solid color and text overlay.
+
+        When image_reference is provided, the mock video includes a label
+        indicating image-to-video mode was used.
+        """
         shot_id = uuid.uuid4().hex[:8]
         filename = f"mock_shot_{shot_id}.mp4"
         output_path = OUTPUT_DIR / filename
@@ -41,6 +46,12 @@ class MockVideoClient(VideoAPIClient):
             # Extract a short label from the prompt (aggressively sanitize for shell safety)
             import re
             label = re.sub(r'[^a-zA-Z0-9\s\-_,.()]', '', prompt[:80])[:40]
+
+            # Indicate image-to-video mode in the label
+            mode_tag = ""
+            if image_reference:
+                ref_name = Path(image_reference).stem[:20]
+                mode_tag = f" [img2vid:{ref_name}]"
 
             # Parse aspect ratio
             w, h = (1080, 1920) if aspect_ratio == "9:16" else (1920, 1080)
@@ -56,7 +67,7 @@ class MockVideoClient(VideoAPIClient):
             cmd = (
                 f"ffmpeg -y -f lavfi -i color=c=0x{color_hex}:s={w}x{h}:d={duration_sec}"
                 f" -f lavfi -i anullsrc=r=44100:cl=mono"
-                f" -vf \"drawtext=text='Scene {label[:40]}':fontsize=48:fontcolor=white:"
+                f" -vf \"drawtext=text='Scene {label[:40]}{mode_tag}':fontsize=48:fontcolor=white:"
                 f"x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.5:boxborderw=10\""
                 f" -c:v libx264 -preset ultrafast -c:a aac -shortest"
                 f" \"{output_path}\" 2>/dev/null"
@@ -69,6 +80,7 @@ class MockVideoClient(VideoAPIClient):
                 local_path=str(output_path),
                 duration_sec=float(duration_sec),
                 api_cost=0.0,
+                reference_image_used=image_reference or "",
             )
         except Exception as e:
             return VideoGenResult(

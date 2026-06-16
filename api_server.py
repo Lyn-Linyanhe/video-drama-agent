@@ -22,9 +22,8 @@ from pydantic import BaseModel, Field
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.agents import (
-    ScriptAgent, VisualDesignAgent, PromptEngineeringAgent,
+    ScriptAgent, VisualPromptAgent, ImageGenerationAgent,
     VideoGenerationAgent, ReviewAgent, AudioAgent, AssemblyAgent,
-    CharacterAgent, SceneImageAgent,
 )
 from src.graph.orchestrator import DramaOrchestrator
 from src.graph.state import DramaState
@@ -34,19 +33,21 @@ from src.utils.project_store import ProjectStore
 
 # ── 全局单例 ─────────────────────────────────────────────────
 script_agent = ScriptAgent()
-visual_agent = VisualDesignAgent()
-prompt_agent = PromptEngineeringAgent()
-character_agent = CharacterAgent(api_client=MockImageClient())
-scene_image_agent = SceneImageAgent(api_client=MockImageClient())
+visual_prompt_agent = VisualPromptAgent()
+image_gen_agent = ImageGenerationAgent(api_client=MockImageClient())
 video_gen_agent = VideoGenerationAgent()
 review_agent = ReviewAgent()
 audio_agent = AudioAgent()
 assembly_agent = AssemblyAgent()
 
 orchestrator = DramaOrchestrator(
-    script_agent, visual_agent, prompt_agent,
-    video_gen_agent, review_agent, audio_agent, assembly_agent,
-    character_agent, scene_image_agent,
+    script_agent=script_agent,
+    visual_prompt_agent=visual_prompt_agent,
+    image_gen_agent=image_gen_agent,
+    video_gen_agent=video_gen_agent,
+    review_agent=review_agent,
+    audio_agent=audio_agent,
+    assembly_agent=assembly_agent,
 )
 
 project_store = ProjectStore()
@@ -354,16 +355,11 @@ async def list_projects():
 
 @app.get("/api/projects/{project_id}/assets")
 async def get_project_assets(project_id: str):
-    """获取指定项目的所有资产文件。"""
-    categories = ["characters", "scenes", "videos", "audio", "final"]
-    assets = {}
-    for cat in categories:
-        files = project_store.get_asset_files(project_id, cat)
-        assets[cat] = [
-            {"name": Path(f).name, "path": f}
-            for f in files
-        ]
-    return {"project_id": project_id, "assets": assets}
+    """获取指定项目的所有资产文件（多图分组格式）。"""
+    try:
+        return project_store.get_asset_groups(project_id)
+    except ValueError:
+        return {"error": "无效的 project_id"}
 
 
 # ── API 配置档案 ──────────────────────────────────────────────

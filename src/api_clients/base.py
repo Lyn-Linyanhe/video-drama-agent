@@ -14,6 +14,7 @@ class VideoGenResult:
     duration_sec: float = 0.0
     error_message: str = ""
     api_cost: float = 0.0
+    reference_image_used: str = ""  # Path to reference image if image-to-video mode
 
 
 class VideoAPIClient(ABC):
@@ -39,6 +40,7 @@ class VideoAPIClient(ABC):
         seed: int | None = None,
         aspect_ratio: str = "9:16",
         motion_strength: float = 0.7,
+        image_reference: str | None = None,
     ) -> VideoGenResult:
         """Submit a video generation request and wait for completion.
 
@@ -49,6 +51,9 @@ class VideoAPIClient(ABC):
             seed: Random seed for reproducibility.
             aspect_ratio: Video aspect ratio (e.g. "9:16").
             motion_strength: How much motion (0-1).
+            image_reference: Optional path to a reference image for
+                image-to-video generation (character portrait, scene bg).
+                When provided, the API should use this as a visual anchor.
 
         Returns:
             VideoGenResult with success status and video URL or error.

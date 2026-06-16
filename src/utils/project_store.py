@@ -146,21 +146,76 @@ class ProjectStore:
 
     def get_asset_files(self, project_id: str, category: str) -> list[str]:
         _validate_project_id(project_id)
-        """List asset files in a category folder.
+        """List asset files in a category folder (recursive into subdirectories).
 
-        Args:
-            project_id: Project ID.
-            category: One of 'characters', 'scenes', 'videos', 'audio', 'final'.
-
-        Returns:
-            List of absolute file paths.
+        For multi-view assets (characters, scenes), returns all files under
+        the category directory tree.
         """
         cat_dir = self.store_dir / project_id / category
         if not cat_dir.exists():
             return []
-        return sorted(
-            str(p) for p in cat_dir.iterdir() if p.is_file()
-        )
+        files = []
+        for p in sorted(cat_dir.rglob("*")):
+            if p.is_file():
+                files.append(str(p))
+        return files
+
+    def get_asset_groups(self, project_id: str) -> dict:
+        """Get assets grouped by category and sub-group.
+
+        Returns a structure suitable for frontend display:
+        {
+            "characters": {
+                "林屿": {
+                    "portrait": "path/to/portrait.png",
+                    "profile": "path/to/profile.png",
+                    "full_body": "path/to/full_body.png"
+                }
+            },
+            "scenes": {
+                "scene_01": {
+                    "wide": "path/to/wide.png",
+                    "medium": "path/to/medium.png"
+                }
+            },
+            "videos": [...],
+            "audio": [...],
+            "final": [...]
+        }
+        """
+        _validate_project_id(project_id)
+        result: dict = {}
+
+        for category in ("characters", "scenes", "videos", "audio", "final"):
+            cat_dir = self.store_dir / project_id / category
+            if not cat_dir.exists():
+                result[category] = {} if category in ("characters", "scenes") else []
+                continue
+
+            if category in ("characters", "scenes"):
+                # Grouped by subdirectory (character name or scene name)
+                groups: dict[str, dict[str, str]] = {}
+                for sub_dir in sorted(cat_dir.iterdir()):
+                    if not sub_dir.is_dir():
+                        continue
+                    group_name = sub_dir.name
+                    views: dict[str, str] = {}
+                    for img_file in sorted(sub_dir.iterdir()):
+                        if img_file.is_file() and img_file.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                            view_name = img_file.stem  # "portrait", "profile", "wide", "medium", etc.
+                            views[view_name] = str(img_file)
+                    if views:
+                        groups[group_name] = views
+                result[category] = groups
+            else:
+                # Flat list for videos, audio, final
+                files = []
+                for p in sorted(cat_dir.iterdir()):
+                    if p.is_file():
+                        files.append({"name": p.name, "path": str(p)})
+                result[category] = files
+
+        return result
 
     def delete_project(self, project_id: str) -> bool:
         """Delete a project and all its assets."""

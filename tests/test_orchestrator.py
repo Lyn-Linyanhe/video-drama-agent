@@ -6,8 +6,8 @@ from pathlib import Path
 
 from src.agents import (
     ScriptAgent,
-    VisualDesignAgent,
-    PromptEngineeringAgent,
+    VisualPromptAgent,
+    ImageGenerationAgent,
     VideoGenerationAgent,
     ReviewAgent,
     AudioAgent,
@@ -21,8 +21,8 @@ def orchestrator():
     """Create a real orchestrator with all agents."""
     return DramaOrchestrator(
         script_agent=ScriptAgent(),
-        visual_agent=VisualDesignAgent(),
-        prompt_agent=PromptEngineeringAgent(),
+        visual_prompt_agent=VisualPromptAgent(),
+        image_gen_agent=ImageGenerationAgent(),
         video_gen_agent=VideoGenerationAgent(),
         review_agent=ReviewAgent(),
         audio_agent=AudioAgent(),

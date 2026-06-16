@@ -10,6 +10,10 @@ from .assembly_agent import AssemblyAgent
 from .character_agent import CharacterAgent
 from .scene_image_agent import SceneImageAgent
 
+# Merged agents (9 → 7 agent architecture)
+from .visual_prompt_agent import VisualPromptAgent
+from .image_gen_agent import ImageGenerationAgent
+
 __all__ = [
     "ScriptAgent",
     "VisualDesignAgent",
@@ -20,4 +24,7 @@ __all__ = [
     "AssemblyAgent",
     "CharacterAgent",
     "SceneImageAgent",
+    # Merged
+    "VisualPromptAgent",
+    "ImageGenerationAgent",
 ]
