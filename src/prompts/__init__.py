@@ -1,0 +1,23 @@
+"""标准化 AI 提示词模板 — 7 套模板覆盖短剧创作全流程。"""
+
+from .templates import (
+    SCRIPT_GEN_TEMPLATE,
+    ROLE_EXTRACT_TEMPLATE,
+    SCENE_EXTRACT_TEMPLATE,
+    SHOT_EXTRACT_TEMPLATE,
+    CHARACTER_IMAGE_TEMPLATE,
+    SCENE_IMAGE_TEMPLATE,
+    SHOT_IMAGE_TEMPLATE,
+    render_prompt,
+)
+
+__all__ = [
+    "SCRIPT_GEN_TEMPLATE",
+    "ROLE_EXTRACT_TEMPLATE",
+    "SCENE_EXTRACT_TEMPLATE",
+    "SHOT_EXTRACT_TEMPLATE",
+    "CHARACTER_IMAGE_TEMPLATE",
+    "SCENE_IMAGE_TEMPLATE",
+    "SHOT_IMAGE_TEMPLATE",
+    "render_prompt",
+]

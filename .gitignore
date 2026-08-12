@@ -1,0 +1,63 @@
+# ── API Keys & Secrets ──────────────────────────────────────────
+.env
+*.pem
+*.key
+
+# ── Generated output (runtime artifacts) ─────────────────────────
+output/
+!output/.gitkeep
+*.log
+*.out
+*.err
+*.pid
+stdout
+final_*.mp4
+.tmp_state.json
+HANDOFF_*.md
+modified_prompt_files/
+cloudflared.*
+codex-open-api.*
+detach_test.out
+server-*.log
+server.*.log
+
+# ── API config archives (contains keys) ──────────────────────────
+settings_ui.json
+projects.json
+
+# ── Python ───────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyc.bak
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.pytest_tmp*/
+
+# ── IDE / Editor ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Checkpoints ──────────────────────────────────────────────────
+*.db
+
+# ── Local browser/tunnel tools ───────────────────────────────────
+.edge-cdp-profile/
+.tmp-edge-profile/
+tools/cloudflared*
+tools/msi_admin_extract/
+
+# Local agent/session and browser audit artifacts
+.agents/
+.superpowers/
+tmp/

@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 短剧创作平台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/settings.css">
+<link rel="stylesheet" href="/static/css/assets.css">
+<link rel="stylesheet" href="/static/css/production.css?v=20260809-audio-workspace">
+<link rel="stylesheet" href="/static/css/audio.css?v=20260809-audio-workspace">
+</head>
+<body>
+
+<!-- ═══ 左侧导航 ═══ -->
+<aside class="sidebar">
+  <div class="sidebar-brand">
+    <div style="font-size:16px;font-weight:700;background:linear-gradient(135deg,#4f46e5,#7c3aed);-webkit-background-clip:text;-webkit-text-fill-color:transparent">
+      🎬 AI 短剧工作室
+    </div>
+    <div style="font-size:10px;color:#71717a;margin-top:4px">7 Agent 协作管线</div>
+  </div>
+  <nav class="sidebar-nav">
+    <a href="#" class="active" data-page="home">🏠 工作台首页</a>
+    <a href="#" data-page="script">📝 剧本编辑</a>
+    <a href="#" data-page="assets">🗂️ 资产库</a>
+    <a href="#" data-page="shots">🎬 分镜制作</a>
+    <a href="#" data-page="works">🎞️ 作品管理</a>
+    <a href="#" data-page="settings" style="margin-top:12px;border-top:1px solid #2a2a40;padding-top:14px">🔧 API 配置</a>
+  </nav>
+  <div class="sidebar-footer">
+    API: <span id="api-status">连接中</span><br>
+    v1.0 · Mock 模式
+  </div>
+</aside>
+
+<!-- ═══ 主内容区 ═══ -->
+<div class="main">
+  <!-- 步骤导航 -->
+  <div class="steps" id="step-nav">
+    <span class="step-item active" data-page="script">1 剧本</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="assets">2 资产库</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="shots">3 分镜制作</span><span class="step-divider">→</span>
+    <span class="step-item" data-page="works">4 作品</span>
+    <button class="project-jobs-trigger" id="project-jobs-trigger" onclick="StudioActions.toggleProjectJobs()" disabled>任务 <span class="project-jobs-count" id="project-jobs-count">0</span></button>
+  </div>
+
+  <!-- ═══════════ 页面 0: 工作台首页 ═══════════ -->
+  <div class="page active" id="page-home">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+      <h2 style="font-size:20px;font-weight:700">我的项目</h2>
+      <button class="btn-primary" onclick="StudioActions.openNewProjectModal()">+ 新建项目</button>
+    </div>
+    <div class="grid-cards" id="project-list">
+      <div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">
+        暂无项目，点击「新建项目」开始创作
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 2: 剧本编辑 ═══════════ -->
+  <div class="page" id="page-script">
+    <div style="display:flex;gap:24px">
+      <div style="flex:2">
+        <h3 style="margin-bottom:12px">剧本工作区</h3>
+        <div id="script-workspace" class="card" style="min-height:210px;padding:20px"></div>
+        <input id="script-file-input" type="file" accept=".txt,.docx,.md" style="display:none" onchange="StudioActions.importScriptSource(this)">
+        <div id="script-result" style="margin-top:16px;display:none">
+          <h4 id="script-result-title" style="margin-bottom:8px">剧本解析</h4>
+          <div id="script-readable-analysis"></div>
+          <details style="margin-top:12px;border-top:1px solid #27272a;padding-top:10px">
+            <summary style="cursor:pointer;color:#a1a1aa">高级结构化编辑</summary>
+            <textarea id="structured-script-editor" rows="16" style="width:100%;font-family:monospace;margin-top:10px"></textarea>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+              <button class="btn-secondary btn-sm" onclick="StudioActions.saveStructuredScript()">保存人工修改</button>
+              <input id="script-revision-instruction" type="text" placeholder="例如：把结局改得更有悬念，其他剧情不变" style="flex:1;min-width:240px">
+              <button class="btn-primary btn-sm" onclick="StudioActions.reviseStructuredScript()">AI 修改结果</button>
+            </div>
+          </details>
+        </div>
+      </div>
+      <div style="flex:1;min-width:200px">
+        <div class="card" style="margin-bottom:12px">
+          <h4 style="font-size:13px;margin-bottom:8px;color:#a1a1aa">当前项目</h4>
+          <div id="project-info" style="font-size:12px">未创建项目</div>
+        </div>
+        <div class="card">
+          <h4 style="font-size:13px;margin-bottom:8px;color:#a1a1aa">AI 生成状态</h4>
+          <div id="gen-status" style="font-size:12px;color:#71717a">等待输入</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 3: 资产库 ═══════════ -->
+  <div class="page" id="page-assets">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3>资产库</h3>
+      <div style="display:flex;gap:8px" id="asset-tabs">
+        <button class="btn-secondary btn-sm" data-asset-tab="characters" onclick="StudioActions.showAssetTab('characters')">角色</button>
+        <button class="btn-secondary btn-sm" data-asset-tab="scenes" onclick="StudioActions.showAssetTab('scenes')">场景</button>
+        <button class="btn-secondary btn-sm" data-asset-tab="props" onclick="StudioActions.showAssetTab('props')">道具</button>
+      </div>
+    </div>
+    <section data-asset-panel="characters">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h4>角色形象</h4><div style="display:flex;gap:8px"><button class="btn-secondary btn-sm" onclick="StudioActions.openManualAsset('character')">+ 添加角色</button><button class="btn-secondary btn-sm" onclick="StudioActions.reExtractRoles()">重新提取</button><button class="btn-primary btn-sm" id="btn-gen-roles" onclick="StudioActions.generateRoleImages()">生成缺失图片</button></div></div>
+      <div id="char-status" style="font-size:12px;color:#71717a;margin-bottom:12px"></div><div class="grid-cards" id="role-cards"></div>
+    </section>
+    <section data-asset-panel="scenes" style="display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h4>场景参考</h4><div style="display:flex;gap:8px"><button class="btn-secondary btn-sm" onclick="StudioActions.openManualAsset('scene')">+ 添加场景</button><button class="btn-secondary btn-sm" onclick="StudioActions.reExtractScenes()">重新提取</button><button class="btn-primary btn-sm" id="btn-gen-scenes" onclick="StudioActions.generateSceneImages()">生成缺失图片</button></div></div>
+      <div id="scene-status" style="font-size:12px;color:#71717a;margin-bottom:12px"></div><div class="grid-cards" id="scene-cards"></div>
+    </section>
+    <section data-asset-panel="props" style="display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h4>关键道具</h4><div style="display:flex;gap:8px"><button class="btn-secondary btn-sm" onclick="StudioActions.openManualAsset('prop')">+ 添加道具</button><button class="btn-primary btn-sm" id="btn-gen-props" onclick="StudioActions.generatePropImages()">生成缺失图片</button></div></div>
+      <div id="prop-status" style="font-size:12px;color:#71717a;margin-bottom:12px"></div><div class="grid-cards" id="prop-cards"></div>
+    </section>
+  </div>
+
+  <!-- ═══════════ 页面 5: 分镜列表 ═══════════ -->
+  <div class="page" id="page-shots">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3>分镜列表</h3>
+      <div style="display:flex;gap:8px">
+        <button class="btn-secondary btn-sm" onclick="StudioActions.extractShots()">📋 提取分镜</button>
+        <button class="btn-secondary btn-sm" onclick="StudioActions.insertShot()">+ 插入分镜</button>
+      </div>
+    </div>
+    <div id="shot-list">
+      <div style="color:#71717a;padding:40px;text-align:center">
+        请先在剧本编辑页生成剧本，然后提取分镜
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 6: 制作预览 ═══════════ -->
+  <div class="page" id="page-produce">
+    <div style="display:flex;gap:24px">
+      <div style="flex:1;max-width:260px">
+        <h4 style="margin-bottom:8px">分镜时长</h4>
+        <div id="shot-duration-list" style="color:#71717a;font-size:12px">暂无分镜数据</div>
+        <div id="shot-video-list" style="display:flex;flex-direction:column;gap:8px;margin-top:12px"></div>
+      </div>
+      <div style="flex:2;text-align:center">
+        <div class="player-placeholder" id="preview-player">
+          <span>📺 预览区<br><span style="font-size:11px">生成后显示</span></span>
+        </div>
+        <div id="final-video-container" style="margin-top:12px;display:none"></div>
+      </div>
+      <div style="flex:1;min-width:220px">
+        <div class="card" style="margin-bottom:12px">
+          <h4 style="font-size:13px;margin-bottom:8px;color:#a1a1aa">制作流水线</h4>
+          <div style="font-size:12px;display:flex;flex-direction:column;gap:8px">
+            <button class="btn-primary" id="btn-gen-videos" onclick="StudioActions.generateVideos()" style="width:100%">🎬 批量生成视频</button>
+            <button class="btn-primary" id="btn-gen-audio" onclick="StudioActions.generateAudio()" style="width:100%;background:linear-gradient(135deg,#7c3aed,#a855f7)">🎵 生成配音BGM</button>
+            <button class="btn-primary" id="btn-assemble" onclick="StudioActions.assembleVideo()" style="width:100%;background:linear-gradient(135deg,#059669,#10b981)">🎞️ 合成最终视频</button>
+          </div>
+        </div>
+        <div id="produce-status" style="margin-top:8px;font-size:12px;color:#71717a"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 7: 作品管理 ═══════════ -->
+  <div class="page" id="page-works">
+    <h3 style="margin-bottom:16px">我的作品</h3>
+    <div class="grid-cards" id="works-list">
+      <div style="color:#71717a;padding:40px;text-align:center;grid-column:1/-1">
+        📺 暂无作品<br><span style="font-size:12px">完成全部制作流程后，合成的短剧将在这里展示</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 页面 8: API 配置 ═══════════ -->
+  <div class="page settings-page" id="page-settings">
+    <header class="settings-header">
+      <div>
+        <h3>API 设置</h3>
+        <p>管理实际参与剧本、图片与视频生成的服务连接。</p>
+      </div>
+      <div class="settings-header-actions">
+        <span class="settings-active-state" id="cfg-active-label"><span class="status-dot gray"></span>未加载配置</span>
+        <button class="btn-primary" id="cfg-save-button" onclick="StudioActions.saveApiConfig()">保存并应用</button>
+      </div>
+    </header>
+
+    <section class="settings-profile-bar" aria-label="配置档案">
+      <div class="settings-field compact">
+        <label for="cfg-profile-name">配置名称</label>
+        <input type="text" id="cfg-profile-name" maxlength="80" placeholder="例如：日常制作">
+      </div>
+      <div class="settings-field compact profile-picker">
+        <label for="cfg-profile-select">已保存配置</label>
+        <select id="cfg-profile-select" onchange="StudioActions.loadApiProfile()"><option value="">暂无配置</option></select>
+      </div>
+      <div class="settings-profile-actions">
+        <button class="btn-secondary btn-sm" onclick="StudioActions.exportProfile()">导出</button>
+        <button class="btn-secondary btn-sm" onclick="document.getElementById('import-file').click()">导入</button>
+        <button class="btn-secondary btn-sm danger" onclick="StudioActions.deleteApiProfile()">删除</button>
+        <input type="file" id="import-file" hidden accept=".json,application/json" onchange="StudioActions.importProfile(this)">
+      </div>
+      <div id="cfg-status" class="settings-save-status" role="status"></div>
+    </section>
+
+    <div class="settings-layout">
+      <nav class="settings-menu" aria-label="API 设置分类">
+        <button class="active" data-settings-section="llm" onclick="StudioActions.showSettingsSection('llm')"><span>语言模型</span><small id="cfg-nav-llm">未配置</small></button>
+        <button data-settings-section="image" onclick="StudioActions.showSettingsSection('image')"><span>图片生成</span><small id="cfg-nav-image">占位模式</small></button>
+        <button data-settings-section="video" onclick="StudioActions.showSettingsSection('video')"><span>视频生成</span><small id="cfg-nav-video">占位模式</small></button>
+        <button data-settings-section="audio" onclick="StudioActions.showSettingsSection('audio')"><span>语音与音乐</span><small>本地服务</small></button>
+        <button data-settings-section="network" onclick="StudioActions.showSettingsSection('network')"><span>网络</span><small id="cfg-nav-network">直连</small></button>
+      </nav>
+
+      <div class="settings-workarea">
+        <section class="settings-panel active" data-settings-panel="llm">
+          <div class="settings-panel-head">
+            <div><span class="settings-kicker">SCRIPT INTELLIGENCE</span><h4>语言模型</h4><p>用于剧本生成、结构化解析和提示词推理。</p></div>
+            <span class="settings-capability">必需</span>
+          </div>
+          <div class="settings-form-grid">
+            <div class="settings-field"><label for="cfg-llm-provider">服务商</label><select id="cfg-llm-provider" onchange="StudioActions.onProviderChange('llm')"><option value="deepseek">DeepSeek</option><option value="kimi">Kimi</option><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></div>
+            <div class="settings-field"><label for="cfg-llm-model">模型</label><select id="cfg-llm-model"></select></div>
+            <div class="settings-field full"><label for="cfg-llm-key">API Key</label><div class="settings-secret"><input type="password" id="cfg-llm-key" data-secret-field="llm_key" autocomplete="new-password" placeholder="输入 API Key"><button type="button" onclick="StudioActions.togglePwd('cfg-llm-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-llm-key')">清除</button></div><small>密钥不会返回到浏览器；留空保存会保留已配置值。</small></div>
+          </div>
+          <details class="settings-advanced"><summary>高级设置</summary><div class="settings-advanced-body"><div class="settings-field"><label for="cfg-llm-base">Base URL</label><input type="url" id="cfg-llm-base" placeholder="留空使用服务商默认地址"><small>仅在代理网关或 OpenAI 兼容服务中需要。</small></div></div></details>
+          <div class="settings-test-row"><button class="btn-secondary btn-sm" onclick="StudioActions.testConnection('llm')">测试连接</button><span id="cfg-llm-test" class="settings-test-status" role="status"></span></div>
+        </section>
+
+        <section class="settings-panel" data-settings-panel="image">
+          <div class="settings-panel-head">
+            <div><span class="settings-kicker">VISUAL ASSETS</span><h4>图片生成</h4><p>用于角色、场景和道具参考图。当前真实生成支持可灵。</p></div>
+            <span class="settings-capability optional">可选</span>
+          </div>
+          <div class="settings-mode-note" id="img-mode-note"></div>
+          <div class="settings-form-grid">
+            <div class="settings-field"><label for="cfg-img-api">服务商</label><select id="cfg-img-api" onchange="StudioActions.onProviderChange('image')"><option value="mock">Mock 占位图片</option><option value="kling">可灵 Kling</option></select></div>
+            <div class="settings-field" id="cfg-img-model-field"><label for="cfg-img-model">模型</label><select id="cfg-img-model"><option value="kling-v1">kling-v1</option><option value="kling-v1-5">kling-v1-5</option></select></div>
+            <div class="settings-field full" id="cfg-img-key-field"><label for="cfg-img-key">图片 API Key</label><div class="settings-secret"><input type="password" id="cfg-img-key" data-secret-field="image_gen_key" autocomplete="new-password" placeholder="留空可复用视频的可灵 API Key"><button type="button" onclick="StudioActions.togglePwd('cfg-img-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-img-key')">清除</button></div><small>单独填写时仅用于图片生成；留空时复用可灵视频 API Key。</small></div>
+          </div>
+          <div class="settings-test-row"><button class="btn-secondary btn-sm" onclick="StudioActions.testConnection('image')">测试连接</button><span id="cfg-image-test" class="settings-test-status" role="status"></span></div>
+        </section>
+
+        <section class="settings-panel" data-settings-panel="video">
+          <div class="settings-panel-head">
+            <div><span class="settings-kicker">SHOT GENERATION</span><h4>视频生成</h4><p>为分镜制作生成视频版本。支持可灵与快马。</p></div>
+            <span class="settings-capability optional">可选</span>
+          </div>
+          <div class="settings-mode-note" id="video-mode-note"></div>
+          <div class="settings-form-grid">
+            <div class="settings-field"><label for="cfg-video-api">服务商</label><select id="cfg-video-api" onchange="StudioActions.onProviderChange('video')"><option value="mock">Mock 占位视频</option><option value="kling">可灵 Kling</option><option value="happyhorse">快马 Happy Horse</option><option value="seedance">Seedance 火山方舟</option></select></div>
+          </div>
+          <div id="cfg-video-kling-fields">
+            <div class="settings-auth-label">推荐：API Key</div>
+            <div class="settings-field"><label for="cfg-kling-api-key">可灵 API Key</label><div class="settings-secret"><input type="password" id="cfg-kling-api-key" data-secret-field="kling_api_key" autocomplete="new-password" placeholder="api-key-kling-..."><button type="button" onclick="StudioActions.togglePwd('cfg-kling-api-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-kling-api-key')">清除</button></div></div>
+            <details class="settings-advanced"><summary>使用旧版 AK / SK</summary><div class="settings-advanced-body two-columns"><div class="settings-field"><label for="cfg-kling-access-key">Access Key</label><div class="settings-secret"><input type="password" id="cfg-kling-access-key" data-secret-field="kling_access_key" autocomplete="new-password"><button type="button" onclick="StudioActions.togglePwd('cfg-kling-access-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-kling-access-key')">清除</button></div></div><div class="settings-field"><label for="cfg-kling-secret-key">Secret Key</label><div class="settings-secret"><input type="password" id="cfg-kling-secret-key" data-secret-field="kling_secret_key" autocomplete="new-password"><button type="button" onclick="StudioActions.togglePwd('cfg-kling-secret-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-kling-secret-key')">清除</button></div></div></div></details>
+            <details class="settings-advanced"><summary>生成参数</summary><div class="settings-advanced-body two-columns"><div class="settings-field"><label for="cfg-video-model">模型</label><select id="cfg-video-model"><option value="kling-v2-6">kling-v2-6</option><option value="kling-v2-6-pro">kling-v2-6-pro</option></select></div><div class="settings-field"><label for="cfg-video-mode">质量模式</label><select id="cfg-video-mode"><option value="std">标准 720p</option><option value="pro">专业 1080p</option></select></div></div></details>
+          </div>
+          <div id="cfg-video-happyhorse-fields">
+            <div class="settings-form-grid">
+              <div class="settings-field full"><label for="cfg-happy-key">快马 API Key</label><div class="settings-secret"><input type="password" id="cfg-happy-key" data-secret-field="happyhorse_api_key" autocomplete="new-password"><button type="button" onclick="StudioActions.togglePwd('cfg-happy-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-happy-key')">清除</button></div></div>
+            </div>
+            <details class="settings-advanced"><summary>高级设置</summary><div class="settings-advanced-body two-columns"><div class="settings-field"><label for="cfg-happy-base">Base URL</label><input type="url" id="cfg-happy-base" placeholder="https://api.apiyi.com"></div><div class="settings-field"><label for="cfg-happy-model">模型</label><input type="text" id="cfg-happy-model" placeholder="happyhorse-1.1-i2v"></div><div class="settings-field"><label for="cfg-happy-resolution">分辨率</label><select id="cfg-happy-resolution"><option value="720p">720p</option><option value="1080p">1080p</option></select></div></div></details>
+          </div>
+          <div id="cfg-video-seedance-fields">
+            <div class="settings-form-grid">
+              <div class="settings-field full"><label for="cfg-ark-key">Seedance Ark API Key</label><div class="settings-secret"><input type="password" id="cfg-ark-key" data-secret-field="ark_api_key" autocomplete="new-password" placeholder="ark-..."><button type="button" onclick="StudioActions.togglePwd('cfg-ark-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-ark-key')">清除</button></div></div>
+            </div>
+            <details class="settings-advanced" open><summary>高级设置</summary><div class="settings-advanced-body two-columns"><div class="settings-field"><label for="cfg-ark-base">Base URL</label><input type="url" id="cfg-ark-base" placeholder="https://ark.cn-beijing.volces.com"></div><div class="settings-field"><label for="cfg-ark-model">模型</label><select id="cfg-ark-model"><option value="doubao-seedance-2-0-fast-260128">doubao-seedance-2-0-fast-260128</option><option value="doubao-seedance-2-5-260628">doubao-seedance-2-5-260628</option><option value="doubao-seedance-2-0-260128">doubao-seedance-2-0-260128</option><option value="doubao-seedance-2-0-mini-260615">doubao-seedance-2-0-mini-260615</option><option value="doubao-seedance-1-5-pro-251215">doubao-seedance-1-5-pro-251215</option><option value="doubao-seedance-1-0-pro-250528">doubao-seedance-1-0-pro-250528</option><option value="doubao-seedance-1-0-pro-fast-251015">doubao-seedance-1-0-pro-fast-251015</option><option value="doubao-seedance-1-0-pro-fast-250528">doubao-seedance-1-0-pro-fast-250528</option><option value="doubao-seedance-1-0-lite-i2v-250428">doubao-seedance-1-0-lite-i2v-250428</option><option value="doubao-seedance-1-0-lite-t2v-250428">doubao-seedance-1-0-lite-t2v-250428</option></select></div><div class="settings-field"><label for="cfg-ark-resolution">分辨率</label><select id="cfg-ark-resolution"><option value="720p">720p</option><option value="1080p">1080p</option></select></div></div></details>
+          </div>
+          <div class="settings-test-row"><button class="btn-secondary btn-sm" onclick="StudioActions.testConnection('video')">测试连接</button><span id="cfg-video-test" class="settings-test-status" role="status"></span></div>
+        </section>
+
+        <section class="settings-panel" data-settings-panel="audio">
+          <div class="settings-panel-head"><div><span class="settings-kicker">AUDIO PIPELINE</span><h4>语音与音乐</h4><p>Qwen3-TTS 与 MiniMax 共用当前阿里云百炼视频账户；当前默认 Qwen3-TTS，Edge-TTS 仅在主服务失败时兜底。</p></div><span class="settings-capability live">百炼</span></div>
+          <div class="settings-grid two-columns"><div class="settings-field"><label for="cfg-tts-provider">百炼语音供应商</label><select id="cfg-tts-provider" onchange="StudioActions.onProviderChange('tts')"><option value="qwen3">Qwen3-TTS（当前默认）</option><option value="minimax">MiniMax</option></select></div><label class="settings-field" style="display:flex;align-items:center;gap:8px"><input id="cfg-edge-fallback" type="checkbox" checked> 主服务失败时使用 Edge-TTS</label></div>
+          <div id="cfg-qwen-tts-fields"><div class="settings-field"><label for="cfg-qwen-model">Qwen3-TTS 模型</label><input id="cfg-qwen-model" value="qwen3-tts-flash"><small>复用视频服务中的阿里云百炼 API Key 与 Base URL；Ethan/Cherry 为默认角色音色，可在角色声音档案中单独调整。</small></div><div class="settings-grid two-columns"><div class="settings-field"><label for="cfg-qwen-male">默认男声音色</label><input id="cfg-qwen-male" value="Ethan"></div><div class="settings-field"><label for="cfg-qwen-female">默认女声音色</label><input id="cfg-qwen-female" value="Cherry"></div><div class="settings-field"><label for="cfg-qwen-timeout">超时（秒）</label><input id="cfg-qwen-timeout" type="number" min="5" max="180" value="45"></div></div></div>
+          <details id="cfg-minimax-tts-fields" class="settings-advanced"><summary>MiniMax 备用配置</summary><div class="settings-advanced-body"><div class="settings-field"><label for="cfg-minimax-model">MiniMax 语音模型</label><input id="cfg-minimax-model" value="MiniMax/speech-2.8-turbo"></div><div class="settings-grid two-columns"><div class="settings-field"><label for="cfg-minimax-male">默认男声音色 ID</label><input id="cfg-minimax-male" placeholder="例如 male-qn-qingse"></div><div class="settings-field"><label for="cfg-minimax-female">默认女声音色 ID</label><input id="cfg-minimax-female" placeholder="在百炼音色列表中选择"></div><div class="settings-field"><label for="cfg-minimax-timeout">超时（秒）</label><input id="cfg-minimax-timeout" type="number" min="5" max="180" value="45"></div></div></div></details>
+          <div class="settings-service-row"><div><strong>Qwen3-TTS、MiniMax 与 Edge-TTS</strong><p>测试不会合成音频；生成记录会保存实际供应商，历史版本不会因切换默认模型而改变。</p></div><div class="settings-test-row"><button class="btn-secondary btn-sm" onclick="StudioActions.testConnection('tts')">测试百炼连接</button><span id="cfg-tts-test" class="settings-test-status"></span></div></div>
+        </section>
+
+        <section class="settings-panel" data-settings-panel="network">
+          <div class="settings-panel-head"><div><span class="settings-kicker">CONNECTIVITY</span><h4>网络</h4><p>为需要访问外部服务的后端请求设置 HTTP 代理。</p></div><span class="settings-capability optional">全局</span></div>
+          <div class="settings-field"><label for="cfg-proxy">HTTP 代理</label><input type="url" id="cfg-proxy" placeholder="http://127.0.0.1:7890"><small>留空使用系统直连。保存后立即作用于新请求。</small></div>
+        </section>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+<div class="modal-overlay" id="modal-manual-asset" style="display:none">
+  <div class="modal" style="max-width:640px">
+    <h3 id="manual-asset-title" style="margin-bottom:18px;font-size:18px">添加资产</h3>
+    <label style="display:block;font-size:12px;color:#a1a1aa;margin-bottom:6px">名称</label>
+    <input id="manual-asset-name" type="text" maxlength="120" style="width:100%;margin-bottom:14px">
+    <label style="display:block;font-size:12px;color:#a1a1aa;margin-bottom:6px">外观或环境描述</label>
+    <textarea id="manual-asset-description" rows="4" maxlength="2000" style="width:100%;margin-bottom:14px"></textarea>
+    <div id="manual-asset-time-wrap" style="display:none;margin-bottom:14px">
+      <label style="display:block;font-size:12px;color:#a1a1aa;margin-bottom:6px">时间、天气与光线</label>
+      <input id="manual-asset-time" type="text" maxlength="240" style="width:100%" placeholder="例如：雨夜，冷白路灯从右侧照入">
+    </div>
+    <label id="manual-asset-handheld-wrap" style="display:none;align-items:center;gap:8px;margin-bottom:14px;font-size:13px"><input id="manual-asset-handheld" type="checkbox"> 人物会持有或操作该道具</label>
+    <div id="manual-asset-scenes-wrap" style="margin-bottom:18px">
+      <div style="font-size:12px;color:#a1a1aa;margin-bottom:8px">绑定镜头</div>
+      <div id="manual-asset-scenes" style="display:flex;flex-wrap:wrap;gap:8px;max-height:130px;overflow:auto"></div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn-secondary" onclick="StudioActions.closeModal('modal-manual-asset')">取消</button>
+      <button class="btn-primary" id="btn-save-manual-asset" onclick="StudioActions.saveManualAsset()">添加资产</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ 项目编辑弹窗 ═══════════ -->
+<div class="modal-overlay" id="modal-new-project" style="display:none">
+  <div class="modal project-create-modal">
+    <h3 style="margin-bottom:20px;font-size:18px">新建项目</h3>
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">项目名称</label>
+      <input type="text" id="proj-name" placeholder="输入项目名称" style="margin-top:4px">
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">视频比例</label>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <span class="tag selected" data-ratio="9:16" onclick="StudioActions.selectRatio(this)">竖屏 9:16</span>
+        <span class="tag" data-ratio="16:9" onclick="StudioActions.selectRatio(this)">横屏 16:9</span>
+      </div>
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">剧集类型</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px" id="genre-tags">
+        <span class="tag" onclick="StudioActions.toggleTag(this)">甜宠</span>
+        <span class="tag" onclick="StudioActions.toggleTag(this)">逆袭</span>
+        <span class="tag" onclick="StudioActions.toggleTag(this)">悬疑</span>
+        <span class="tag" onclick="StudioActions.toggleTag(this)">古装</span>
+        <span class="tag" onclick="StudioActions.toggleTag(this)">科幻</span>
+        <span class="tag" onclick="StudioActions.toggleTag(this)">都市</span>
+        <span class="tag" onclick="StudioActions.toggleTag(this)">校园</span>
+      </div>
+    </div>
+    <div style="margin-bottom:20px">
+      <label style="font-size:12px;color:#a1a1aa">主视觉风格</label>
+      <div id="visual-style-options" class="visual-style-grid" aria-label="主视觉风格选择">
+        <div class="visual-style-empty">正在加载风格参考图...<br><span class="visual-style-fallback-labels">现代电影级二维赛璐璐 · 半写实动漫 · 日系商业动画 · 电影级真人写实</span></div>
+      </div>
+      <div class="visual-style-note">参考图只用于选择风格，不会作为生成任务的输入；生成时会使用项目内的角色、场景和道具资产。</div>
+    </div>
+    <div style="margin-bottom:20px">
+      <label style="font-size:12px;color:#a1a1aa">补充风格标签（可选）</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px" id="style-modifier-tags">
+        <span class="tag" data-modifier="赛博朋克" onclick="StudioActions.toggleStyleModifier(this)">赛博朋克</span>
+        <span class="tag" data-modifier="国风" onclick="StudioActions.toggleStyleModifier(this)">国风</span>
+        <span class="tag" data-modifier="清新" onclick="StudioActions.toggleStyleModifier(this)">清新</span>
+      </div>
+    </div>
+    <div style="margin-bottom:20px">
+      <label for="proj-audio-mode" style="font-size:12px;color:#a1a1aa">对白生成方式</label>
+      <select id="proj-audio-mode" style="width:100%;margin-top:4px">
+        <option value="auto">自动选择（Seedance 原生对白，其他模型使用 TTS）</option>
+        <option value="native_dialogue">优先使用视频模型原生对白</option>
+        <option value="external_tts">始终使用外部配音（TTS）</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn-secondary" onclick="StudioActions.closeModal('modal-new-project')">取消</button>
+      <button class="btn-primary" onclick="StudioActions.createProject()">创建项目</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-idea-script" style="display:none">
+  <div class="modal" style="width:min(760px,calc(100vw - 48px))">
+    <h3 style="margin-bottom:16px;font-size:18px">从创意生成剧本</h3>
+    <textarea id="idea-input" rows="12" maxlength="12000" placeholder="描述你想拍的故事：人物、事件、冲突、氛围或结局方向都可以写在这里。" style="width:100%;line-height:1.7"></textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px">
+      <button class="btn-secondary" onclick="StudioActions.closeModal('modal-idea-script')">取消</button>
+      <button class="btn-primary" id="btn-draft-generate" onclick="StudioActions.generateDraftFromIdea()">生成剧本草稿</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-import-script" style="display:none">
+  <div class="modal" style="width:min(760px,calc(100vw - 48px))">
+    <h3 style="margin-bottom:16px;font-size:18px">导入已有剧本</h3>
+    <button class="btn-secondary btn-sm" onclick="document.getElementById('script-file-input').click()">导入 TXT / DOCX / MD</button>
+    <span id="script-source-filename" style="font-size:12px;color:#a1a1aa;margin-left:8px"></span>
+    <textarea id="import-script-text" rows="14" maxlength="60000" placeholder="粘贴完整剧本正文" style="width:100%;margin-top:12px;line-height:1.7"></textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px">
+      <button class="btn-secondary" onclick="StudioActions.closeModal('modal-import-script')">取消</button>
+      <button class="btn-primary" onclick="StudioActions.saveImportedDraft()">确认并解析</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-script-draft" style="display:none">
+  <div class="modal" style="width:min(960px,calc(100vw - 48px))">
+    <h3 style="margin-bottom:12px;font-size:18px">剧本草稿</h3>
+    <textarea id="script-draft-editor" rows="18" maxlength="60000" style="width:100%;font-size:14px;line-height:1.7"></textarea>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <input id="script-draft-instruction" placeholder="例如：加强前两场的冲突，结局改为反转" style="flex:1">
+      <button class="btn-secondary" id="btn-draft-revise" onclick="StudioActions.reviseDraft()">AI 改写</button>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn-secondary" onclick="StudioActions.closeModal('modal-script-draft')">稍后继续</button>
+      <button class="btn-secondary" onclick="StudioActions.saveDraft()">保存草稿</button>
+      <button class="btn-secondary" id="btn-draft-regenerate" onclick="StudioActions.openIdeaModal()">重新生成</button>
+      <button class="btn-primary" id="btn-confirm-script" onclick="StudioActions.confirmDraftAndAnalyze()">确认并解析</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ 项目修改弹窗 ═══════════ -->
+<div class="modal-overlay" id="modal-edit-project" style="display:none">
+  <div class="modal">
+    <h3 style="margin-bottom:20px;font-size:18px">🔧 修改项目</h3>
+    <input type="hidden" id="edit-project-id">
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">项目名称</label>
+      <input type="text" id="edit-proj-name" placeholder="输入新名称" style="margin-top:4px">
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="font-size:12px;color:#a1a1aa">故事内容</label>
+      <textarea id="edit-user-input" rows="6" placeholder="修改故事创意…" style="font-size:12px;line-height:1.6;margin-top:4px"></textarea>
+    </div>
+    <div style="margin-bottom:20px">
+      <label style="font-size:12px;color:#a1a1aa">项目状态</label>
+      <select id="edit-status" style="margin-top:4px">
+        <option value="created">已创建</option>
+        <option value="scripted">剧本已生成</option>
+        <option value="completed">已完成</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn-secondary" onclick="StudioActions.closeModal('modal-edit-project')">取消</button>
+      <button class="btn-primary" onclick="StudioActions.saveEditProject()">💾 保存修改</button>
+    </div>
+  </div>
+</div>
+
+<div class="image-editor-overlay" id="modal-image-editor" style="display:none" role="dialog" aria-modal="true" aria-labelledby="image-editor-title">
+  <section class="image-editor-modal">
+    <div class="image-editor-header">
+      <h3 id="image-editor-title" style="margin:0">编辑形象</h3>
+      <button class="image-editor-close" type="button" title="关闭" aria-label="关闭" onclick="StudioActions.closeImageEditor()">&times;</button>
+    </div>
+    <div class="image-editor-layout">
+      <div class="image-editor-preview-panel">
+        <img id="image-editor-preview" class="image-editor-preview" alt="当前图片">
+        <div id="image-editor-preview-status" class="media-missing-notice" hidden></div>
+        <div id="image-editor-views" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:12px"></div>
+      </div>
+      <div class="image-editor-work-panel">
+        <label class="image-editor-label" for="image-editor-system-prompt">最终发送给图片服务的提示词</label>
+        <textarea id="image-editor-system-prompt" rows="9" style="width:100%" readonly></textarea>
+        <label class="image-editor-label" for="image-editor-negative-prompt" style="margin-top:10px">负面约束</label>
+        <textarea id="image-editor-negative-prompt" rows="3" style="width:100%" readonly></textarea>
+        <div id="image-editor-project-constraints" style="font-size:11px;line-height:1.5;color:#a1a1aa"></div>
+        <label class="image-editor-label" id="image-editor-prompt-label" for="image-editor-prompt" style="margin-top:14px">补充修改要求</label>
+        <textarea id="image-editor-prompt" rows="4" style="width:100%" placeholder="补充需要改变的可见细节。系统会固定保留当前视图的构图方向与禁用项。"></textarea>
+        <div id="image-generation-policy" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin:12px 0">
+          <label class="image-editor-label">模型服务<select id="image-editor-provider" onchange="StudioActions.changeImagePolicy()"></select></label>
+          <label class="image-editor-label">图片模型<select id="image-editor-model" onchange="StudioActions.changeImagePolicy()"></select></label>
+          <label class="image-editor-label">清晰度<select id="image-editor-resolution" onchange="StudioActions.changeImagePolicy()"></select></label>
+        </div>
+        <label id="image-editor-save-policy-row" class="image-editor-label" style="display:flex;align-items:center;gap:7px"><input id="image-editor-save-policy" type="checkbox"> 设为项目默认图片模型</label>
+        <label id="image-editor-reference-row" class="image-editor-label" style="margin-top:10px;display:none">附加角色参考图（可选）<select id="image-editor-reference-versions" multiple size="4" style="width:100%;margin-top:5px"></select></label>
+        <div id="image-generation-policy-note" style="font-size:12px;line-height:1.5;color:#a1a1aa;margin:8px 0"></div>
+      </div>
+      <div class="image-editor-meta-panel">
+        <span class="image-editor-label">资产名称</span>
+        <div id="image-editor-asset-name" class="image-editor-asset-name"></div>
+        <span class="image-editor-label" style="margin-top:18px">当前视图</span>
+        <div id="image-editor-asset-meta" class="image-editor-asset-name" style="color:#a1a1aa"></div>
+        <span class="image-editor-label" style="margin-top:18px">图片操作</span>
+        <button class="btn-secondary" style="width:100%;margin-bottom:8px" onclick="document.getElementById('image-editor-upload').click()">上传替换图片</button>
+        <input id="image-editor-upload" type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="StudioActions.uploadEditedImage(this)">
+        <div style="font-size:12px;line-height:1.6;color:#71717a">补充要求会叠加到当前视图的系统提示词；镜头方向、构图尺寸和禁用项始终由系统固定。新图片会自动保存为历史版本。</div>
+        <div class="image-editor-history-title">历史版本</div>
+        <div id="image-editor-history"></div>
+      </div>
+    </div>
+    <div class="image-editor-footer">
+      <button class="btn-secondary" onclick="StudioActions.closeImageEditor()">取消</button>
+      <button class="btn-secondary" id="btn-image-generate-master" onclick="StudioActions.generateCharacterMaster()" style="display:none">生成角色母版</button>
+      <button class="btn-secondary" id="btn-image-generate-all" onclick="StudioActions.generateAllCharacterViews()" style="display:none">生成四视图组图</button>
+      <button class="btn-primary" id="btn-image-regenerate" onclick="StudioActions.regenerateEditedImage()">重新生成图片</button>
+    </div>
+  </section>
+</div>
+
+<div class="api-progress" id="api-progress" aria-live="polite">
+  <div class="api-progress-head"><span class="api-progress-label" id="api-progress-label">AI 正在处理中</span><span class="api-progress-time" id="api-progress-time">0 秒</span></div>
+  <div class="api-progress-track"><div class="api-progress-fill" id="api-progress-fill"></div></div>
+</div>
+
+<aside class="project-jobs-drawer" id="project-jobs-drawer" aria-label="当前项目任务">
+  <div class="project-jobs-head"><div><h3>当前项目任务</h3><p id="project-jobs-project">尚未打开项目</p></div><button class="project-jobs-close" onclick="StudioActions.toggleProjectJobs(false)" title="关闭">×</button></div>
+  <div class="project-jobs-list" id="project-jobs-list"><div class="project-jobs-empty">当前项目暂无任务</div></div>
+</aside>
+
+<div class="modal-overlay" id="modal-job-detail" style="display:none">
+  <div class="modal" style="width:min(620px,calc(100vw - 40px));max-width:620px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px"><h3 style="font-size:17px">任务详情</h3><button class="project-jobs-close" onclick="StudioActions.closeModal('modal-job-detail')" title="关闭">×</button></div>
+    <div id="project-job-detail-content" style="max-height:65vh;overflow:auto;font-size:12px;line-height:1.65"></div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  const arkModelSelect = document.getElementById('cfg-ark-model');
+  if (!arkModelSelect) return;
+  const models = [
+    'doubao-seedance-2-0-fast-260128',
+    'doubao-seedance-2-5-260628',
+    'doubao-seedance-2-0-260128',
+    'doubao-seedance-2-0-mini-260615',
+    'doubao-seedance-1-5-pro-251215',
+    'doubao-seedance-1-0-pro-250528',
+    'doubao-seedance-1-0-pro-fast-251015',
+    'doubao-seedance-1-0-pro-fast-250528',
+    'doubao-seedance-1-0-lite-i2v-250428',
+    'doubao-seedance-1-0-lite-t2v-250428',
+  ];
+  const previous = arkModelSelect.value;
+  arkModelSelect.replaceChildren(...models.map(model => new Option(model, model)));
+  arkModelSelect.value = models.includes(previous) ? previous : models[0];
+});
+</script>
+<script type="module" src="/static/js/bootstrap.js?v=20260811-asset-quality-references&rev=20260812-style-selection-state-review"></script>
+</body>
+</html>
