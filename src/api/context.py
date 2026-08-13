@@ -423,6 +423,7 @@ def _state_to_json(state: DramaState) -> str:
         "visual_job_id": state.visual_job_id,
         "visual_stage_error": state.visual_stage_error,
         "visual_performance": state.visual_performance,
+        "prompt_review": state.prompt_review,
         "user_feedback": state.user_feedback,
         "scene_vision_descriptions": state.scene_vision_descriptions,
         "shot_productions": {
@@ -596,6 +597,7 @@ def _state_from_json(json_str: str) -> DramaState:
         visual_job_id=data.get("visual_job_id", ""),
         visual_stage_error=data.get("visual_stage_error", ""),
         visual_performance=data.get("visual_performance") or {},
+        prompt_review=data.get("prompt_review") or {},
     )
 
     # 重建 Pydantic 子模型
@@ -992,6 +994,12 @@ def _reconcile_state_after_script_change(
     from src.utils.visual_asset_manifest import normalize_scene_assets, normalize_scene_name, scene_source_signature, state_for_scene
 
     old_script = state.script
+    state.prompt_review = {
+        "status": "pending",
+        "prompt_signature": "",
+        "job_id": "",
+        "error": "",
+    }
     normalize_scene_assets(script)
     manifest = script.asset_manifest
     allowed_characters = {
@@ -1724,6 +1732,7 @@ def _production_payload(state: DramaState) -> dict:
             "language": state.generation_prompts.prompt_language,
             "needs_refresh": state.generation_prompts.needs_refresh,
         },
+        "prompt_review": state.prompt_review,
         "provider_capabilities": provider_capabilities(provider),
         "subtitle_enabled": state.subtitle_enabled,
         "subtitle_mode": state.subtitle_mode,

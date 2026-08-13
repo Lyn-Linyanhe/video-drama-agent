@@ -13,6 +13,7 @@ from .scene_image_agent import SceneImageAgent
 # Merged agents (9 → 7 agent architecture)
 from .visual_prompt_agent import VisualPromptAgent
 from .image_gen_agent import ImageGenerationAgent
+from .prompt_review_agent import PromptReviewAgent
 
 __all__ = [
     "ScriptAgent",
@@ -27,4 +28,5 @@ __all__ = [
     # Merged
     "VisualPromptAgent",
     "ImageGenerationAgent",
+    "PromptReviewAgent",
 ]

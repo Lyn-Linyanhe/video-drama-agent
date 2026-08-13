@@ -39,6 +39,7 @@ from src.services.video_continuity import continuity_reference, extract_tail_fra
 from src.services.asr import align_native_subtitles
 from src.schemas.audio import SceneAudio
 from src.schemas.prompt import ShotPrompt
+from src.agents.prompt_review_agent import PromptReviewAgent
 
 router = APIRouter()
 
@@ -317,6 +318,102 @@ def _cancel_active_visual_jobs(project_id: str) -> None:
             job_manager.cancel(project_id, job["job_id"])
 
 
+def _prompt_review_signature(state: DramaState) -> str:
+    """Version the audit against the exact script, prompts, and project policy."""
+    payload = {
+        "script": state.script.model_dump() if state.script else None,
+        "generation_prompts": state.generation_prompts.model_dump() if state.generation_prompts else None,
+        "prompt_policy": state.prompt_policy.model_dump(),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _mark_prompt_review_stale(state: DramaState) -> None:
+    """Keep reports from being presented as current after a prompt edit."""
+    previous = dict(state.prompt_review or {})
+    if not previous:
+        return
+    previous["status"] = "stale"
+    previous["error"] = ""
+    state.prompt_review = previous
+
+
+async def _job_prompt_review(context, payload: dict) -> dict:
+    """Audit generated storyboard prompts with the configured Kimi account."""
+    expected_signature = str(payload.get("prompt_signature") or "")
+    agent = PromptReviewAgent()
+    if not agent.enabled():
+        return {"skipped": True, "reason": "Kimi 分镜审核已关闭"}
+    if not agent.is_configured():
+        raise ValueError(agent.configuration_error())
+
+    async with context.project_lock:
+        state = _load_project_state(context.project_id)
+        current_signature = _prompt_review_signature(state)
+        if expected_signature and expected_signature != current_signature:
+            _mark_prompt_review_stale(state)
+            _save_project_state(state)
+            return {"stale": True, "prompt_signature": expected_signature}
+        state.prompt_review = {
+            **dict(state.prompt_review or {}),
+            "status": "generating",
+            "prompt_signature": current_signature,
+            "job_id": context.job_id,
+            "provider": "kimi",
+            "model": agent._settings()[1],
+            "error": "",
+        }
+        _save_project_state(state)
+        script = state.script.model_copy(deep=True)
+        prompts = state.generation_prompts.model_copy(deep=True)
+        visual = state.visual_design.model_copy(deep=True) if state.visual_design else None
+        policy = state.prompt_policy.model_copy(deep=True)
+
+    context.progress("waiting_provider", 0, 1, "Kimi 正在核对剧本与分镜提示词")
+    try:
+        result = await agent.run(script, prompts, visual, policy)
+    except BaseException as exc:
+        async with context.project_lock:
+            latest = _load_project_state(context.project_id, require_visual=False)
+            if _prompt_review_signature(latest) == expected_signature:
+                latest.prompt_review = {
+                    **dict(latest.prompt_review or {}),
+                    "status": "failed",
+                    "prompt_signature": expected_signature,
+                    "job_id": context.job_id,
+                    "provider": "kimi",
+                    "model": agent._settings()[1],
+                    "error": str(exc)[:500],
+                }
+                _save_project_state(latest)
+        raise
+    context.check_cancelled()
+    async with context.project_lock:
+        latest = _load_project_state(context.project_id)
+        current_signature = _prompt_review_signature(latest)
+        if expected_signature and expected_signature != current_signature:
+            _mark_prompt_review_stale(latest)
+            _save_project_state(latest)
+            return {"stale": True, "prompt_signature": expected_signature}
+        latest.prompt_review = {
+            "status": "ready",
+            "prompt_signature": current_signature,
+            "job_id": context.job_id,
+            "provider": "kimi",
+            "model": agent._settings()[1],
+            "error": "",
+            "report": result.model_dump(),
+        }
+        _save_project_state(latest)
+    context.progress("saving", 1, 1, "已保存 Kimi 分镜审核报告")
+    return {
+        "stale": False,
+        "prompt_signature": current_signature,
+        "report": result.model_dump(),
+    }
+
+
 async def _job_script_visualize(context, payload: dict) -> dict:
     """Generate visual design after the user can already review the script."""
     expected_signature = str(payload.get("script_signature") or "")
@@ -407,8 +504,44 @@ async def _job_script_visualize(context, payload: dict) -> dict:
         project_store.set_visual_design(context.project_id, visual.model_dump())
         project_store.add_stage(context.project_id, "stage1")
         project_store.update_status(context.project_id, "scripted")
+        reviewer = PromptReviewAgent()
+        prompt_signature = _prompt_review_signature(latest)
+        if reviewer.enabled() and reviewer.is_configured():
+            latest.prompt_review = {
+                "status": "generating",
+                "prompt_signature": prompt_signature,
+                "job_id": "",
+                "provider": "kimi",
+                "model": reviewer._settings()[1],
+                "error": "",
+            }
+            _save_project_state(latest)
+            review_job = job_manager.create_job(
+                context.project_id,
+                "prompt.review",
+                "prompt_set",
+                "current",
+                {"prompt_signature": prompt_signature},
+                provider="kimi",
+            )
+            latest.prompt_review["job_id"] = review_job["job_id"]
+        else:
+            latest.prompt_review = {
+                "status": "unavailable",
+                "prompt_signature": prompt_signature,
+                "job_id": "",
+                "provider": "kimi",
+                "model": reviewer._settings()[1],
+                "error": reviewer.configuration_error(),
+            }
         _save_project_state(latest)
-    return {"stale": False, "script_signature": expected_signature, "visual_design": visual.model_dump(), "generation_prompts": generation_prompts.model_dump()}
+    return {
+        "stale": False,
+        "script_signature": expected_signature,
+        "visual_design": visual.model_dump(),
+        "generation_prompts": generation_prompts.model_dump(),
+        "prompt_review": latest.prompt_review,
+    }
 
 
 async def _job_asset_generate(context, payload: dict) -> dict:
@@ -927,6 +1060,7 @@ register_handlers(job_manager, {
     "script.draft.revise": _job_script_draft_revise,
     "script.analyze": _job_script_analyze,
     "script.visualize": _job_script_visualize,
+    "prompt.review": _job_prompt_review,
     "asset.generate": _job_asset_generate,
     "character.reference.group": _job_character_reference_group,
     "scene.reference.group": _job_scene_reference_group,
@@ -1045,7 +1179,7 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
     _ensure_reference_job_handlers()
     production_job_types = {
         "asset.generate", "character.reference.group", "character.reference.edit", "scene.reference.edit",
-        "scene.reference.group", "prop.reference.group", "video.generate", "audio.generate", "final.assemble",
+        "scene.reference.group", "prop.reference.group", "prompt.review", "video.generate", "audio.generate", "final.assemble",
     }
     if req.job_type in production_job_types:
         workflow_state = _load_project_state(project_id, require_visual=False, require_script=False)
@@ -1066,6 +1200,31 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
         specs.append({
             "job_type": "script.analyze", "target_type": "script", "target_id": "current", "provider": "llm",
             "payload": {**req.payload, "source_text": source_text, "original_input": str(req.payload.get("original_input") or source_text)},
+        })
+    elif req.job_type == "prompt.review":
+        state = _load_project_state(project_id)
+        reviewer = PromptReviewAgent()
+        if not reviewer.enabled():
+            raise HTTPException(409, "Kimi 分镜审核已关闭")
+        if not reviewer.is_configured():
+            raise HTTPException(409, reviewer.configuration_error())
+        signature = _prompt_review_signature(state)
+        state.prompt_review = {
+            **dict(state.prompt_review or {}),
+            "status": "generating",
+            "prompt_signature": signature,
+            "job_id": "",
+            "provider": "kimi",
+            "model": reviewer._settings()[1],
+            "error": "",
+        }
+        _save_project_state(state)
+        specs.append({
+            "job_type": "prompt.review",
+            "target_type": "prompt_set",
+            "target_id": "current",
+            "provider": "kimi",
+            "payload": {"prompt_signature": signature},
         })
     elif req.job_type == "asset.generate":
         state = _load_project_state(project_id)

@@ -40,7 +40,7 @@ class QualityReport(BaseModel):
 
 class JobCreateRequest(BaseModel):
     job_type: Literal[
-        "script.generate", "script.draft.generate", "script.draft.revise", "script.analyze", "script.visualize", "asset.generate",
+        "script.generate", "script.draft.generate", "script.draft.revise", "script.analyze", "script.visualize", "prompt.review", "asset.generate",
         "character.reference.group", "character.reference.edit",
         "scene.reference.group", "scene.reference.edit", "prop.reference.group",
         "video.generate", "audio.generate", "final.assemble",

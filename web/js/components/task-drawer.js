@@ -14,7 +14,7 @@ const JOB_STAGE_LABELS = {
   visual_review: '视觉审核', saving: '保存结果', completed: '完成', failed: '失败', canceled: '已终止', interrupted: '已中断',
 };
 const JOB_TYPE_LABELS = {
-  'script.generate': '生成剧本', 'script.draft.generate': '生成剧本草稿', 'script.draft.revise': 'AI 改写草稿', 'script.analyze': '确认并解析剧本', 'script.visualize': '生成视觉与分镜提示词', 'asset.generate': '生成图片',
+  'script.generate': '生成剧本', 'script.draft.generate': '生成剧本草稿', 'script.draft.revise': 'AI 改写草稿', 'script.analyze': '确认并解析剧本', 'script.visualize': '生成视觉与分镜提示词', 'prompt.review': 'Kimi 分镜提示词审核', 'asset.generate': '生成图片',
   'character.reference.group': '角色参考组图', 'character.reference.edit': '角色参考修订', 'scene.reference.group': '场景参考组图', 'scene.reference.edit': '场景参考修订', 'prop.reference.group': '道具参考视图',
   'video.generate': '生成视频', 'audio.generate': '生成缺失台词', 'final.assemble': '合成作品',
 };

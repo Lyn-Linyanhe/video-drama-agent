@@ -71,6 +71,9 @@ class DramaState:
     visual_performance: dict = field(default_factory=dict)
     """Per-stage LLM timing and retry observations for support diagnostics."""
 
+    prompt_review: dict = field(default_factory=dict)
+    """Kimi storyboard prompt-review lifecycle and latest report."""
+
     generated_assets: Optional[GeneratedAssets] = None
     """Output of Video Generation Agent — generated video files."""
 

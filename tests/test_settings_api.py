@@ -59,6 +59,7 @@ def test_settings_reads_and_exports_never_expose_secrets(tmp_path, monkeypatch):
     profile = settings_routes.SettingsRequest(
         profile_name="production",
         llm_key="test-llm-secret",
+        kimi_prompt_review_api_key="test-kimi-review-secret",
         kling_api_key="test-kling-secret",
         image_gen_key="test-image-secret",
     ).model_dump(exclude={"clear_secret_fields"})
@@ -71,14 +72,17 @@ def test_settings_reads_and_exports_never_expose_secrets(tmp_path, monkeypatch):
     listing = client.get("/api/settings").json()
     public = listing["profiles"]["production"]
     assert public["llm_key"] == ""
+    assert public["kimi_prompt_review_api_key"] == ""
     assert public["kling_api_key"] == ""
     assert public["image_gen_key"] == ""
     assert public["_secret_configured"]["llm_key"] is True
+    assert public["_secret_configured"]["kimi_prompt_review_api_key"] is True
 
     detail = client.get("/api/settings/production").json()
     assert detail["llm_key"] == ""
     exported = client.get("/api/settings/production/export").text
     assert "test-llm-secret" not in exported
+    assert "test-kimi-review-secret" not in exported
     assert "test-kling-secret" not in exported
     assert "test-image-secret" not in exported
 
@@ -125,6 +129,69 @@ def test_blank_save_preserves_secret_and_explicit_clear_removes_it(tmp_path, mon
     assert response.status_code == 200
     saved = json.loads(settings_file.read_text(encoding="utf-8"))["profiles"]["production"]
     assert saved["llm_key"] == ""
+
+
+def test_deepseek_primary_and_kimi_review_credentials_are_saved_independently(tmp_path, monkeypatch):
+    client, settings_file = _settings_client(tmp_path, monkeypatch)
+    env_calls = []
+    monkeypatch.setattr(settings_routes, "_write_env", lambda **kwargs: env_calls.append(kwargs))
+    monkeypatch.setattr(settings_routes, "_reload_env_and_config", lambda: None)
+
+    response = client.post(
+        "/api/settings",
+        json={
+            "profile_name": "production",
+            "llm_provider": "deepseek",
+            "llm_model": "deepseek-v4-flash",
+            "llm_key": "deepseek-secret",
+            "kimi_prompt_review_enabled": True,
+            "kimi_prompt_review_api_key": "kimi-review-secret",
+            "kimi_prompt_review_model": "kimi-k2.6",
+            "kimi_prompt_review_base_url": "https://api.moonshot.cn/v1",
+        },
+    )
+
+    assert response.status_code == 200
+    saved = json.loads(settings_file.read_text(encoding="utf-8"))["profiles"]["production"]
+    assert saved["llm_provider"] == "deepseek"
+    assert saved["llm_key"] == "deepseek-secret"
+    assert saved["kimi_prompt_review_api_key"] == "kimi-review-secret"
+    assert env_calls[-1]["llm_key"] == "deepseek-secret"
+    assert env_calls[-1]["kimi_prompt_review_key"] == "kimi-review-secret"
+    assert response.json()["profile"]["kimi_prompt_review_api_key"] == ""
+
+
+def test_blank_kimi_review_key_is_preserved_and_can_be_cleared(tmp_path, monkeypatch):
+    profile = settings_routes.SettingsRequest(
+        profile_name="production",
+        llm_provider="deepseek",
+        llm_key="deepseek-secret",
+        kimi_prompt_review_api_key="kimi-review-secret",
+    ).model_dump(exclude={"clear_secret_fields"})
+    client, settings_file = _settings_client(
+        tmp_path,
+        monkeypatch,
+        {"profiles": {"production": profile}, "active_profile": "production"},
+    )
+    monkeypatch.setattr(settings_routes, "_write_env", lambda **kwargs: None)
+    monkeypatch.setattr(settings_routes, "_reload_env_and_config", lambda: None)
+
+    response = client.post("/api/settings", json={"profile_name": "production", "llm_provider": "deepseek"})
+    assert response.status_code == 200
+    saved = json.loads(settings_file.read_text(encoding="utf-8"))["profiles"]["production"]
+    assert saved["kimi_prompt_review_api_key"] == "kimi-review-secret"
+
+    response = client.post(
+        "/api/settings",
+        json={
+            "profile_name": "production",
+            "llm_provider": "deepseek",
+            "clear_secret_fields": ["kimi_prompt_review_api_key"],
+        },
+    )
+    assert response.status_code == 200
+    saved = json.loads(settings_file.read_text(encoding="utf-8"))["profiles"]["production"]
+    assert saved["kimi_prompt_review_api_key"] == ""
 
 
 def test_startup_falls_back_when_active_profile_has_no_llm_key(tmp_path, monkeypatch):
@@ -457,6 +524,24 @@ def test_write_env_treats_kimi_as_openai_compatible(tmp_path, monkeypatch):
     assert "OPENAI_API_KEY=moonshot-secret" in env_text
     assert "OPENAI_BASE_URL=https://api.moonshot.cn/v1" in env_text
     assert "ANTHROPIC_API_KEY=" in env_text
+
+
+def test_write_env_keeps_deepseek_primary_and_kimi_review_credentials_separate(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings_routes, "BASE_DIR", tmp_path)
+
+    settings_routes._write_env(
+        llm_provider="deepseek",
+        llm_model="deepseek-v4-flash",
+        llm_key="deepseek-secret",
+        kimi_prompt_review_enabled=True,
+        kimi_prompt_review_key="kimi-review-secret",
+    )
+
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "LLM_PROVIDER=deepseek" in env_text
+    assert "OPENAI_API_KEY=deepseek-secret" in env_text
+    assert "KIMI_PROMPT_REVIEW_ENABLED=true" in env_text
+    assert "KIMI_PROMPT_REVIEW_API_KEY=kimi-review-secret" in env_text
 
 
 def test_write_env_mirrors_proxy_for_https_requests(tmp_path, monkeypatch):

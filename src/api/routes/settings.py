@@ -9,6 +9,7 @@ router = APIRouter()
 SETTINGS_FILE = BASE_DIR / "output" / "settings_ui.json"
 SECRET_SETTING_FIELDS = (
     "llm_key",
+    "kimi_prompt_review_api_key",
     "kling_api_key",
     "kling_access_key",
     "kling_secret_key",
@@ -99,6 +100,9 @@ def _normalize_audio_profile(profile: dict) -> dict:
         normalized.get("llm_model", ""),
     )
     normalized["llm_timeout"] = _normalize_llm_timeout(normalized.get("llm_timeout", "300"))
+    normalized.setdefault("kimi_prompt_review_enabled", True)
+    normalized.setdefault("kimi_prompt_review_model", "kimi-k2.6")
+    normalized.setdefault("kimi_prompt_review_base_url", "https://api.moonshot.cn/v1")
     legacy_key = str(normalized.get("minimax_api_key") or "").strip()
     if not normalized.get("happyhorse_api_key") and legacy_key:
         normalized["happyhorse_api_key"] = legacy_key
@@ -180,6 +184,11 @@ class SettingsRequest(BaseModel):
     llm_stream: str = "true"
     llm_temperature: str = "0.7"
     llm_top_p: str = "0.9"
+    # ── Dedicated Kimi storyboard-prompt review ──
+    kimi_prompt_review_enabled: bool = True
+    kimi_prompt_review_api_key: str = ""
+    kimi_prompt_review_model: str = "kimi-k2.6"
+    kimi_prompt_review_base_url: str = "https://api.moonshot.cn/v1"
     # ── Audio ──
     # Legacy values stay parseable for imported profiles but are excluded from
     # every persisted profile. Both adapters use happyhorse_api_key/base_url.
@@ -290,6 +299,10 @@ async def save_settings(req: SettingsRequest):
         minimax_timeout=profile["minimax_timeout"], edge_tts_fallback=profile["edge_tts_fallback"],
         minimax_male_voice=profile["minimax_default_male_voice"], minimax_female_voice=profile["minimax_default_female_voice"],
         llm_timeout=profile["llm_timeout"], llm_stream=profile["llm_stream"],
+        kimi_prompt_review_enabled=profile["kimi_prompt_review_enabled"],
+        kimi_prompt_review_key=profile["kimi_prompt_review_api_key"],
+        kimi_prompt_review_model=profile["kimi_prompt_review_model"],
+        kimi_prompt_review_base_url=profile["kimi_prompt_review_base_url"],
     )
     _reload_env_and_config()
     return {
@@ -704,7 +717,10 @@ def _write_env(llm_provider="", llm_model="", llm_key="", llm_base="",
                http_proxy="", tts_provider="qwen3", qwen_model="qwen3-tts-flash", qwen_timeout="45",
                qwen_male_voice="Ethan", qwen_female_voice="Cherry",
                minimax_model="MiniMax/speech-2.8-turbo", minimax_timeout="45", edge_tts_fallback=True,
-               minimax_male_voice="", minimax_female_voice="", llm_timeout="1800", llm_stream="true"):
+               minimax_male_voice="", minimax_female_voice="", llm_timeout="1800", llm_stream="true",
+               kimi_prompt_review_enabled=True, kimi_prompt_review_key="",
+               kimi_prompt_review_model="kimi-k2.6",
+               kimi_prompt_review_base_url="https://api.moonshot.cn/v1"):
     """写入 .env 文件。"""
     env_path = BASE_DIR / ".env"
     llm_model = _normalize_llm_model(llm_provider, llm_model)
@@ -723,6 +739,10 @@ def _write_env(llm_provider="", llm_model="", llm_key="", llm_base="",
         "OPENAI_BASE_URL": llm_base or LLM_DEFAULT_BASE_URLS.get(llm_provider, ""),
         "LLM_TIMEOUT": llm_timeout or "1800",
         "LLM_STREAM": llm_stream or "true",
+        "KIMI_PROMPT_REVIEW_ENABLED": "true" if kimi_prompt_review_enabled else "false",
+        "KIMI_PROMPT_REVIEW_API_KEY": kimi_prompt_review_key,
+        "KIMI_PROMPT_REVIEW_MODEL": kimi_prompt_review_model or "kimi-k2.6",
+        "KIMI_PROMPT_REVIEW_BASE_URL": kimi_prompt_review_base_url or "https://api.moonshot.cn/v1",
         "DEFAULT_VIDEO_API": default_video_api,
         "KLING_API_KEY": kling_api_key,
         "KLING_ACCESS_KEY": kling_ak,
@@ -964,6 +984,10 @@ def _restore_env_from_settings() -> None:
         http_proxy=profile.get("http_proxy", ""),
         llm_timeout=profile.get("llm_timeout", "1800"),
         llm_stream=profile.get("llm_stream", "true"),
+        kimi_prompt_review_enabled=profile.get("kimi_prompt_review_enabled", True),
+        kimi_prompt_review_key=profile.get("kimi_prompt_review_api_key", ""),
+        kimi_prompt_review_model=profile.get("kimi_prompt_review_model", "kimi-k2.6"),
+        kimi_prompt_review_base_url=profile.get("kimi_prompt_review_base_url", "https://api.moonshot.cn/v1"),
     )
         print(f"[启动] 已从档案 '{active}' 恢复配置")
     except Exception as exc:

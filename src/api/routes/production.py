@@ -128,6 +128,9 @@ async def update_project_production_shot(
         production.transition_duration_sec = req.transition_duration_sec
         production.transition_manual = True
         scene.transition_duration_sec = req.transition_duration_sec
+    if req.prompt.strip() or req.negative_prompt is not None or req.duration_sec is not None:
+        from .jobs import _mark_prompt_review_stale
+        _mark_prompt_review_stale(state)
     _save_project_state(state)
     return _production_payload(state)
 
@@ -154,6 +157,8 @@ async def revise_project_production_prompt(
         raise HTTPException(502, f"AI prompt revision failed: {exc}") from exc
     prompt.prompt = updated.strip().strip('"').strip("'")
     state.prompt_overrides[str(scene_id)] = prompt.prompt
+    from .jobs import _mark_prompt_review_stale
+    _mark_prompt_review_stale(state)
     _ensure_shot_production(state, scene_id)
     _save_project_state(state)
     return _production_payload(state)
@@ -319,6 +324,8 @@ async def update_project_prompt_policy(project_id: str, req: PromptPolicyRequest
 
     state = _load_project_state(project_id)
     state.prompt_policy = PromptPolicy.model_validate(req.model_dump())
+    from .jobs import _mark_prompt_review_stale
+    _mark_prompt_review_stale(state)
     _save_project_state(state)
     return _production_payload(state)
 

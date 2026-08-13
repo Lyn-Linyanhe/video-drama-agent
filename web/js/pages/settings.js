@@ -13,6 +13,7 @@ const SETTINGS_DEFAULTS = {
   profile_name: '默认配置', http_proxy: '',
   llm_provider: 'deepseek', llm_model: 'deepseek-v4-flash', llm_key: '', llm_base_url: '',
   llm_timeout: '1800', llm_stream: 'true', llm_temperature: '0.7', llm_top_p: '0.9',
+  kimi_prompt_review_enabled: true, kimi_prompt_review_api_key: '', kimi_prompt_review_model: 'kimi-k2.6', kimi_prompt_review_base_url: 'https://api.moonshot.cn/v1',
   tts_provider: 'edge', tts_key: '', tts_base_url: '', tts_model: '',
   minimax_api_key: '', minimax_model: 'MiniMax/speech-2.8-turbo', minimax_timeout: '45', minimax_default_male_voice: '', minimax_default_female_voice: '',
   dashscope_tts_provider: 'qwen3', qwen_tts_model: 'qwen3-tts-flash', qwen_timeout: '45', qwen_default_male_voice: 'Ethan', qwen_default_female_voice: 'Cherry', edge_tts_fallback: true,
@@ -139,6 +140,10 @@ function collectSettings(profileName) {
     llm_model: document.getElementById('cfg-llm-model').value,
     llm_key: document.getElementById('cfg-llm-key').value,
     llm_base_url: document.getElementById('cfg-llm-base').value,
+    kimi_prompt_review_enabled: document.getElementById('cfg-kimi-review-enabled').checked,
+    kimi_prompt_review_api_key: document.getElementById('cfg-kimi-review-key').value,
+    kimi_prompt_review_model: document.getElementById('cfg-kimi-review-model').value,
+    kimi_prompt_review_base_url: document.getElementById('cfg-kimi-review-base').value,
     default_video_api: document.getElementById('cfg-video-api').value,
     kling_api_key: document.getElementById('cfg-kling-api-key').value,
     kling_access_key: document.getElementById('cfg-kling-access-key').value,
@@ -184,6 +189,12 @@ function populateSettings(p) {
   if (currentSettingsProfile.llm_model && ![...modelSelect.options].some(option => option.value === currentSettingsProfile.llm_model)) modelSelect.add(new Option(currentSettingsProfile.llm_model, currentSettingsProfile.llm_model));
   set('cfg-llm-model', currentSettingsProfile.llm_model);
   set('cfg-llm-base', currentSettingsProfile.llm_base_url);
+  const kimiReviewEnabled = document.getElementById('cfg-kimi-review-enabled');
+  if (kimiReviewEnabled) kimiReviewEnabled.checked = currentSettingsProfile.kimi_prompt_review_enabled !== false;
+  const kimiReviewModel = document.getElementById('cfg-kimi-review-model');
+  if (currentSettingsProfile.kimi_prompt_review_model && ![...kimiReviewModel.options].some(option => option.value === currentSettingsProfile.kimi_prompt_review_model)) kimiReviewModel.add(new Option(currentSettingsProfile.kimi_prompt_review_model, currentSettingsProfile.kimi_prompt_review_model));
+  set('cfg-kimi-review-model', currentSettingsProfile.kimi_prompt_review_model || 'kimi-k2.6');
+  set('cfg-kimi-review-base', currentSettingsProfile.kimi_prompt_review_base_url || 'https://api.moonshot.cn/v1');
   set('cfg-video-api', ['mock','happyhorse','seedance','seedence'].includes(currentSettingsProfile.default_video_api) ? (currentSettingsProfile.default_video_api === 'seedence' ? 'seedance' : currentSettingsProfile.default_video_api) : 'mock');
   set('cfg-video-model', currentSettingsProfile.kling_model);
   set('cfg-video-mode', currentSettingsProfile.kling_mode);

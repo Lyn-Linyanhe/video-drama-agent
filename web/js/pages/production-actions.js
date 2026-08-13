@@ -162,6 +162,44 @@ function productionReferenceHtml(reference, index) {
   return `<div class="reference-chip" draggable="true" ondragstart="StudioActions.productionDragStart(${index})" ondragover="event.preventDefault()" ondrop="StudioActions.productionDropReference(${index})"><img src="${image}" alt=""><span>${escapeHtml(reference.label || reference.reference_id)}</span><button title="移除参考" onclick="StudioActions.productionRemoveReference(${index})">×</button></div>`;
 }
 
+function promptReviewHtml(review) {
+  const status = review?.status || 'pending';
+  const labels = {
+    pending: '待审核',
+    generating: 'Kimi 审核中',
+    ready: '审核完成',
+    stale: '报告已过期',
+    failed: '审核失败',
+    unavailable: '未配置 Kimi',
+  };
+  const report = review?.report || {};
+  const score = Number.isFinite(Number(report.overall_score)) ? Number(report.overall_score) : null;
+  const color = status === 'ready' && report.passed
+    ? '#86efac'
+    : status === 'ready' || status === 'stale'
+      ? '#fbbf24'
+      : status === 'failed'
+        ? '#fca5a5'
+        : '#a1a1aa';
+  const summary = review?.error || report.summary || (
+    status === 'stale'
+      ? '分镜提示词已被修改，请重新检验以获得当前报告。'
+      : status === 'unavailable'
+        ? '请在 API 设置的“分镜提示词审核（Kimi）”中保存 Kimi API Key 后再检验。'
+        : '审核将逐镜核对剧本覆盖度、剧情忠实度、连续性和可执行性。'
+  );
+  const issues = report.issues || [];
+  return `<section class="production-panel" style="margin:0 0 10px;padding:12px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <div><b style="font-size:13px">Kimi 分镜提示词检验</b><span style="margin-left:8px;color:${color};font-size:12px">${escapeHtml(labels[status] || status)}${score !== null ? ` · ${score} 分` : ''}</span></div>
+      <button class="btn-secondary btn-sm" onclick="StudioActions.productionReviewPrompts()" ${status === 'generating' ? 'disabled' : ''}>${status === 'generating' ? '审核中' : '重新检验'}</button>
+      ${review?.model ? `<span style="color:#71717a;font-size:11px">${escapeHtml(review.model)}</span>` : ''}
+    </div>
+    <div style="margin-top:7px;color:#d4d4d8;font-size:12px;line-height:1.55">${escapeHtml(summary)}</div>
+    ${issues.length ? `<div style="display:grid;gap:6px;margin-top:10px">${issues.slice(0, 3).map(item => `<div style="padding:8px;border-left:3px solid ${item.severity === 'critical' ? '#ef4444' : item.severity === 'major' ? '#f59e0b' : '#60a5fa'};background:#202024;font-size:11px"><b>镜头 ${escapeHtml(String(item.scene_id || '全片'))} · ${escapeHtml(item.severity)}</b><div style="margin-top:3px">${escapeHtml(item.description)}</div><div style="margin-top:3px;color:#a1a1aa">${escapeHtml(item.suggestion)}</div></div>`).join('')}</div>` : ''}
+  </section>`;
+}
+
 function renderProductionWorkspace() {
   const root = document.getElementById('shot-production-workspace');
   if (!root) return;
@@ -172,6 +210,15 @@ function renderProductionWorkspace() {
   const {scene, prompt, production} = current;
   const effective = current.effective_prompt || {};
   const promptQuality = productionData.prompt_quality || {};
+  const promptReview = productionData.prompt_review || {};
+  const currentPromptReview = (promptReview.report?.shots || []).find(item => Number(item.scene_id) === Number(scene.scene_id));
+  const currentPromptIssues = [
+    ...(currentPromptReview?.issues || []),
+    ...(promptReview.report?.issues || []).filter(item => Number(item.scene_id) === Number(scene.scene_id)),
+  ];
+  const currentPromptReviewHtml = currentPromptReview
+    ? `<div style="margin-top:8px;padding:8px;border:1px solid ${currentPromptReview.passed ? '#166534' : '#854d0e'};background:#18181b;font-size:11px;line-height:1.55"><b style="color:${currentPromptReview.passed ? '#86efac' : '#fbbf24'}">Kimi 检验：${escapeHtml(String(currentPromptReview.score))} 分 · ${currentPromptReview.passed ? '通过' : '需修改'}</b>${currentPromptReview.summary ? `<div style="margin-top:3px;color:#d4d4d8">${escapeHtml(currentPromptReview.summary)}</div>` : ''}${currentPromptIssues.length ? `<div style="display:grid;gap:4px;margin-top:6px">${currentPromptIssues.map(item => `<div><span style="color:${item.severity === 'critical' ? '#fca5a5' : '#fbbf24'}">${escapeHtml(item.severity)}</span> · ${escapeHtml(item.description)}<br><span style="color:#a1a1aa">${escapeHtml(item.suggestion)}</span></div>`).join('')}</div>` : ''}</div>`
+    : '';
   const providerPrompt = effective.provider_prompt || effective.effective_prompt || prompt.prompt || '';
   const providerNegative = effective.provider_negative_prompt || '';
   const negativeMode = effective.negative_prompt_mode || 'merged';
@@ -228,6 +275,7 @@ function renderProductionWorkspace() {
   root.innerHTML = `
     <div class="production-toolbar" style="margin-bottom:14px"><h3 style="margin:0 auto 0 0">分镜制作</h3><button class="btn-primary btn-sm" onclick="StudioActions.productionGeneratePending()">${activeVideoJobs.length ? `终止本批次 ${batchCompleted}/${batchJobs.length || activeVideoJobs.length}` : '一键准备参考图并生成视频'}</button><button class="btn-secondary btn-sm" id="btn-gen-audio" onclick="StudioActions.productionGenerateAudio()">${activeAudioJob ? '终止台词生成' : (audioSummary.failed_line_count ? '重试失败台词' : '生成缺失台词')}</button><button class="btn-secondary btn-sm" id="btn-assemble" onclick="StudioActions.productionAssembleVideo()">${activeFinalJob ? '终止合成' : '合成作品'}</button><span id="production-global-status" style="font-size:11px;color:#a1a1aa"></span></div>
     ${promptQuality.needs_refresh ? '<div class="production-panel" style="margin:0 0 10px;padding:10px;color:#fbbf24;font-size:12px">当前项目含旧版非中文分镜提示词。已有视频与手动编辑将保留；确认需要更新时，请重新解析剧本以生成新版中文分镜。</div>' : ''}
+    ${promptReviewHtml(promptReview)}
     <details class="production-panel" style="margin:0 0 10px;padding:12px"><summary style="cursor:pointer">提示词策略</summary><div style="display:grid;gap:8px;margin-top:10px"><input id="production-style-prefix" class="production-script" style="min-height:38px" placeholder="全项目风格前缀" value="${escapeHtml(promptPolicy.style_prefix || '')}"><textarea id="production-global-negative" class="production-script" style="min-height:58px" placeholder="全项目负面约束">${escapeHtml(promptPolicy.global_negative_prompt || '')}</textarea><button class="btn-secondary btn-sm" onclick="StudioActions.productionSavePromptPolicy()">保存提示词策略</button></div></details>
     <div class="production-shell">
       <aside class="production-panel production-assets"><h4>资产库</h4><h5>角色形象</h5>${assetGrid(catalog.characters, '请先生成角色形象图')}<h5>场景参考</h5>${assetGrid(catalog.scenes, '请先生成场景参考图')}<h5>道具参考</h5>${assetGrid(catalog.props, '当前镜头没有可用关键道具图')}</aside>
@@ -236,6 +284,7 @@ function renderProductionWorkspace() {
         <div style="display:grid;grid-template-columns:1fr 1fr 110px;gap:8px;align-items:end"><label style="font-size:12px">视频服务<select id="production-video-provider" onchange="StudioActions.productionVideoProviderChanged()">${providerOptions}</select></label><label style="font-size:12px">模型<select id="production-video-model" onchange="StudioActions.productionVideoModelChanged()">${modelOptions}</select></label><label style="font-size:12px">清晰度<select id="production-video-resolution">${resolutionOptions}</select></label></div><div style="font-size:11px;color:#a1a1aa">成本档位：${escapeHtml(current.video_capability?.cost_tier || '未标注')}</div>
         <div style="display:flex;align-items:center;gap:12px;font-size:12px;color:#d4d4d8"><label><input id="production-continuity" type="checkbox" ${production.continuity_enabled ? 'checked' : ''}> 承接上一镜尾帧</label><span style="color:${production.continuity_stale ? '#fbbf24' : '#a1a1aa'}">${escapeHtml(continuityHint)}</span><span class="production-chip" style="margin-left:auto">新任务采用硬切</span></div>
         <textarea id="production-prompt" class="production-script" placeholder="视频生成 Prompt">${escapeHtml(prompt.prompt)}</textarea>
+        ${currentPromptReviewHtml}
         <textarea id="production-negative" class="production-feedback" placeholder="镜头负面约束">${escapeHtml(prompt.negative_prompt || '')}</textarea>
         <div class="production-feedback" style="white-space:pre-wrap;min-height:68px"><div style="font-size:11px;color:#a1a1aa;margin-bottom:4px">最终发送 · ${escapeHtml(effective.provider || '')} · ${negativeMode === 'merged' ? '负面约束已合并到主提示词' : '使用独立负面提示词参数'}</div>${finalPromptPreview}</div>
         <textarea id="production-feedback" class="production-feedback" placeholder="用口语描述希望 AI 如何修改当前视频 Prompt"></textarea>
@@ -406,6 +455,19 @@ async function productionSavePromptPolicy() {
     renderProductionWorkspace();
   } catch (error) { alert(error.message); }
 }
+async function productionReviewPrompts() {
+  const active = activeProjectJobs(job => job.job_type === 'prompt.review');
+  if (active.length) return cancelMatchingJobs(active);
+  try {
+    await submitProjectJob({job_type:'prompt.review',target_type:'prompt_set',target_id:'current'});
+    if (productionData) {
+      productionData.prompt_review = {...(productionData.prompt_review || {}), status:'generating'};
+      renderProductionWorkspace();
+    }
+  } catch (error) {
+    alert(error.message);
+  }
+}
 async function productionGenerateAudio() {
   const active = activeProjectJobs(job => job.job_type === 'audio.generate');
   if (active.length) return cancelMatchingJobs(active);
@@ -448,6 +510,7 @@ const __moduleActions = {
   patchProductionWorkspace,
   loadProductionWorkspace,
   productionReferenceHtml,
+  promptReviewHtml,
   renderProductionWorkspace,
   productionSaveCurrent,
   productionAddReference,
@@ -463,6 +526,7 @@ const __moduleActions = {
   productionSetSubtitleMode,
   productionSetAsr,
   productionSavePromptPolicy,
+  productionReviewPrompts,
   productionGenerateAudio,
   productionAssembleVideo,
   productionActivateVersion,

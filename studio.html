@@ -223,6 +223,7 @@
             <div class="settings-field full"><label for="cfg-llm-key">API Key</label><div class="settings-secret"><input type="password" id="cfg-llm-key" data-secret-field="llm_key" autocomplete="new-password" placeholder="输入 API Key"><button type="button" onclick="StudioActions.togglePwd('cfg-llm-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-llm-key')">清除</button></div><small>密钥不会返回到浏览器；留空保存会保留已配置值。</small></div>
           </div>
           <details class="settings-advanced"><summary>高级设置</summary><div class="settings-advanced-body"><div class="settings-field"><label for="cfg-llm-base">Base URL</label><input type="url" id="cfg-llm-base" placeholder="留空使用服务商默认地址"><small>仅在代理网关或 OpenAI 兼容服务中需要。</small></div></div></details>
+          <details class="settings-advanced"><summary>分镜提示词审核（Kimi）</summary><div class="settings-advanced-body"><div class="settings-field"><label style="display:flex;align-items:center;gap:8px"><input id="cfg-kimi-review-enabled" type="checkbox" checked> 启用自动审核</label><small>主 LLM 可继续使用 DeepSeek；分镜生成完成后会独立调用 Kimi 检查提示词是否覆盖剧本及其质量。</small></div><div class="settings-field"><label for="cfg-kimi-review-model">Kimi 模型</label><select id="cfg-kimi-review-model"><option value="kimi-k2.6">kimi-k2.6</option><option value="kimi-k2.5">kimi-k2.5</option><option value="kimi-k2">kimi-k2</option></select></div><div class="settings-field full"><label for="cfg-kimi-review-key">Kimi API Key</label><div class="settings-secret"><input type="password" id="cfg-kimi-review-key" data-secret-field="kimi_prompt_review_api_key" autocomplete="new-password" placeholder="输入 Kimi API Key"><button type="button" onclick="StudioActions.togglePwd('cfg-kimi-review-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-kimi-review-key')">清除</button></div><small>密钥仅用于分镜审核，留空保存会保留已配置值。</small></div><div class="settings-field full"><label for="cfg-kimi-review-base">Kimi Base URL</label><input type="url" id="cfg-kimi-review-base" value="https://api.moonshot.cn/v1"><small>使用 Moonshot 官方地址时无需修改。</small></div></div></details>
           <div class="settings-test-row"><button class="btn-secondary btn-sm" onclick="StudioActions.testConnection('llm')">测试连接</button><span id="cfg-llm-test" class="settings-test-status" role="status"></span></div>
         </section>
 
@@ -527,6 +528,6 @@ document.addEventListener('DOMContentLoaded', function() {
   arkModelSelect.value = models.includes(previous) ? previous : models[0];
 });
 </script>
-<script type="module" src="/static/js/bootstrap.js?v=20260811-asset-quality-references&rev=20260812-style-selection-state-review"></script>
+<script type="module" src="/static/js/bootstrap.js?v=20260811-asset-quality-references"></script>
 </body>
 </html>
