@@ -18,6 +18,7 @@ from src.schemas.script import (
 from src.schemas.scene_image import SceneImage, SceneImageAssets
 from src.schemas.scene_state import LocationState
 from src.schemas.visual import VisualDesign
+from src.schemas.prompt import GenerationPrompts, ShotPrompt
 from src.services.asset_prompt_composer import compose_asset_prompt
 from src.schemas.prop import PropImage
 from src.utils import project_store as project_store_module
@@ -441,3 +442,62 @@ def test_character_draft_uses_stable_visual_style_id_over_legacy_art_style():
     assert "二维手绘动画媒介" in asset.image_prompt
     assert "MANDATORY STYLE: photorealistic" not in asset.image_prompt
     assert "项目视觉约束：艺术风格必须为写实" not in asset.image_prompt
+
+
+def test_loading_repairs_legacy_storyboard_environment_snapshot_without_erasing_action():
+    """Old storyboard [environment] sections must not retain shot-only actions."""
+    action = "\u987e\u8861\u6491\u5899\u7ad9\u8d77\uff0c\u6307\u5411\u4e2d\u592e\u88c2\u5f00\u7684\u5e9f\u5f03\u94dc\u949f\u3002"
+    transient = "\u4f17\u4eba\u6d88\u5931\u5728\u6697\u9053\u540e"
+    location = "\u65e7\u949f\u697c\u5730\u4e0b\u5ba4"
+    script = ScriptBreakdown(
+        title="\u65e7\u63d0\u793a\u8bcd\u8fc1\u79fb",
+        genre="\u60ac\u7591",
+        logline="\u65e7\u5206\u955c\u5feb\u7167",
+        duration_sec=3,
+        narration_style="\u65e0\u65c1\u767d",
+        scenes=[Scene(
+            scene_id=1,
+            duration_sec=3,
+            location=location,
+            characters=["\u987e\u8861"],
+            action_description=action,
+            camera_direction="\u4e2d\u666f",
+            emotion_tone="\u7d27\u5f20",
+        )],
+        asset_manifest=VisualAssetManifest(
+            locations=[LocationAsset(
+                location_id="loc_basement",
+                canonical_name=location,
+                representative_scene_id=1,
+                shot_ids=[1],
+                fixed_dressing=f"\u5ba4\u5185\u5806\u6ee1\u6728\u7bb1\uff1b{action}\uff1b{transient}",
+                environment_description=f"\u5ba4\u5185\u5806\u6ee1\u6728\u7bb1\uff1b{action}\uff1b{transient}",
+            )],
+            shot_bindings=[ShotVisualBinding(scene_id=1, location_id="loc_basement")],
+        ),
+    )
+    prompt = (
+        "\u3010\u65f6\u95f4\u8f74\u5206\u955c\u3011\n"
+        f"\u3010\u73af\u5883\u3011{location}\u3002\u5ba4\u5185\u5806\u6ee1\u6728\u7bb1\uff1b{action}\uff1b{transient}\u3002"
+        "\u5730\u4e0b\u5ba4\u4e2d\u592e\u94dc\u949f\u88c2\u5f00\u4e00\u9053\u7ec6\u7f1d\u3002\n"
+        "\u3010\u955c\u5934\u8bed\u8a00\u3011\u4e2d\u666f\u56fa\u5b9a\n"
+        f"\u3010\u6838\u5fc3\u5206\u955c\u610f\u56fe\u3011{action}"
+    )
+    state = DramaState(
+        project_id="legacy-storyboard-environment",
+        script=script,
+        generation_prompts=GenerationPrompts(
+            api_provider="mock",
+            shots=[ShotPrompt(scene_id=1, prompt=prompt, duration_sec=3)],
+        ),
+    )
+
+    loaded = api_context._state_from_json(api_context._state_to_json(state))
+    repaired = loaded.generation_prompts.shots[0].prompt
+    environment = repaired.split("\u3010\u73af\u5883\u3011", 1)[1].split("\u3010\u955c\u5934\u8bed\u8a00\u3011", 1)[0]
+
+    assert action not in environment
+    assert transient not in environment
+    assert "\u5ba4\u5185\u5806\u6ee1\u6728\u7bb1" in environment
+    assert action in repaired
+    assert "\u73af\u5883\u3011" in repaired and "\n\u3010\u955c\u5934\u8bed\u8a00\u3011" in repaired

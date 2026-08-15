@@ -51,7 +51,7 @@ function hasSceneReferenceMaster() {
 
 function imageEditorHasCurrentImage() {
   const entry = imageEditorEntry();
-  return Boolean(entry?.image_path && !isMissingMediaPath(entry.image_path));
+  return Boolean(imageEditorImageSource(entry));
 }
 
 async function projectImagePolicyPayload() {
@@ -133,6 +133,7 @@ async function changeImagePolicy() {
   const resolution = document.getElementById('image-editor-resolution').value;
   imagePolicy = {provider, model, resolution};
   renderImagePolicyControls();
+  updateJobDrivenControls();
   if (!document.getElementById('image-editor-save-policy')?.checked) return;
   const res = await fetch(`${API_BASE}/api/projects/${appState.projectId}/image-generation-policy`, {
     method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(imagePolicy),
@@ -142,6 +143,7 @@ async function changeImagePolicy() {
   savedImagePolicy = {...imagePolicy};
   imagePolicyProjectId = appState.projectId;
   renderImagePolicyControls();
+  updateJobDrivenControls();
 }
 
 async function imageEditorResponseError(response, fallbackMessage) {
@@ -218,9 +220,13 @@ function isCurrentImageEditor(snapshot) {
 }
 
 function imageEditorEntries() {
-  if (activeImageEditor?.assetType === 'character') return appState.characterImages;
-  if (activeImageEditor?.assetType === 'prop') return appState.propImages;
-  return appState.sceneImages;
+  if (activeImageEditor?.assetType === 'character') return appState.characterImages || [];
+  if (activeImageEditor?.assetType === 'prop') return appState.propImages || [];
+  return appState.sceneImages || [];
+}
+
+function imageEditorImageSource(entry) {
+  return typeof entry?.image_path === 'string' ? entry.image_path.trim() : '';
 }
 
 function imageEditorEntry() {
@@ -374,6 +380,13 @@ async function loadAssetPromptPreview() {
     document.getElementById('image-editor-system-prompt').value = preview.display_prompt || preview.effective_prompt || preview.prompt || '';
     document.getElementById('image-editor-negative-prompt').value = preview.negative_prompt || '';
     document.getElementById('image-editor-project-constraints').textContent = preview.project_constraints || '';
+    const characterDescription = document.getElementById('image-editor-character-description');
+    const characterDescriptionText = document.getElementById('image-editor-character-description-text');
+    const description = snapshot.assetType === 'character' ? String(preview.character_description || '').trim() : '';
+    if (characterDescription && characterDescriptionText) {
+      characterDescription.hidden = !description;
+      characterDescriptionText.textContent = description;
+    }
     document.getElementById('image-editor-asset-meta').textContent = `视图：${imageViewLabel(snapshot.viewType)} · ${preview.width} × ${preview.height}`;
   } catch (error) { console.error(error); }
 }
@@ -392,16 +405,40 @@ function renderImageEditor() {
   const legacyPrompt = activeImageEditor.assetType === 'character' && (entry?.prompt_template_version || 1) < 2;
   document.getElementById('image-editor-asset-meta').textContent = `视图：${imageViewLabel(activeImageEditor.viewType)}${entry?.width && entry?.height ? ` · ${entry.width} × ${entry.height}` : ''}${legacyPrompt ? ' · 旧版提示词' : ''}`;
   const previewImage = document.getElementById('image-editor-preview');
+  const previewEmpty = document.getElementById('image-editor-empty-state');
   const previewStatus = document.getElementById('image-editor-preview-status');
-  const imageMissing = Boolean(entry?.image_path && isMissingMediaPath(entry.image_path));
-  previewImage.style.display = imageMissing ? 'none' : '';
-  if (imageMissing) {
+  const imageSource = imageEditorImageSource(entry);
+  const imageMissing = Boolean(imageSource && isMissingMediaPath(imageSource));
+  const imageExists = Boolean(imageSource);
+  previewImage.onerror = () => {
+    if (!activeImageEditor || !previewEmpty) return;
+    previewImage.style.display = 'none';
+    previewImage.hidden = true;
+    previewEmpty.hidden = false;
+    previewEmpty.querySelector('strong').textContent = '图片加载失败';
+    previewEmpty.querySelector('span').textContent = '可重新生成当前视图或选择历史版本';
+    if (previewStatus) previewStatus.hidden = true;
+  };
+  // A stale missing-media report must not hide a path that can still be loaded.
+  if (imageMissing && !imageExists) {
+    previewImage.style.display = 'none';
+    previewImage.hidden = true;
     previewImage.removeAttribute('src');
+    if (previewEmpty) previewEmpty.hidden = true;
     previewStatus.hidden = false;
     previewStatus.textContent = '图片文件缺失，历史记录已保留。可重新生成此视图或选择历史版本。';
-  } else {
+  } else if (!imageExists) {
+    previewImage.style.display = 'none';
+    previewImage.hidden = true;
+    previewImage.removeAttribute('src');
+    if (previewEmpty) previewEmpty.hidden = false;
     previewStatus.hidden = true;
-    previewImage.src = entry?.image_path ? mediaUrl(entry.image_path, entry.version_id) : '';
+  } else {
+    previewImage.style.display = '';
+    previewImage.hidden = false;
+    if (previewEmpty) previewEmpty.hidden = true;
+    previewStatus.hidden = true;
+    previewImage.src = imageSource ? mediaUrl(imageSource, entry.version_id) : '';
   }
   const systemPrompt = activeImageEditor.assetType === 'character'
     ? (entry?.image_prompt || '将由系统根据角色设定和当前视图生成。')
@@ -412,6 +449,8 @@ function renderImageEditor() {
   if (systemPromptElement) systemPromptElement.value = systemPrompt;
   document.getElementById('image-editor-negative-prompt').value = '';
   if (systemPromptElement) systemPromptElement.value = '正在加载当前视图的最终提示词...';
+  const characterDescription = document.getElementById('image-editor-character-description');
+  if (characterDescription) characterDescription.hidden = activeImageEditor.assetType !== 'character';
   loadAssetPromptPreview();
   const promptInput = document.getElementById('image-editor-prompt');
   const promptLabel = document.getElementById('image-editor-prompt-label');
@@ -453,15 +492,27 @@ function renderImageEditor() {
       referenceSelect.innerHTML = candidates.map(item => `<option value="${escapeHtml(item.version_id)}">${escapeHtml(imageViewLabel(item.view_type))}</option>`).join('');
     }
   }
-  document.getElementById('image-editor-views').innerHTML = imageEditorViews().map(view =>
-    `<button class="btn-secondary btn-sm" style="${view === activeImageEditor.viewType ? 'border-color:#10b981;color:#10b981' : ''}" onclick="StudioActions.setImageEditorView('${view}')">${imageViewLabel(view)}</button>`
-  ).join('');
+  document.getElementById('image-editor-views').innerHTML = imageEditorViews().map(view => {
+    const active = view === activeImageEditor.viewType;
+    return `<button class="btn-secondary btn-sm image-editor-view-tab${active ? ' is-active' : ''}" aria-pressed="${active}" onclick="StudioActions.setImageEditorView('${view}')">${imageViewLabel(view)}</button>`;
+  }).join('');
   const history = activeImageEditor.history || [];
+  const historyError = String(activeImageEditor.historyError || '');
+  const historySection = document.getElementById('image-editor-history-section');
+  if (historySection) historySection.hidden = !history.length && !historyError;
   document.getElementById('image-editor-history').innerHTML = history.length
-    ? history.map(record => `<button class="btn-secondary" style="padding:4px;border-color:${record.active ? '#10b981' : '#27272a'}" onclick="StudioActions.activateImageHistory('${record.id}')" title="${escapeHtml(record.source || 'history')}">${isMissingMediaPath(record.path) ? '<span class="media-missing-notice">文件缺失</span>' : `<img src="${mediaUrl(record.path)}" style="display:block;width:100%;height:74px;object-fit:cover;border-radius:3px">`}<span style="display:block;font-size:10px;margin-top:3px">${record.active ? '当前' : (record.source || 'history')}</span></button>`).join('')
-    : '<div style="font-size:12px;color:#71717a">暂无历史版本</div>';
-  updateJobDrivenControls();
+    ? history.map(record => {
+      const usable = Boolean(record.path);
+      const preview = usable
+        ? `<img src="${mediaUrl(record.path)}" style="display:block;width:100%;height:74px;object-fit:cover;border-radius:3px" alt="">`
+        : '<span class="media-missing-notice">文件不可用</span>';
+      return `<button class="btn-secondary" style="padding:4px;border-color:${record.active ? '#10b981' : '#27272a'}" onclick="StudioActions.activateImageHistory('${record.id}')" title="${escapeHtml(record.source || 'history')}">${preview}<span style="display:block;font-size:10px;margin-top:3px">${record.active ? '当前' : (record.source || 'history')}</span></button>`;
+    }).join('')
+    : historyError
+      ? `<div class="image-editor-history-error"><span>${escapeHtml(historyError)}</span><button class="btn-secondary btn-sm" type="button" onclick="StudioActions.loadImageHistory()">重试</button></div>`
+      : '<div style="font-size:12px;color:#71717a">暂无历史版本</div>';
   renderImagePolicyControls();
+  updateJobDrivenControls();
 }
 
 async function loadImageHistory() {
@@ -476,12 +527,17 @@ async function loadImageHistory() {
   try {
     const res = await fetch(`${API_BASE}/api/projects/${appState.projectId}/image-history?${params}`);
     if (!isCurrentImageEditor(snapshot)) return;
-    if (res.status === 404) { activeImageEditor.history = []; return; }
+    if (res.status === 404) { activeImageEditor.history = []; activeImageEditor.historyError = ''; renderImageEditor(); return; }
     if (!res.ok) throw new Error('无法加载图片历史');
     activeImageEditor.history = (await res.json()).versions || [];
+    activeImageEditor.historyError = '';
     renderImageEditor();
   } catch (error) {
     console.error(error);
+    if (isCurrentImageEditor(snapshot)) {
+      activeImageEditor.historyError = error.message || '无法加载图片历史';
+      renderImageEditor();
+    }
   }
 }
 
@@ -680,6 +736,7 @@ const __moduleActions = {
   imageEditorEntries,
   imageEditorEntry,
   imageEditorViews,
+  imageEditorImageSource,
   hasChinesePrompt,
   characterIdentity,
   characterDescription,

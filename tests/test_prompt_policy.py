@@ -78,14 +78,73 @@ def test_duplicate_global_negative_constraints_are_not_repeated():
     assert result["provider_negative_prompt"].count("same constraint") == 1
 
 
+def test_video_prompt_does_not_expose_internal_visual_style_id():
+    profile = CreativeProfile(
+        visual_style_id="live_action_cinematic",
+        art_style="电影级真人写实",
+    )
+    result = compose_video_prompt(
+        "happyhorse",
+        _prompts(),
+        _prompts().shots[0],
+        creative_profile=profile,
+    )
+
+    assert "电影级真人写实" in result["effective_prompt"]
+    assert "电影级真人写实（live_action_cinematic）" not in result["effective_prompt"]
+    assert "live_action_cinematic" not in result["effective_prompt"]
+
+
+def test_video_prompt_uses_chinese_for_fixed_quality_and_timeline_constraints():
+    result = compose_video_prompt(
+        "happyhorse",
+        _prompts(),
+        _prompts().shots[0],
+    )
+
+    fixed_english = (
+        "[Video quality]",
+        "[Planned edit rule]",
+        "[Single-take rule]",
+        "Cinematic vertical",
+        "Follow the authored",
+        "No montage",
+    )
+    assert not any(marker in result["provider_prompt"] for marker in fixed_english)
+    assert "【视频质量】" in result["provider_prompt"]
+    assert "【单镜头连续拍摄规则】" in result["provider_prompt"]
+
+
+def test_loading_legacy_project_prompt_removes_internal_visual_style_id():
+    state = DramaState(
+        creative_profile=CreativeProfile(
+            visual_style_id="live_action_cinematic",
+            art_style="电影级真人写实",
+        ),
+        generation_prompts=GenerationPrompts(
+            api_provider="happyhorse",
+            shots=[ShotPrompt(
+                scene_id=1,
+                prompt="【视觉媒介】电影级真人写实（live_action_cinematic）：电影级真人镜头语言。",
+            )],
+        ),
+    )
+
+    loaded = api_context._state_from_json(api_context._state_to_json(state))
+
+    assert "live_action_cinematic" not in loaded.generation_prompts.shots[0].prompt
+    assert "【视觉媒介】电影级真人写实：" in loaded.generation_prompts.shots[0].prompt
+    assert loaded.creative_profile.visual_style_id == "live_action_cinematic"
+
+
 def test_video_prompt_adds_cinematic_quality_block_without_dropping_scene_action():
     result = compose_video_prompt("mock", _prompts(), _prompts().shots[0], PromptPolicy())
 
-    assert "[Video quality]" in result["provider_prompt"]
-    assert "Keep character identity" in result["provider_prompt"]
-    assert "[Single-take rule]" in result["provider_prompt"]
-    assert "one continuous take" in result["provider_prompt"]
-    assert "No montage" in result["provider_prompt"]
+    assert "【视频质量】" in result["provider_prompt"]
+    assert "整段视频保持人物身份" in result["provider_prompt"]
+    assert "【单镜头连续拍摄规则】" in result["provider_prompt"]
+    assert "连续长镜头" in result["provider_prompt"]
+    assert "不得使用蒙太奇" in result["provider_prompt"]
     assert "scene action" in result["provider_prompt"]
 
 
@@ -97,9 +156,9 @@ def test_timecoded_video_prompt_uses_planned_edit_rule_instead_of_single_take():
     )
     result = compose_video_prompt("mock", prompts, shot, PromptPolicy())
 
-    assert "[Planned edit rule]" in result["provider_prompt"]
-    assert "Cuts are allowed only where the prompt explicitly specifies" in result["provider_prompt"]
-    assert "[Single-take rule]" not in result["provider_prompt"]
+    assert "【计划剪辑规则】" in result["provider_prompt"]
+    assert "只允许在提示词明确写出时长" in result["provider_prompt"]
+    assert "【单镜头连续拍摄规则】" not in result["provider_prompt"]
 
 
 def test_plain_script_shot_is_structured_as_timed_prompt_with_elastic_duration_for_added_detail():
@@ -1960,6 +2019,25 @@ def test_back_full_character_prompt_prioritizes_strict_rear_view_and_excludes_fa
     assert "三分之二背面" in prompt
     assert "正脸" in negative
     assert "三分之二背面" in negative
+
+
+def test_character_image_prompt_uses_chinese_constraints_without_hardcoded_english():
+    from src.services.asset_prompt_composer import _character_project_constraint, _reference_lock
+
+    prompt = build_character_image_prompt(
+        "角色", "黑色短发，深灰色风衣", "front_half", art_style="电影级真人写实"
+    )
+    negative = build_character_negative_prompt("front_half", art_style="电影级真人写实")
+    combined = "\n".join((prompt, negative, _character_project_constraint("电影级真人写实", "9:16"), _reference_lock("character", "电影级真人写实")))
+
+    assert "MANDATORY STYLE" not in combined
+    assert "OUTPUT FORMAT" not in combined
+    assert "FRAMING OVERRIDE" not in combined
+    assert "Reference lock" not in combined
+    assert "English hard constraint" not in combined
+    assert "split panels" not in combined
+    assert "必须是真人写实照片" in prompt
+    assert "参考图" in combined or "参考" in combined
 
 
 def test_legacy_english_storyboard_prompts_are_flagged_without_rewriting_them():

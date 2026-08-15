@@ -36,7 +36,11 @@ function productionStatusLabel(status) {
   return {idle:'待生成', generating:'生成中', success:'已生成', failed:'失败', canceled:'已终止'}[status] || '待生成';
 }
 
-function productionImageUrl(reference) { return reference?.image_path && !reference.media_missing && !isMissingMediaPath(reference.image_path) ? mediaUrl(reference.image_path) : ''; }
+function productionImageUrl(reference) {
+  if (!reference?.image_path || reference.media_missing || isMissingMediaPath(reference.image_path)) return '';
+  const versionId = reference.asset_version_id || reference.version_id || '';
+  return mediaUrl(reference.image_path, versionId);
+}
 function productionVideoUrl(version) { return version?.video_url || (version?.local_path && !version.media_missing && !isMissingMediaPath(version.local_path) ? mediaUrl(version.local_path) : ''); }
 
 function productionPreviewHtml(current) {

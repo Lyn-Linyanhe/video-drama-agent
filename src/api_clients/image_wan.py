@@ -8,6 +8,7 @@ import io
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import httpx
 from PIL import Image
@@ -45,7 +46,23 @@ class WanImageClient:
     async def generate_sequence(self, prompt: str, reference_paths: list[str], n: int, resolution: str) -> ImageGroupResult:
         content = [{"image": self._data_url(Path(path))} for path in reference_paths]
         content.append({"text": prompt})
-        return await self._create(content, {"enable_sequential": True, "n": n, "size": resolution})
+        requested_output_count = max(1, int(n))
+        # In sequential mode DashScope counts the supplied reference images
+        # toward n, but does not return those references as output URLs.  The
+        # API currently accepts at most four sequence items.  For example,
+        # asking for three new views with one master uses n=4 and returns the
+        # three new views.  For a four-view character group, n=4 intentionally
+        # yields three new views because the fourth view is the locked master.
+        provider_n = min(4, requested_output_count + len(reference_paths))
+        result = await self._create(
+            content,
+            {"enable_sequential": True, "n": provider_n, "size": resolution},
+        )
+        if not isinstance(result.metadata, dict):
+            result.metadata = {}
+        result.metadata.setdefault("requested_output_count", requested_output_count)
+        result.metadata.setdefault("provider_requested_n", provider_n)
+        return result
 
     async def edit_image(self, prompt: str, reference_paths: list[str], resolution: str) -> ImageGenResult:
         content = [{"image": self._data_url(Path(path))} for path in reference_paths]
@@ -55,30 +72,62 @@ class WanImageClient:
 
     async def _create(self, content: list[dict], parameters: dict) -> ImageGroupResult:
         payload = {"model": self.model, "input": {"messages": [{"role": "user", "content": content}]}, "parameters": {**parameters, "watermark": False}}
+        reference_count = sum(1 for item in content if isinstance(item, dict) and item.get("image"))
+        sequential = bool(parameters.get("enable_sequential"))
+        metadata: dict[str, Any] = {
+            "requested_n": int(parameters.get("n") or 0),
+            "reference_count": reference_count,
+            "sequential": sequential,
+            # DashScope's sequential image contract counts the input image in
+            # n.  The returned URLs contain only newly generated images.
+            "sequence_reference_counted": bool(sequential and reference_count),
+        }
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
                 response = await client.post(
                     f"{self.base_url}{self._CREATE_PATH}", json=payload, headers=self._headers(asynchronous=True),
                 )
                 body = self._response_body(response)
+            metadata["response_shape"] = self._shape(body)
             if response.status_code >= 400:
                 return ImageGroupResult(
-                    False, [], self._provider_error(body, f"Wan task creation failed [{response.status_code}]"), self.provider_name,
+                    False,
+                    [],
+                    self._provider_error(body, f"Wan task creation failed [{response.status_code}]"),
+                    self.provider_name,
+                    metadata,
                 )
             if not isinstance(body, dict):
-                return ImageGroupResult(False, [], f"Wan task creation returned an invalid response: {body!r}", self.provider_name)
+                return ImageGroupResult(
+                    False,
+                    [],
+                    f"Wan task creation returned an invalid response: {body!r}",
+                    self.provider_name,
+                    metadata,
+                )
             task_id = str((body.get("output") or {}).get("task_id") or "")
             if task_id:
+                metadata["provider_task_id"] = task_id
                 get_generation_hooks().provider_task(self.provider_name, task_id)
                 body = await self._poll(task_id)
-            images = [await self._download(url) for url in self._urls(body)]
+                metadata["response_shape"] = self._shape(body)
+            urls = self._urls(body)
+            metadata["parsed_url_count"] = len(urls)
+            images = [await self._download(url) for url in urls]
+            metadata["downloaded_image_count"] = len(images)
             if not images:
-                return ImageGroupResult(False, [], f"Wan response did not include images: {body}", self.provider_name)
-            return ImageGroupResult(True, images, provider_name=self.provider_name)
+                return ImageGroupResult(
+                    False,
+                    [],
+                    f"Wan response did not include images (response_shape={metadata.get('response_shape')})",
+                    self.provider_name,
+                    metadata,
+                )
+            return ImageGroupResult(True, images, provider_name=self.provider_name, metadata=metadata)
         except httpx.TimeoutException as exc:
-            return ImageGroupResult(False, [], f"Wan task submission timed out: {exc!r}", self.provider_name)
+            return ImageGroupResult(False, [], f"Wan task submission timed out: {exc!r}", self.provider_name, metadata)
         except Exception as exc:
-            return ImageGroupResult(False, [], f"Wan request exception: {exc!r}", self.provider_name)
+            return ImageGroupResult(False, [], f"Wan request exception: {exc!r}", self.provider_name, metadata)
 
     async def _poll(self, task_id: str) -> dict:
         deadline = time.monotonic() + 300
@@ -113,16 +162,58 @@ class WanImageClient:
 
     @staticmethod
     def _urls(body: dict) -> list[str]:
-        values = []
+        values: list[str] = []
         output = body.get("output") or {}
+
+        def append(value: object) -> None:
+            if isinstance(value, str) and value.strip():
+                values.append(value.strip())
+            elif isinstance(value, dict):
+                for key in ("url", "image", "image_url", "uri"):
+                    if value.get(key):
+                        append(value[key])
+
+        def append_item(item: object) -> None:
+            if isinstance(item, str):
+                append(item)
+                return
+            if not isinstance(item, dict):
+                return
+            # The multimodal response uses content[].image, while the async
+            # response normally uses results[].url.  Accept the equivalent
+            # aliases returned by compatible DashScope gateways as well.
+            for key in ("image", "url", "image_url", "uri"):
+                if item.get(key):
+                    append(item[key])
+
         for choice in output.get("choices") or []:
-            for item in ((choice.get("message") or {}).get("content") or []):
-                if item.get("type") == "image" and item.get("image"):
-                    values.append(str(item["image"]))
-        for item in output.get("results") or []:
-            if item.get("url"):
-                values.append(str(item["url"]))
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message") or {}
+            for item in (message.get("content") or []) if isinstance(message, dict) else []:
+                append_item(item)
+        for key in ("results", "images", "outputs", "data"):
+            entries = output.get(key) or []
+            if isinstance(entries, (str, dict)):
+                entries = [entries]
+            for item in entries:
+                append_item(item)
         return list(dict.fromkeys(values))
+
+    @staticmethod
+    def _shape(value: object, depth: int = 0) -> object:
+        """Return a bounded response shape without retaining URLs or text."""
+        if depth > 2:
+            return type(value).__name__
+        if isinstance(value, dict):
+            return {
+                str(key): WanImageClient._shape(item, depth + 1)
+                for key, item in list(value.items())[:20]
+            }
+        if isinstance(value, list):
+            keys = sorted({str(key) for item in value[:5] if isinstance(item, dict) for key in item.keys()})
+            return {"type": "list", "length": len(value), "item_keys": keys}
+        return type(value).__name__
 
     @staticmethod
     def _data_url(path: Path) -> str:

@@ -7,7 +7,7 @@ import pytest
 from pydantic import BaseModel
 
 from src.api import context as api_context
-from src.api.routes import jobs, scripts
+from src.api.routes import jobs, production, scripts
 from src.api.context import ScriptRequest, ScriptRevisionRequest
 from src.graph.state import DramaState
 from src.schemas.prompt import GenerationPrompts, ShotPrompt
@@ -24,6 +24,7 @@ from src.schemas.script import (
 )
 from src.schemas.visual import VisualDesign
 from src.agents.visual_prompt_agent import (
+    _CharacterRegistryOutput,
     VisualPromptAgent,
     _CompactShotVisualPrompt,
     _CompactVisualPromptOutput,
@@ -215,6 +216,7 @@ def test_compact_visual_output_is_assembled_into_a_complete_shot_prompt():
     assert "0-2秒抬头观察" in prompt.prompt
     assert "走廊尽头灯光闪烁" in prompt.prompt
     assert "中景缓慢推进" in prompt.prompt
+    assert "live_action_cinematic" not in prompt.prompt
     assert prompt.negative_prompt == "不要人物变形"
 
 
@@ -287,6 +289,212 @@ async def test_visual_stage_uses_compact_output_contract_for_non_kimi_provider()
 
     assert agent.llm.calls[0]["output_schema"].__name__ == "_CompactVisualPromptOutput"
     assert "每个字段最多两句" in agent.llm.calls[0]["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_visual_stage_repairs_an_incomplete_character_profile_once():
+    script = ScriptBreakdown(
+        title="人物侧写补全",
+        genre="都市悬疑",
+        logline="角色在雨夜追查线索。",
+        duration_sec=5,
+        narration_style="无旁白",
+        scenes=[Scene(
+            scene_id=1,
+            duration_sec=5,
+            location="便利店外",
+            characters=["苏眠"],
+            action_description="苏眠穿米白色长风衣站在雨中。",
+            camera_direction="中景",
+            emotion_tone="紧张",
+        )],
+        asset_manifest=VisualAssetManifest(
+            characters=[VisualCharacterAsset(
+                asset_id="char_su_mian",
+                name="苏眠",
+                appearance_mode="on_screen",
+                description="苏眠：米白色长风衣。",
+            )],
+        ),
+    )
+    complete_profile = (
+        "二十六岁成年女性，身形修长匀称；椭圆脸、自然白皙肤色，"
+        "眉形清晰、杏眼沉静、鼻梁挺直、唇形自然；黑色中长直发，"
+        "穿米白色棉质长风衣与深色长裤，佩戴细银色腕表，左眼下有一颗小痣。"
+    )
+
+    class _FakeLLM:
+        provider = "deepseek"
+        model = "deepseek-chat"
+
+        def __init__(self):
+            self.calls = []
+
+        async def generate_structured(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["output_schema"].__name__ == "_CompactVisualPromptOutput":
+                return _CompactVisualPromptOutput(
+                    overall_style="电影级真人写实",
+                    color_palette="冷蓝灰",
+                    aspect_ratio="9:16",
+                    global_character_descriptions_cn={"苏眠": "米白色长风衣。"},
+                    shots=[_CompactShotVisualPrompt(scene_id=1, duration_sec=5)],
+                )
+            return _CharacterRegistryOutput(
+                global_character_descriptions={"苏眠": complete_profile},
+                global_character_descriptions_cn={"苏眠": complete_profile},
+            )
+
+    agent = VisualPromptAgent(api_provider="mock")
+    agent.llm = _FakeLLM()
+
+    source_text = "人物小传：苏眠从小习惯用左手，左眼下有一颗小痣。"
+    visual, _prompts = await agent.run(script, source_text=source_text)
+
+    assert len(agent.llm.calls) == 2
+    assert agent.llm.calls[1]["output_schema"].__name__ == "_CharacterRegistryOutput"
+    assert visual.global_character_descriptions_cn["苏眠"] == complete_profile
+    repair_prompt = agent.llm.calls[1]["user_prompt"]
+    assert "性别与年龄段" in repair_prompt
+    assert "脸型与肤色" in repair_prompt
+    assert "眉眼鼻唇" in repair_prompt
+    assert "米白色长风衣" in repair_prompt
+    assert source_text in repair_prompt
+
+
+@pytest.mark.asyncio
+async def test_character_reextract_retries_incomplete_output_with_asset_id_contract():
+    script = ScriptBreakdown(
+        title="人物侧写结构化修复",
+        genre="都市悬疑",
+        logline="角色在雨夜追查线索。",
+        duration_sec=5,
+        narration_style="无旁白",
+        scenes=[Scene(
+            scene_id=1,
+            duration_sec=5,
+            location="便利店外",
+            characters=["苏眠"],
+            action_description="苏眠穿米白色长风衣站在雨中。",
+            camera_direction="中景",
+            emotion_tone="紧张",
+        )],
+        asset_manifest=VisualAssetManifest(
+            characters=[VisualCharacterAsset(
+                asset_id="char_su_mian",
+                name="苏眠",
+                appearance_mode="on_screen",
+                description="苏眠：米白色长风衣。",
+            )],
+        ),
+    )
+    complete_profile = (
+        "二十六岁成年女性，身形修长匀称；椭圆脸、自然白皙肤色，"
+        "眉形清晰、杏眼沉静、鼻梁挺直、唇形自然；黑色中长直发，"
+        "穿米白色棉质长风衣与深色长裤，佩戴细银色腕表，左眼下有一颗小痣。"
+    )
+
+    class _FakeLLM:
+        provider = "deepseek"
+        model = "deepseek-chat"
+
+        def __init__(self):
+            self.calls = []
+
+        async def generate_structured(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return _CharacterRegistryOutput()
+            return _CharacterRegistryOutput(characters=[{
+                "asset_id": "char_su_mian",
+                "name": "苏眠",
+                "description_en": complete_profile,
+                "description_cn": complete_profile,
+            }])
+
+    agent = VisualPromptAgent(api_provider="mock")
+    agent.llm = _FakeLLM()
+
+    english, chinese = await agent.reextract_visible_characters(
+        script,
+        source_text="苏眠的完整人物小传。",
+    )
+
+    assert len(agent.llm.calls) == 2
+    assert agent.llm.calls[1]["output_schema"].__name__ == "_CharacterRegistryOutput"
+    assert "上一次输出不合格" in agent.llm.calls[1]["user_prompt"]
+    assert english["苏眠"] == complete_profile
+    assert chinese["苏眠"] == complete_profile
+
+
+@pytest.mark.asyncio
+async def test_visual_job_passes_saved_script_draft_to_profile_repair(monkeypatch):
+    state = DramaState(
+        project_id="d" * 12,
+        input_mode="script",
+        script_draft_text="完整剧本中的稳定人物外貌资料。",
+        script=_script("source text propagation"),
+        visual_stage="generating",
+        visual_script_signature="stable-signature",
+    )
+    visual = VisualDesign(overall_style="写实", color_palette="冷色", scenes=[])
+    prompts = GenerationPrompts(
+        api_provider="mock",
+        shots=[ShotPrompt(scene_id=1, prompt="prompt", duration_sec=5)],
+    )
+    captured = {}
+
+    async def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return visual, prompts
+
+    monkeypatch.setattr(jobs, "_load_project_state", lambda _project_id, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(jobs.project_store, "set_visual_design", lambda *_args: None)
+    monkeypatch.setattr(jobs.project_store, "add_stage", lambda *_args: None)
+    monkeypatch.setattr(jobs.project_store, "update_status", lambda *_args: None)
+    monkeypatch.setattr(jobs, "_script_signature", lambda _script: "stable-signature")
+    monkeypatch.setattr(jobs.visual_prompt_agent, "run", fake_run)
+
+    await jobs._job_script_visualize(
+        _Context(state.project_id),
+        {"script_signature": "stable-signature"},
+    )
+
+    assert captured["source_text"] == state.script_draft_text
+
+
+@pytest.mark.asyncio
+async def test_character_reextract_endpoint_passes_saved_script_draft(monkeypatch):
+    state = DramaState(
+        project_id="e" * 12,
+        input_mode="script",
+        script_draft_text="原始剧本中保存的完整人物小传。",
+        script=_script("reextract source text"),
+        visual_design=VisualDesign(overall_style="写实", color_palette="冷色", scenes=[]),
+    )
+    state.script.asset_manifest = VisualAssetManifest(
+        characters=[VisualCharacterAsset(
+            asset_id="char_lin",
+            name="林澈",
+            appearance_mode="on_screen",
+            description="林澈：深色外套。",
+        )]
+    )
+    captured = {}
+
+    async def fake_reextract(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"林澈": "profile"}, {"林澈": "完整人物侧写"}
+
+    monkeypatch.setattr(production, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production.project_store, "set_visual_design", lambda *_args: None)
+    monkeypatch.setattr(production.visual_prompt_agent, "reextract_visible_characters", fake_reextract)
+
+    await production.reextract_project_characters(state.project_id)
+
+    assert captured["source_text"] == state.script_draft_text
 
 
 def test_compact_visual_prompt_includes_bound_asset_anchors():

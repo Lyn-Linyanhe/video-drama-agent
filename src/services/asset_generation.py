@@ -50,6 +50,27 @@ def _style_snapshot_metadata(state: Any) -> dict[str, Any]:
     }
 
 
+def _group_result_diagnostic(result: Any, expected: int = 0) -> str:
+    """Format bounded provider diagnostics for an actionable group error."""
+    metadata = getattr(result, "metadata", {}) or {}
+    parts = []
+    for key, label in (
+        ("requested_output_count", "requested"),
+        ("provider_requested_n", "provider_n"),
+        ("reference_count", "references"),
+        ("parsed_url_count", "parsed"),
+        ("downloaded_image_count", "downloaded"),
+    ):
+        if metadata.get(key) is not None:
+            parts.append(f"{label}={metadata[key]}")
+    if expected:
+        parts.append(f"expected={expected}")
+    shape = metadata.get("response_shape")
+    if shape:
+        parts.append(f"response_shape={shape}")
+    return f" [{', '.join(parts)}]" if parts else ""
+
+
 async def _validate_generated_image(
     image: Any,
     prompt: str,
@@ -653,7 +674,8 @@ async def generate_prop_reference_views(
         if len(result.images) != len(requested):
             raise HTTPException(
                 502,
-                f"Wan prop reference group returned {len(result.images)} images, expected {len(requested)}; no partial views were activated",
+                f"Wan prop reference group returned {len(result.images)} images, expected {len(requested)}; no partial views were activated"
+                f"{_group_result_diagnostic(result, len(requested))}",
             )
         produced = list(result.images)
         generation_mode = "reference_group"
@@ -1086,7 +1108,11 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
     if not result.success:
         raise HTTPException(502, result.error_message or "万相场景组图生成失败")
     if len(result.images) != count:
-        raise HTTPException(502, f"万相场景组图仅返回 {len(result.images)} 张，未激活部分结果，请重新生成整组")
+        raise HTTPException(
+            502,
+            f"万相场景组图仅返回 {len(result.images)} 张，未激活部分结果，请重新生成整组"
+            f"{_group_result_diagnostic(result, count)}",
+        )
     try:
         quality_reports = {}
         for view_type, image in zip(views, result.images):
@@ -1543,9 +1569,8 @@ def _character_reference_group_prompt(name: str, description: str, extra: str, a
         if extra.strip() else ""
     )
     return f"""{character_style_prefix(art_style)}
-基于提供的正面半身角色母版，生成{identity}的四张连续角色参考图。必须保留同一张脸、相同性别、年龄感、体型、发型、服装颜色与材质、鞋子、标志特征和统一纯色背景。角色：{name}；设定：{description}。身份锁定：{character_gender_lock(name, description)}。{style_rule}
-严格按以下顺序返回四张独立图片：
-1. 正面半身：正对镜头，胸部以上，完整清晰脸部、发型和上身服装。
+基于提供的正面半身角色母版，组成{identity}的四张连续角色参考图。必须保留同一张脸、相同性别、年龄感、体型、发型、服装颜色与材质、鞋子、标志特征和统一纯色背景。角色：{name}；设定：{description}。身份锁定：{character_gender_lock(name, description)}。{style_rule}
+输入的第一张正面半身母版已经作为第1张视图；请不要重复生成或返回它，只返回后续三张独立图片，并按以下顺序对应第2至第4张：
 2. 正面全身：正对镜头，9:16 竖构图，头顶到鞋底完整入画，双脚清晰可见。
 3. 左侧面半身：身体与脸部严格朝画面左侧，只见左侧脸轮廓，不得出现正脸或三分之二正脸。
 4. 背面全身：相机严格位于背脊中线正后方，人物完全背向镜头，头顶到鞋底完整入画，脸部、侧脸、镜中倒影均不可见。
@@ -1645,18 +1670,33 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
     )
     if not group_result.success:
         raise HTTPException(502, group_result.error_message or "万相角色组图生成失败")
-    if len(group_result.images) != 4:
+    group_views = ("front_half", "front_full", "left_profile", "back_full")
+    derived_views = group_views[1:]
+    if len(group_result.images) == len(group_views):
+        # Keep compatibility with gateways that return every requested view.
+        generated_views = group_views
+        group_images = dict(zip(group_views, group_result.images))
+    elif (
+        len(group_result.images) == len(derived_views)
+        and (group_result.metadata or {}).get("sequence_reference_counted")
+    ):
+        # Official sequential output excludes the supplied master.  The
+        # already-confirmed front-half master is the first group view; only
+        # the three newly generated views need validation and activation.
+        generated_views = derived_views
+        group_images = dict(zip(derived_views, group_result.images))
+    else:
         raise HTTPException(
             502,
-            f"万相角色组图仅返回 {len(group_result.images)} 张，未激活部分结果，请重新生成整组",
+            f"万相角色组图仅返回 {len(group_result.images)} 张，未激活部分结果，请重新生成整组"
+            f"{_group_result_diagnostic(group_result, len(derived_views))}",
         )
-    group_views = ("front_half", "front_full", "left_profile", "back_full")
-    group_images = dict(zip(group_views, group_result.images))
     try:
         from src.agents.image_gen_agent import character_view_spec
 
         quality_reports = {}
-        for view_type, image in group_images.items():
+        for view_type in generated_views:
+            image = group_images[view_type]
             view_instruction = character_view_spec(view_type)[3]
             review_prompt = (
                 f"{group_prompt}\nVIEW-SPECIFIC CONTRACT: {view_type}\n"
@@ -1683,7 +1723,7 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
         ):
             raise HTTPException(409, "Character master changed while the group was generating")
         histories = {}
-        for view_type in group_views:
+        for view_type in generated_views:
             image = group_images[view_type]
             req = RegenerateImageRequest(asset_type="character", asset_id=asset_id, view_type=view_type)
             latest, asset, item_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
@@ -1697,6 +1737,13 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
             asset.group_id, asset.master_version_id, asset.reference_version_ids = group_id, master_id, [master_id]
             _save_image_asset_state(project_id, latest, asset, active_path, prompt, image, custom_instructions, CHARACTER_PROMPT_TEMPLATE_VERSION, version_id, quality_reports[view_type])
             histories[view_type] = history
+        # Associate the locked master with the same logical group without
+        # replacing its confirmed image or creating a duplicate version.
+        if len(generated_views) == len(derived_views):
+            latest_master = _asset_record(latest, "character", asset_id, "front_half")
+            if latest_master:
+                latest_master.group_id = group_id
+                latest_master.master_version_id = master_id
         if latest.character_images:
             latest.character_images.reference_masters[asset_id] = master_id
         _save_project_state(latest)

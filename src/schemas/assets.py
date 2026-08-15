@@ -43,9 +43,14 @@ class ShotReference(BaseModel):
     image_path: str = Field(description="Local image path")
     label: str = Field(default="", description="Display label")
     reference_tag: str = Field(default="", description="Prompt tag such as @ref01_character_front")
-    source: Literal["asset", "manual"] = Field(
+    reference_token: str = Field(default="", description="User-facing explicit @ asset token")
+    explicit_base_source: Literal["", "asset", "manual"] = Field(
+        default="",
+        description="Source to restore when an explicit @ token is removed from the prompt",
+    )
+    source: Literal["asset", "manual", "explicit"] = Field(
         default="asset",
-        description="Whether this reference follows an asset version or was manually selected",
+        description="Whether this reference is automatic, manually selected, or explicitly @-mentioned",
     )
     asset_version_id: str = Field(default="", description="Active source image version for asset references")
     stale: bool = Field(default=False, description="Asset reference cannot resolve to a current usable file")

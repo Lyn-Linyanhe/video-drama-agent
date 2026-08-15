@@ -79,6 +79,10 @@ async def get_project_detail(project_id: str):
 async def get_project_assets(project_id: str):
     """获取指定项目的所有资产文件（多图分组格式）。"""
     try:
+        # Run the same path migration as the project-detail endpoint before
+        # scanning persisted state.  Direct asset requests are also used by
+        # older clients and must not expose stale absolute/乱码 paths.
+        _load_project_state(project_id, require_visual=False, require_script=False)
         return project_store.get_asset_groups(project_id)
     except ValueError:
         return {"error": "无效的 project_id"}

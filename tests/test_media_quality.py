@@ -220,6 +220,71 @@ def test_scene_review_with_a_failed_contract_check_cannot_pass():
     assert "空间方向" in report["issues"][0]
 
 
+def test_character_review_accepts_natural_qwen_contract_labels():
+    checks = [
+        {"item": "正面半身视图", "passed": True, "evidence": "从胸口以上入画"},
+        {"item": "身份一致性", "passed": True, "evidence": "脸部、发型和服装一致"},
+        {"item": "背景纯净度", "passed": True, "evidence": "纯白背景，无杂物"},
+        {"item": "真人写实风格", "passed": True, "evidence": "真实皮肤和服装材质"},
+    ]
+
+    report = media_quality._parse_visual_review(
+        json.dumps({
+            "passed": True,
+            "score": 1,
+            "should_regenerate": False,
+            "contract_checks": checks,
+            "issues": [],
+        }, ensure_ascii=False),
+        require_contract_checks=True,
+        contract_kind="character",
+    )
+
+    assert report["status"] == "passed"
+    assert report["passed"] is True
+
+
+def test_character_review_accepts_english_clean_background_label():
+    checks = [
+        {"item": "Identity", "passed": True, "evidence": "same face"},
+        {"item": "Anime vs Live-Action Medium", "passed": True, "evidence": "live action"},
+        {"item": "Requested View: Front Half", "passed": True, "evidence": "front bust"},
+        {"item": "Clean Background", "passed": True, "evidence": "seamless white background"},
+    ]
+
+    report = media_quality._parse_visual_review(
+        json.dumps({"passed": True, "score": 1, "should_regenerate": False, "contract_checks": checks}),
+        require_contract_checks=True,
+        contract_kind="character",
+    )
+
+    assert report["passed"] is True
+
+
+def test_character_review_accepts_profile_alias_and_natural_style_background_labels():
+    checks = [
+        {"item": "身份锁定（性别与年龄感）", "passed": True, "evidence": "身份和年龄感一致"},
+        {"item": "真人摄影风格", "passed": True, "evidence": "真实皮肤和服装材质"},
+        {"item": "left_profile", "passed": True, "evidence": "严格左侧面轮廓"},
+        {"item": "纯白干净背景", "passed": True, "evidence": "背景无杂物"},
+    ]
+
+    report = media_quality._parse_visual_review(
+        json.dumps({"passed": True, "score": 1, "should_regenerate": False, "contract_checks": checks}, ensure_ascii=False),
+        require_contract_checks=True,
+        contract_kind="character",
+    )
+
+    assert report["passed"] is True
+
+
+def test_character_review_prompt_requires_fixed_contract_categories():
+    prompt = media_quality.build_image_review_prompt("character", "left_profile", "同一角色的左侧面半身图")
+
+    assert "Required character evidence categories: identity, style, view, forbidden" in prompt
+    assert "must be exactly one of" in prompt
+
+
 def test_scene_review_rejects_arbitrary_labels_even_when_six_checks_are_present():
     checks = [
         {"item": f"自定义检查{i}", "passed": True, "evidence": "可见证据"}

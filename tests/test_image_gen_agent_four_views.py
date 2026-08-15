@@ -13,14 +13,16 @@ from src.agents.image_gen_agent import (
     build_character_negative_prompt,
     diagnose_character_prompt,
 )
+from src.agents.visual_prompt_agent import COMPACT_SYSTEM_PROMPT
 from src.agents.video_gen_agent import VideoGenerationAgent
 from src.api_clients.image_mock import MockImageClient
-from src.schemas.script import Scene, ScriptBreakdown
+from src.schemas.script import Scene, ScriptBreakdown, VisualAssetManifest, VisualCharacterAsset
 from src.schemas.visual import SceneVisual, VisualDesign
 from src.schemas.project import CreativeProfile
 from src.schemas.character import CharacterImage
 from src.graph.state import DramaState
 from src.services.asset_prompt_composer import compose_asset_prompt
+from src.api.context import _character_description
 from src.utils.visual_asset_manifest import build_manifest_from_scenes
 
 
@@ -46,6 +48,34 @@ class _CaptureSceneImageClient:
             height=1080,
             provider_name=self.provider_name,
         )
+
+
+def test_character_description_normalizes_scene_names_without_mutating_set_during_iteration():
+    state = DramaState(
+        script=ScriptBreakdown(
+            title="角色提示词预览",
+            genre="都市",
+            logline="测试角色描述读取。",
+            duration_sec=6,
+            narration_style="无旁白",
+            scenes=[
+                Scene(
+                    scene_id=1,
+                    duration_sec=6,
+                    location="便利店",
+                    characters=["顾衡 (Gu Heng)"],
+                    action_description="顾衡站在便利店门口，观察雨中的街道。",
+                    camera_direction="中景",
+                    emotion_tone="警觉",
+                )
+            ],
+        )
+    )
+
+    description = _character_description(state, "顾衡 (Gu Heng)")
+
+    assert "剧本可见外貌线索" in description
+    assert "顾衡站在便利店门口" in description
 
 
 class _StableScenePromptLLM:
@@ -306,6 +336,60 @@ def test_legacy_english_key_uses_the_saved_chinese_character_description():
     assert _character_description(state, "苏眠 (Su Mian)") == "女性，26岁，黑色中长发，穿米白色风衣。"
 
 
+def test_character_prompt_merges_manifest_details_when_visual_registry_is_short():
+    """A terse visual-stage summary must not hide the richer asset description."""
+    state = DramaState(
+        visual_design=VisualDesign(
+            overall_style="现代悬疑",
+            color_palette="冷蓝灰",
+            global_character_descriptions_cn={"苏眠": "女性，气质清冷。"},
+            scenes=[],
+        ),
+        script=ScriptBreakdown(
+            title="描述合并",
+            genre="悬疑",
+            logline="验证角色提示词来源合并。",
+            duration_sec=3,
+            narration_style="无旁白",
+            scenes=[
+                Scene(
+                    scene_id=1,
+                    duration_sec=3,
+                    location="办公室",
+                    characters=["苏眠"],
+                    action_description="苏眠站在办公室门口。",
+                    camera_direction="中景",
+                    emotion_tone="紧张",
+                )
+            ],
+            asset_manifest=VisualAssetManifest(
+                characters=[
+                    VisualCharacterAsset(
+                        asset_id="char_su_mian",
+                        name="苏眠",
+                        appearance_mode="on_screen",
+                        description="苏眠：约26岁女性；黑色中长发；米白色棉质长风衣；细眉、杏眼；左眼下方有小痣。",
+                    )
+                ]
+            ),
+        ),
+    )
+
+    description = _character_description(state, "苏眠")
+    prompt = build_character_image_prompt("苏眠", description, "front_half")
+
+    assert "黑色中长发" in description
+    assert "左眼下方有小痣" in description
+    assert "【角色稳定外貌锚点】" in prompt
+    assert "左眼下方有小痣" in prompt
+
+
+def test_compact_visual_prompt_requires_complete_character_anchors():
+    for term in ("性别与年龄段", "脸型与肤色", "眉眼鼻唇", "服装款式/主色/材质", "配饰"):
+        assert term in COMPACT_SYSTEM_PROMPT
+    assert "外貌以剧本为准" in COMPACT_SYSTEM_PROMPT
+
+
 def test_character_master_prompt_inherits_anime_project_style():
     prompt = build_character_image_prompt(
         "苏眠",
@@ -324,7 +408,7 @@ def test_character_master_prompt_inherits_anime_project_style():
     assert "胸部以下不得入画" in prompt
     assert "裁剪身体" not in negative
     assert "下身与鞋子信息仅作身份档案" in prompt
-    assert "tight bust portrait" in prompt
+    assert "严格胸像特写" in prompt
 
 
 def test_character_asset_preview_uses_project_art_style_in_provider_prompt():
@@ -352,7 +436,7 @@ def test_character_asset_preview_uses_project_art_style_in_provider_prompt():
     assert "photorealistic" not in composition["provider_prompt"]
     assert "真人写实照片" not in composition["provider_prompt"]
     assert "real actor identity" not in composition["provider_prompt"]
-    assert "animation character identity" in composition["provider_prompt"]
+    assert "锁定一个动漫角色身份" in composition["provider_prompt"]
 
 
 def test_character_reference_group_keeps_anime_style_contract():

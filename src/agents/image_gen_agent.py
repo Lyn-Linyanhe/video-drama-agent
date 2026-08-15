@@ -41,20 +41,16 @@ CHARACTER_VIEWS = [
 
 CHARACTER_PROMPT_TEMPLATE_VERSION = 11
 CHARACTER_REALISM_PREFIX = (
-    "MANDATORY STYLE: photorealistic live-action human actor casting reference photo, "
-    "real camera photography, real skin pores, natural facial proportions, real fabric, "
-    "neutral studio lighting, plain white studio background. "
-    "The result must look like a real person photographed in a studio, not stylized character art."
+    "强制风格：电影级真人写实演员定妆参考照片，真实摄影，真实皮肤毛孔，自然五官比例，真实服装面料，"
+    "中性影棚灯光，纯白影棚背景。最终结果必须像在摄影棚拍摄的真实人物，不得呈现为风格化角色原画。"
 )
 CHARACTER_ANIME_PREFIX = (
-    "MANDATORY STYLE: 2D anime character design, clean expressive line art, "
-    "controlled cel shading, coherent anime facial proportions, polished animation key visual, "
-    "consistent costume design and a clean plain studio-style background. "
-    "The result must look like an intentional anime/illustrated character reference, not a live-action photo."
+    "强制风格：二维动漫角色设计，清晰有表现力的线稿，受控的赛璐璐阴影，统一的动漫五官比例，"
+    "精修动画关键帧视觉效果，统一服装设计和干净的纯色影棚式背景。最终结果必须是明确的动漫/插画角色参考图，不得呈现为真人实拍照片。"
 )
 CHARACTER_SINGLE_IMAGE_RULE = (
-    "OUTPUT FORMAT: exactly one single photo, one person only, one camera angle only, "
-    "one plain white studio background, no split panels, no contact sheet, no repeated person."
+    "输出格式：严格只输出一张独立单图，只出现一个人物和一个镜头角度，使用一个纯白影棚背景；"
+    "不得分屏、不得拼接成组图、不得重复出现人物。"
 )
 
 
@@ -120,12 +116,12 @@ def character_style_negative(art_style: str | None) -> str:
     registry_negative = style["negative_prompt_layers"]["character"]
     if is_anime_art_style(art_style):
         return (
-            "photorealistic, live-action, real human actor, real-person casting photo, 真人摄影，真人照片，"
+            "照片级写实，真人实拍，真人演员，真人试镜照，真人摄影，真人照片，"
             "真实皮肤纹理，摄影棚试镜照，写实影视剧照，真人五官比例，真实皮肤毛孔，"
             f"{registry_negative}，"
         )
     return (
-        "stylized character art, concept art, cel shading, painted face, plastic digital skin, exaggerated eyes, "
+        "风格化角色原画，概念艺术，赛璐璐阴影，绘画脸部，塑料数字皮肤，夸张眼睛，"
         "动漫，二次元，漫画，插画，卡通，动画角色，游戏角色，CG渲染，3D建模，虚拟偶像，数字人，娃娃脸，塑料皮肤，"
         "夸张大眼，尖下巴，赛璐璐，上色线稿，厚涂，概念艺术，角色原画，手办质感，非真人照片，"
         f"{registry_negative}，"
@@ -252,15 +248,13 @@ def build_character_image_prompt(
     framing_override = ""
     if view_type == "front_half":
         role_information += "下身与鞋子信息仅作身份档案，不得在本图绘制或展示。"
-        framing_override = (
-            "FRAMING OVERRIDE: tight bust portrait, head and shoulders fill the frame, crop at mid-chest; "
-            "do not show waist, hips, legs, knees, socks or shoes."
-        )
+        framing_override = "构图覆盖要求：严格胸像特写，头部和肩部填充画面，在胸部中段裁切；不得出现腰部、臀部、腿部、膝盖、袜子或鞋子。"
     elif view_type == "left_profile":
-        framing_override = "FRAMING OVERRIDE: strict side bust portrait, crop below the chest; do not show the lower body."
+        framing_override = "构图覆盖要求：严格侧面胸像，在胸部以下裁切；不得出现下半身。"
     return f"""{style_prefix}
 {single_image_rule}
 {style_title}。
+【角色稳定外貌锚点】{role_information}
 高质量专业角色设定图，{label}，只输出当前一个镜头角度的一张人物图；纯白色干净背景，{lighting_requirement}，{medium_description}。
 视图要求：{view_instruction}
 {framing_override}
@@ -277,7 +271,7 @@ def build_character_negative_prompt(view_type: str, art_style: str = "写实") -
     return f"{CHARACTER_COMMON_NEGATIVE_PROMPT}{character_style_negative(art_style)}，{view_exclusions}"
 
 CHARACTER_COMMON_NEGATIVE_PROMPT = (
-        "split panels, contact sheet, repeated person, multiple camera angles in one image, "
+        "分屏，拼接组图，重复人物，单张图片中出现多个镜头角度，"
         "道具，武器，食物，饮料，手持物，复杂动作，夸张表情，面部遮挡，环境背景，其他角色，"
         "多个画面，重复人物，文字，水印，标签，UI元素，额外肢体，服装不一致，发型不一致，面部不一致，"
         "性别改变，年龄改变，男变女，女变男，中性化，换脸，换身份，换发型，换服装，"

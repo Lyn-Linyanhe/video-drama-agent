@@ -6,10 +6,26 @@ function pathToUrl(localPath) {
   if (!localPath) return '';
   // 统一分隔符
   const p = localPath.replace(/\\/g, '/');
-  const idx = p.indexOf('/output/');
-  if (idx >= 0) return p.slice(idx);
+  const idx = p.toLowerCase().indexOf('/output/');
+  if (idx >= 0) {
+    const suffix = p.slice(idx + '/output/'.length);
+    return `/output/${repairUtf8Mojibake(suffix)}`;
+  }
   // 如果不在 output 下，尝试只取文件名
   return '/output/' + p.split('/').pop();
+}
+
+function repairUtf8Mojibake(value) {
+  // Older snapshots can contain UTF-8 bytes decoded as Latin-1.  Browser
+  // requests should use the real project directory name when that happens.
+  if (!value || /[\u3400-\u9fff]/.test(value) || typeof TextDecoder === 'undefined') return value;
+  try {
+    const bytes = new Uint8Array(Array.from(value, char => char.charCodeAt(0) & 0xff));
+    const repaired = new TextDecoder('utf-8', {fatal: true}).decode(bytes);
+    return /[\u3400-\u9fff]/.test(repaired) ? repaired : value;
+  } catch {
+    return value;
+  }
 }
 
 function mediaUrl(path, versionId = '') {
@@ -139,6 +155,7 @@ function restoreProjectMedia(state, scannedAssets) {
 }
 const __moduleActions = {
   pathToUrl,
+  repairUtf8Mojibake,
   mediaUrl,
   scannedCharacterImages,
   scannedSceneImages,

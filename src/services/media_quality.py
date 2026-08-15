@@ -270,13 +270,23 @@ def _scene_required_contract_categories(expected_prompt: str, view_type: str = "
 
 def _character_contract_category(label: str) -> str:
     text = str(label or "").strip().casefold().replace(" ", "")
-    if any(token in text for token in ("角色身份", "人物身份", "characteridentity", "identity")):
+    if any(token in text for token in (
+        "角色身份", "人物身份", "身份一致", "身份锁定", "外貌一致", "角色一致", "人物一致",
+        "characteridentity", "identity",
+    )):
         return "identity"
-    if any(token in text for token in ("风格媒介", "艺术风格", "动漫", "写实", "style", "medium")):
+    if any(token in text for token in ("风格媒介", "艺术风格", "风格", "动漫", "写实", "摄影", "style", "medium")):
         return "style"
-    if any(token in text for token in ("视图", "构图", "机位", "view", "framing", "orientation")):
+    if any(token in text for token in (
+        "视图", "构图", "机位", "left_profile", "right_profile", "front_full", "front_half", "back_full",
+        "profile", "view", "framing", "orientation",
+    )):
         return "view"
-    if any(token in text for token in ("禁用元素", "禁止元素", "forbidden", "negative", "prohibited")):
+    if any(token in text for token in (
+        "禁用元素", "禁止元素", "背景纯净", "干净背景", "纯白背景",
+        "纯白干净背景", "cleanbackground", "backgroundcleanliness", "cleanbackdrop", "background",
+        "forbidden", "negative", "prohibited",
+    )):
         return "forbidden"
     return ""
 
@@ -398,11 +408,19 @@ def build_image_review_prompt(asset_type: str, view_type: str, expected_prompt: 
         assert required_contract_categories is not None
         required_contract_categories.add("state")
 
+    character_evidence_contract = ""
+    if asset_type == "character":
+        character_evidence_contract = (
+            "\nRequired character evidence categories: identity, style, view, forbidden. "
+            "Return exactly one contract_checks item for each category. The item field must be exactly one of "
+            "identity, style, view, forbidden; use visible image evidence only."
+        )
+
     orientation_contract = _view_orientation_contract(asset_type, view_type)
     return (
         f"{contracts.get(asset_type, 'Verify this single generated image against its requested subject and view.')}\n"
         f"Requested view: {view_type or 'unspecified'}.\nGeneration requirements:\n{_review_prompt_excerpt(expected_prompt)}\n"
-        f"{scene_evidence_contract}{prop_state_contract}\n{orientation_contract}"
+        f"{scene_evidence_contract}{prop_state_contract}{character_evidence_contract}\n{orientation_contract}"
         'Return JSON only: {"passed":true,"score":0.0,"should_regenerate":false,'
         '"contract_checks":[{"item":"criterion","passed":true,"evidence":"visible image evidence"}],'
         '"issues":["specific issue"],"summary":"brief summary"}.'

@@ -437,12 +437,19 @@ async def _job_script_visualize(context, payload: dict) -> dict:
         _save_project_state(state)
         script = state.script.model_copy(deep=True)
         profile = state.creative_profile
+        source_text = state.script_draft_text or (
+            state.user_input if state.input_mode == "script" else ""
+        )
     context.progress("waiting_provider", 0, 1, "正在生成视觉设计与分镜提示词")
     started = time.perf_counter()
     llm_metrics: dict = {}
     try:
         visual, generation_prompts = await visual_prompt_agent.run(
-            script, creative_profile=profile, telemetry=llm_metrics, progress_callback=context.progress,
+            script,
+            creative_profile=profile,
+            telemetry=llm_metrics,
+            progress_callback=context.progress,
+            source_text=source_text,
         )
     except asyncio.CancelledError:
         async with context.project_lock:
@@ -788,12 +795,25 @@ async def _job_video_generate(context, payload: dict) -> dict:
     ]
     if missing_references:
         raise ValueError("提交快照中的参考图已丢失：" + "、".join(missing_references) + "；请重新提交视频任务")
-    references = snapshot_references
-    asset_references = [item["image_path"] for item in references]
-    reference_labels = list(snapshot.get("reference_labels") or [
+    snapshot_labels = list(snapshot.get("reference_labels") or [
         f"{item.get('asset_type', 'reference')}：{item.get('label') or item.get('asset_id', '')}（{item.get('view_type', '')}）"
-        for item in references
+        for item in snapshot_references
     ])
+    references = []
+    reference_labels = []
+    seen_reference_keys = set()
+    for index, item in enumerate(snapshot_references):
+        key = _reference_submission_key(item)
+        if key in seen_reference_keys:
+            continue
+        seen_reference_keys.add(key)
+        references.append(item)
+        reference_labels.append(
+            snapshot_labels[index]
+            if index < len(snapshot_labels)
+            else _reference_label_for_item(item, len(references))
+        )
+    asset_references = [item["image_path"] for item in references]
     if policy["capability"].get("multi_reference"):
         reference_paths = asset_references
     elif policy["capability"].get("image_to_video"):
@@ -1459,13 +1479,20 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
         state = _load_project_state(project_id)
         scene_id = int(req.payload.get("scene_id") or req.target_id or 0)
         scenes = [scene_id] if scene_id else [scene.scene_id for scene in state.script.scenes]
+        skipped_video_shots: list[dict[str, object]] = []
         for selected_scene_id in scenes:
             production = _ensure_shot_production(state, selected_scene_id)
             policy = normalize_video_policy(state.video_generation_policy, production.video_override)
             if production.continuity_enabled and not policy["capability"].get("continuity"):
                 raise HTTPException(409, f"{policy['model']} 不支持首帧参考，无法生成连续镜头")
             if scene_id or production.generation_status in {"idle", "failed", "canceled"} or not production.video_versions:
-                snapshot = _build_video_generation_snapshot(state, selected_scene_id, policy)
+                try:
+                    snapshot = _build_video_generation_snapshot(state, selected_scene_id, policy)
+                except ValueError as exc:
+                    if scene_id:
+                        raise HTTPException(409, str(exc)) from exc
+                    skipped_video_shots.append({"scene_id": selected_scene_id, "reason": str(exc)})
+                    continue
                 if requires_reference_image(policy) and not snapshot["references"]:
                     snapshot["references_pending"] = True
                 production.last_generation_snapshot = snapshot
@@ -1531,20 +1558,35 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
     if not specs:
         if len(duplicates) == 1:
             public_job = _job_public(duplicates[0])
-            return {"job": public_job, "jobs": [public_job]}
+            result = {"job": public_job, "jobs": [public_job]}
+            if req.job_type == "video.generate" and 'skipped_video_shots' in locals():
+                result["skipped"] = skipped_video_shots
+            return result
         if duplicates:
             batch_id = next((item["batch_id"] for item in duplicates if item["batch_id"]), "")
             batch = _batch_public(project_id, batch_id, duplicates)
-            return {"batch": batch, "jobs": batch["jobs"]}
+            result = {"batch": batch, "jobs": batch["jobs"]}
+            if req.job_type == "video.generate" and 'skipped_video_shots' in locals():
+                result["skipped"] = skipped_video_shots
+            return result
         batch = _batch_public(project_id, uuid.uuid4().hex[:12], [])
-        return {"batch": batch, "jobs": batch["jobs"]}
+        result = {"batch": batch, "jobs": batch["jobs"]}
+        if req.job_type == "video.generate" and 'skipped_video_shots' in locals():
+            result["skipped"] = skipped_video_shots
+        return result
     if len(specs) == 1:
         job = job_manager.create_job(project_id=project_id, **specs[0])
         public_job = _job_public(job)
-        return {"job": public_job, "jobs": [public_job]}
+        result = {"job": public_job, "jobs": [public_job]}
+        if req.job_type == "video.generate" and 'skipped_video_shots' in locals():
+            result["skipped"] = skipped_video_shots
+        return result
     batch_id, jobs = job_manager.create_batch(project_id, specs)
     batch = _batch_public(project_id, batch_id, jobs)
-    return {"batch": batch, "jobs": batch["jobs"]}
+    result = {"batch": batch, "jobs": batch["jobs"]}
+    if req.job_type == "video.generate" and 'skipped_video_shots' in locals():
+        result["skipped"] = skipped_video_shots
+    return result
 
 
 @router.get("/api/projects/{project_id}/jobs")

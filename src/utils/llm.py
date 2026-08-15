@@ -219,6 +219,11 @@ class LLMClient:
         ) from last_error
 
     def _provider_temperature(self, temperature: float) -> float:
+        if self.provider == "deepseek":
+            # DeepSeek is used for deterministic script/prompt structure. Keep
+            # one effective value across all agents instead of silently
+            # varying with each agent's legacy default.
+            return 0.25
         if self.provider == "kimi":
             return 1
         return temperature

@@ -4,7 +4,26 @@ const generateAssetCard = (...args) => globalThis.StudioActions.generateAssetCar
 const mediaUrl = (...args) => globalThis.StudioActions.mediaUrl(...args);
 const openCharacterImageEditor = (...args) => globalThis.StudioActions.openCharacterImageEditor(...args);
 const openSceneImageEditor = (...args) => globalThis.StudioActions.openSceneImageEditor(...args);
-const isMissingMediaPath = (...args) => globalThis.StudioActions.isMissingMediaPath(...args);
+
+function assetPreviewMarkup(image, label, missing = false) {
+  if (image?.image_path) {
+    return `<img src="${mediaUrl(image.image_path, image.version_id)}" class="asset-card-preview-image" alt="${escapeHtml(label)}" onerror="StudioActions.handleAssetCardImageError(this)">`;
+  }
+  const title = missing ? '图片文件缺失' : '尚未生成';
+  const hint = missing ? '可重新生成当前资产或选择历史版本' : '点击生成按钮创建图片';
+  return `<div class="asset-preview-empty${missing ? ' is-missing' : ''}"><strong>${title}</strong><span>${hint}</span></div>`;
+}
+
+function handleAssetCardImageError(image) {
+  const wrapper = image?.closest?.('.asset-card-preview');
+  if (!wrapper) return;
+  wrapper.innerHTML = '<div class="asset-preview-empty is-error"><strong>图片加载失败</strong><span>可重新生成当前资产</span></div>';
+  const status = wrapper.closest('[data-asset-card]')?.querySelector('[data-asset-status]');
+  if (status) {
+    status.textContent = '图片加载失败，可重新生成';
+    status.style.color = '#ef4444';
+  }
+}
 
 function renderRoles() {
   const container = document.getElementById('role-cards');
@@ -19,8 +38,10 @@ function renderRoles() {
   });
   container.innerHTML = appState.roles.map((r, i) => {
     const imgs = imgMap[r.name] || [];
-    const availableImgs = imgs.filter(item => item.image_path && !item.media_missing && !isMissingMediaPath(item.image_path));
-    const missing = imgs.some(item => item.image_path && (item.media_missing || isMissingMediaPath(item.image_path)));
+    // The server-side missing list can be stale after a moved/renamed asset.
+    // Keep any persisted path renderable and let the image error handler decide.
+    const availableImgs = imgs.filter(item => item.image_path);
+    const missing = imgs.length > 0 && availableImgs.length === 0;
     const mainImg = availableImgs.find(x => x.view_type === 'front_half') || availableImgs.find(x => x.view_type === 'portrait') || availableImgs[0];
     const encodedId = encodeURIComponent(r.name);
     const error = appState.assetErrors[`character:${r.name}`];
@@ -28,11 +49,9 @@ function renderRoles() {
     const ready = availableImgs.length >= 4;
     const status = busy ? '生成中' : error ? '生成失败' : missing ? '文件缺失，可重新生成' : ready ? '已生成' : imgs.length ? '待补齐' : '待生成';
     return `
-    <div class="card" style="position:relative;cursor:pointer" onclick="StudioActions.openCharacterImageEditor(${i})">
-      <div class="player-placeholder" style="max-height:180px;margin-bottom:12px;font-size:11px;overflow:hidden">
-        ${mainImg?.image_path
-          ? `<img src="${mediaUrl(mainImg.image_path, mainImg.version_id)}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.parentElement.innerHTML='${escapeHtml(r.name)}'">`
-          : escapeHtml(r.name)}
+    <div class="card" data-asset-card style="position:relative;cursor:pointer" onclick="StudioActions.openCharacterImageEditor(${i})">
+      <div class="player-placeholder asset-card-preview" style="max-height:180px;margin-bottom:12px;font-size:11px;overflow:hidden">
+        ${assetPreviewMarkup(mainImg, r.name, missing)}
       </div>
       <h4 style="margin-bottom:4px">${escapeHtml(r.name)}</h4>
       <div style="font-size:11px;color:#a1a1aa;display:flex;flex-wrap:wrap;gap:4px">
@@ -41,7 +60,7 @@ function renderRoles() {
         <span class="tag">${escapeHtml(r.personality?.slice(0,12) || '')}</span>
       </div>
       <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.5">${escapeHtml(r.description?.slice(0,80) || '')}</div>
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${status} · ${availableImgs.length}/4</span><button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.generateAssetCard('character','${encodedId}',${Boolean(mainImg?.image_path)})">${busy ? '终止' : mainImg?.image_path ? '重新生成' : '生成'}</button></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span data-asset-status style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${status} · ${availableImgs.length}/4</span><button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.generateAssetCard('character','${encodedId}',${Boolean(mainImg?.image_path)})">${busy ? '终止' : mainImg?.image_path ? '重新生成' : '生成'}</button></div>
     </div>`;
   }).join('');
 }
@@ -67,8 +86,9 @@ function renderScenes() {
     const sceneId = s.locationId || Number(s.sceneId) || i + 1;
     const stateId = s.stateId || '';
     const imgs = imgMap[`${sceneId}|${stateId}`] || (!stateId ? (imgMap[String(sceneId)] || []) : []);
-    const availableImgs = imgs.filter(item => item.image_path && !item.media_missing && !isMissingMediaPath(item.image_path));
-    const missing = imgs.some(item => item.image_path && (item.media_missing || isMissingMediaPath(item.image_path)));
+    // Do not hide a persisted path solely because an older status snapshot marked it missing.
+    const availableImgs = imgs.filter(item => item.image_path);
+    const missing = imgs.length > 0 && availableImgs.length === 0;
     const mainImg = availableImgs.find(item => item.view_type === 'scene_center') || availableImgs[0];
     const pendingMaster = availableImgs.find(item => item.view_type === 'scene_center' && item.is_master && item.needs_confirmation);
     const confirmedMaster = availableImgs.find(item => item.view_type === 'scene_center' && item.is_master && !item.needs_confirmation);
@@ -84,22 +104,22 @@ function renderScenes() {
       ? `<button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.confirmSceneMaster('${encodedId}','${escapeHtml(pendingMaster.version_id || '')}','${escapeHtml(pendingMaster.state_id || '')}')">确认母版</button>`
       : `<button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.generateAssetCard('scene','${encodedId}',${Boolean(mainImg?.image_path)},'${escapeHtml(stateId)}')">${busy ? '终止' : mainImg?.image_path ? '重新生成' : '生成'}</button>`;
     return `
-    <div class="card" style="cursor:pointer" onclick="StudioActions.openSceneImageEditor(${i})">
-      <div class="player-placeholder" style="max-height:160px;margin-bottom:12px;font-size:11px;overflow:hidden">
-        ${mainImg?.image_path
-          ? `<img src="${mediaUrl(mainImg.image_path, mainImg.version_id)}" style="width:100%;height:100%;object-fit:cover;border-radius:8px" onerror="this.parentElement.innerHTML='${escapeHtml(s.name)}'">`
-          : escapeHtml(s.name)}
+    <div class="card" data-asset-card style="cursor:pointer" onclick="StudioActions.openSceneImageEditor(${i})">
+      <div class="player-placeholder asset-card-preview" style="max-height:160px;margin-bottom:12px;font-size:11px;overflow:hidden">
+        ${assetPreviewMarkup(mainImg, s.name, missing)}
       </div>
       <h4 style="margin-bottom:4px">${escapeHtml(s.name)}</h4>
       <div style="font-size:11px;color:#a1a1aa">${escapeHtml([s.time, s.weather, s.light].filter(Boolean).join(' / ') || s.stateLabel || '')}</div>
       <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.5">${escapeHtml((s.description || '').slice(0,60))}</div>
       <div style="font-size:10px;color:#71717a;margin-top:5px">用于分镜 ${escapeHtml((s.shotIds || []).join('、') || '未绑定')}</div>
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${status} · ${availableImgs.length}/${groupCount}</span>${action}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span data-asset-status style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${status} · ${availableImgs.length}/${groupCount}</span>${action}</div>
     </div>`;
   }).join('');
 }
 
 const __moduleActions = {
+  assetPreviewMarkup,
+  handleAssetCardImageError,
   renderRoles,
   renderScenes,
 };

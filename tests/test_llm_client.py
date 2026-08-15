@@ -11,6 +11,14 @@ class StructuredExample(BaseModel):
     title: str
 
 
+def test_deepseek_requests_use_fixed_temperature_point_two_five():
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "deepseek"
+
+    assert client._provider_temperature(0.8) == 0.25
+    assert client._provider_temperature(0.2) == 0.25
+
+
 class FakeStream:
     def __init__(self, text: str):
         self.text = text
@@ -66,6 +74,7 @@ async def test_deepseek_structured_output_uses_plain_json_without_tool_choice():
     assert telemetry["fallback_used"] is True
     assert "tools" not in captured[0]
     assert "tool_choice" not in captured[0]
+    assert captured[0]["temperature"] == 0.25
 
 
 @pytest.mark.asyncio

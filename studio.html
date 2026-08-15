@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 短剧创作平台</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/base.css?v=20260814-image-editor-layout">
 <link rel="stylesheet" href="/static/css/settings.css">
 <link rel="stylesheet" href="/static/css/assets.css">
-<link rel="stylesheet" href="/static/css/production.css?v=20260809-audio-workspace">
+<link rel="stylesheet" href="/static/css/production.css?v=20260814-shot-editor-layout">
 <link rel="stylesheet" href="/static/css/audio.css?v=20260809-audio-workspace">
 </head>
 <body>
@@ -31,7 +31,7 @@
   </nav>
   <div class="sidebar-footer">
     API: <span id="api-status">连接中</span><br>
-    v1.0 · Mock 模式
+    v1.0 · <span id="api-provider">检测中</span>
   </div>
 </aside>
 
@@ -447,45 +447,96 @@
     </div>
     <div class="image-editor-layout">
       <div class="image-editor-preview-panel">
-        <img id="image-editor-preview" class="image-editor-preview" alt="当前图片">
+        <div class="image-editor-panel-head">
+          <div>
+            <div class="image-editor-eyebrow">参考预览</div>
+            <div class="image-editor-panel-title">当前视图</div>
+          </div>
+          <span class="image-editor-panel-hint">选择视角后单独生成或修订</span>
+        </div>
+        <img id="image-editor-preview" class="image-editor-preview" alt="当前图片" hidden>
+        <div id="image-editor-empty-state" class="image-editor-empty-state" hidden>
+          <div class="image-editor-empty-icon">◇</div>
+          <strong>当前视图尚未生成</strong>
+          <span>生成后会在这里显示图片</span>
+        </div>
         <div id="image-editor-preview-status" class="media-missing-notice" hidden></div>
-        <div id="image-editor-views" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:12px"></div>
+        <div class="image-editor-view-control">
+          <div class="image-editor-control-label">视图选择</div>
+          <div id="image-editor-views" class="image-editor-views image-editor-view-tabs" aria-label="当前视图"></div>
+        </div>
+        <div id="image-editor-history-section" class="image-editor-history-section" hidden>
+          <div class="image-editor-history-title">历史版本 <span>点击缩略图切换当前版本</span></div>
+          <div id="image-editor-history"></div>
+        </div>
       </div>
       <div class="image-editor-work-panel">
-        <label class="image-editor-label" for="image-editor-system-prompt">最终发送给图片服务的提示词</label>
-        <textarea id="image-editor-system-prompt" rows="9" style="width:100%" readonly></textarea>
-        <label class="image-editor-label" for="image-editor-negative-prompt" style="margin-top:10px">负面约束</label>
-        <textarea id="image-editor-negative-prompt" rows="3" style="width:100%" readonly></textarea>
-        <div id="image-editor-project-constraints" style="font-size:11px;line-height:1.5;color:#a1a1aa"></div>
-        <label class="image-editor-label" id="image-editor-prompt-label" for="image-editor-prompt" style="margin-top:14px">补充修改要求</label>
-        <textarea id="image-editor-prompt" rows="4" style="width:100%" placeholder="补充需要改变的可见细节。系统会固定保留当前视图的构图方向与禁用项。"></textarea>
-        <div id="image-generation-policy" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin:12px 0">
-          <label class="image-editor-label">模型服务<select id="image-editor-provider" onchange="StudioActions.changeImagePolicy()"></select></label>
-          <label class="image-editor-label">图片模型<select id="image-editor-model" onchange="StudioActions.changeImagePolicy()"></select></label>
-          <label class="image-editor-label">清晰度<select id="image-editor-resolution" onchange="StudioActions.changeImagePolicy()"></select></label>
-        </div>
-        <label id="image-editor-save-policy-row" class="image-editor-label" style="display:flex;align-items:center;gap:7px"><input id="image-editor-save-policy" type="checkbox"> 设为项目默认图片模型</label>
-        <label id="image-editor-reference-row" class="image-editor-label" style="margin-top:10px;display:none">附加角色参考图（可选）<select id="image-editor-reference-versions" multiple size="4" style="width:100%;margin-top:5px"></select></label>
-        <div id="image-generation-policy-note" style="font-size:12px;line-height:1.5;color:#a1a1aa;margin:8px 0"></div>
-      </div>
-      <div class="image-editor-meta-panel">
-        <span class="image-editor-label">资产名称</span>
-        <div id="image-editor-asset-name" class="image-editor-asset-name"></div>
-        <span class="image-editor-label" style="margin-top:18px">当前视图</span>
-        <div id="image-editor-asset-meta" class="image-editor-asset-name" style="color:#a1a1aa"></div>
-        <span class="image-editor-label" style="margin-top:18px">图片操作</span>
-        <button class="btn-secondary" style="width:100%;margin-bottom:8px" onclick="document.getElementById('image-editor-upload').click()">上传替换图片</button>
-        <input id="image-editor-upload" type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="StudioActions.uploadEditedImage(this)">
-        <div style="font-size:12px;line-height:1.6;color:#71717a">补充要求会叠加到当前视图的系统提示词；镜头方向、构图尺寸和禁用项始终由系统固定。新图片会自动保存为历史版本。</div>
-        <div class="image-editor-history-title">历史版本</div>
-        <div id="image-editor-history"></div>
+        <section class="image-editor-section image-editor-identity-section">
+          <div class="image-editor-section-title">当前资产</div>
+          <div class="image-editor-identity">
+            <div>
+              <span class="image-editor-label">资产名称</span>
+              <div id="image-editor-asset-name" class="image-editor-asset-name"></div>
+            </div>
+            <div>
+              <span class="image-editor-label">当前视图</span>
+              <div id="image-editor-asset-meta" class="image-editor-asset-name image-editor-asset-meta"></div>
+            </div>
+          </div>
+        </section>
+        <section class="image-editor-section image-editor-request-section">
+          <div class="image-editor-section-title">本次生成要求 <span class="image-editor-section-optional">可选</span></div>
+          <label class="image-editor-label" id="image-editor-prompt-label" for="image-editor-prompt">补充修改要求</label>
+          <textarea id="image-editor-prompt" rows="4" class="image-editor-request" placeholder="只写本次想改变的外观、服装或材质细节。视图方向和系统约束会自动保留。"></textarea>
+          <div class="image-editor-help">已有图片时，这里会作为参考修订要求；未生成图片时，会作为当前视图的补充要求。</div>
+        </section>
+        <section class="image-editor-section image-editor-policy-section">
+          <div class="image-editor-section-title">生成设置</div>
+          <div id="image-generation-policy" class="image-generation-policy">
+            <label class="image-editor-label">模型服务<select id="image-editor-provider" aria-label="模型服务" onchange="StudioActions.changeImagePolicy()"></select></label>
+            <label class="image-editor-label">图片模型<select id="image-editor-model" aria-label="图片模型" onchange="StudioActions.changeImagePolicy()"></select></label>
+            <label class="image-editor-label">清晰度<select id="image-editor-resolution" aria-label="清晰度" onchange="StudioActions.changeImagePolicy()"></select></label>
+          </div>
+          <div id="image-generation-policy-note" class="image-editor-help image-generation-policy-note"></div>
+        </section>
+        <section class="image-editor-section image-editor-prompt-section">
+          <details class="image-editor-prompt-details">
+            <summary>查看完整提示词 <span>只读审阅</span></summary>
+            <div class="image-editor-prompt-details-body">
+              <div id="image-editor-character-description" class="image-editor-character-description" hidden>
+                <span class="image-editor-label">角色稳定外貌锚点</span>
+                <div id="image-editor-character-description-text"></div>
+              </div>
+              <label class="image-editor-label" for="image-editor-system-prompt">最终发送给图片服务的提示词</label>
+              <textarea id="image-editor-system-prompt" rows="9" readonly></textarea>
+              <label class="image-editor-label" for="image-editor-negative-prompt">负面约束</label>
+              <textarea id="image-editor-negative-prompt" rows="3" readonly></textarea>
+              <div id="image-editor-project-constraints" class="image-editor-project-constraints"></div>
+            </div>
+          </details>
+        </section>
+        <section class="image-editor-section image-editor-advanced-section">
+          <details class="image-editor-advanced">
+            <summary>高级操作 <span>项目默认、参考图和上传</span></summary>
+            <div class="image-editor-advanced-body">
+              <label id="image-editor-save-policy-row" class="image-editor-label image-editor-checkbox"><input id="image-editor-save-policy" type="checkbox"> 设为项目默认图片模型</label>
+              <label id="image-editor-reference-row" class="image-editor-label" style="display:none">附加角色参考图（可选）<select id="image-editor-reference-versions" multiple size="4"></select></label>
+              <button class="btn-secondary" type="button" onclick="document.getElementById('image-editor-upload').click()">上传替换图片</button>
+              <input id="image-editor-upload" type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="StudioActions.uploadEditedImage(this)">
+              <div class="image-editor-help image-editor-advanced-note">补充要求会叠加到当前视图的系统提示词；镜头方向、构图尺寸和禁用项始终由系统固定。新图片会自动保存为历史版本。</div>
+            </div>
+          </details>
+        </section>
       </div>
     </div>
     <div class="image-editor-footer">
+      <div class="image-editor-footer-hint">生成前请确认模型、清晰度和当前视图</div>
+      <div class="image-editor-footer-actions">
       <button class="btn-secondary" onclick="StudioActions.closeImageEditor()">取消</button>
       <button class="btn-secondary" id="btn-image-generate-master" onclick="StudioActions.generateCharacterMaster()" style="display:none">生成角色母版</button>
       <button class="btn-secondary" id="btn-image-generate-all" onclick="StudioActions.generateAllCharacterViews()" style="display:none">生成四视图组图</button>
-      <button class="btn-primary" id="btn-image-regenerate" onclick="StudioActions.regenerateEditedImage()">重新生成图片</button>
+      <button class="btn-primary image-editor-primary-action" id="btn-image-regenerate" onclick="StudioActions.regenerateEditedImage()">重新生成图片</button>
+      </div>
     </div>
   </section>
 </div>
@@ -528,6 +579,6 @@ document.addEventListener('DOMContentLoaded', function() {
   arkModelSelect.value = models.includes(previous) ? previous : models[0];
 });
 </script>
-<script type="module" src="/static/js/bootstrap.js?v=20260811-asset-quality-references"></script>
+<script type="module" src="/static/js/bootstrap.js?v=20260815-image-preview-repair"></script>
 </body>
 </html>

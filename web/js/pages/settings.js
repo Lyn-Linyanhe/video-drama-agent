@@ -12,7 +12,7 @@ const PROVIDER_MODELS = {
 const SETTINGS_DEFAULTS = {
   profile_name: '默认配置', http_proxy: '',
   llm_provider: 'deepseek', llm_model: 'deepseek-v4-flash', llm_key: '', llm_base_url: '',
-  llm_timeout: '1800', llm_stream: 'true', llm_temperature: '0.7', llm_top_p: '0.9',
+  llm_timeout: '1800', llm_stream: 'true', llm_temperature: '0.25', llm_top_p: '0.9',
   kimi_prompt_review_enabled: true, kimi_prompt_review_api_key: '', kimi_prompt_review_model: 'kimi-k2.6', kimi_prompt_review_base_url: 'https://api.moonshot.cn/v1',
   tts_provider: 'edge', tts_key: '', tts_base_url: '', tts_model: '',
   minimax_api_key: '', minimax_model: 'MiniMax/speech-2.8-turbo', minimax_timeout: '45', minimax_default_male_voice: '', minimax_default_female_voice: '',

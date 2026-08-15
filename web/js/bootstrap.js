@@ -1,8 +1,37 @@
 "use strict";
+import {formatApiHealth} from './core/api-health.js';
+
 globalThis.StudioActions = globalThis.StudioActions || {};
 if (document.readyState === 'loading') {
   await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, {once: true}));
 }
+
+async function checkApiHealth() {
+  const status = document.getElementById('api-status');
+  const provider = document.getElementById('api-provider');
+  try {
+    const response = await fetch(`${window.location.origin}/api/health`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const health = formatApiHealth(await response.json());
+    if (status) status.innerHTML = `<span class="status-dot ${health.statusClass}"></span>${health.statusLabel}`;
+    if (provider) provider.textContent = health.providerLabel;
+  } catch (error) {
+    const health = formatApiHealth({status: 'error'});
+    if (status) status.innerHTML = `<span class="status-dot ${health.statusClass}"></span>${health.statusLabel}`;
+    if (provider) provider.textContent = health.providerLabel;
+    console.error('API 健康检查失败:', error);
+    return;
+  }
+  const results = await Promise.allSettled([
+    globalThis.StudioActions.loadProfileList?.(),
+    globalThis.StudioActions.loadProjects?.(),
+  ]);
+  results.filter(result => result.status === 'rejected').forEach(result => console.error('初始化数据加载失败:', result.reason));
+}
+
+globalThis.StudioActions.checkApiHealth = checkApiHealth;
+void checkApiHealth();
+
 const moduleVersion = new URL(import.meta.url).search;
 await import(`./core/state-api.js${moduleVersion}`);
 await import(`./core/media-status.js${moduleVersion}`);
@@ -20,26 +49,7 @@ await import(`./pages/production.js${moduleVersion}`);
 await import(`./components/audio-timeline.js${moduleVersion}`);
 await import(`./pages/production-actions.js${moduleVersion}`);
 
-async function checkApiHealth() {
-  const status = document.getElementById('api-status');
-  try {
-    const response = await fetch(`${window.location.origin}/api/health`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    if (status) status.innerHTML = '<span class="status-dot green"></span>已连接';
-  } catch (error) {
-    if (status) status.innerHTML = '<span class="status-dot red"></span>连接失败';
-    console.error('API 健康检查失败:', error);
-    return;
-  }
-  const results = await Promise.allSettled([
-    globalThis.StudioActions.loadProfileList?.(),
-    globalThis.StudioActions.loadProjects?.(),
-  ]);
-  results.filter(result => result.status === 'rejected').forEach(result => console.error('初始化数据加载失败:', result.reason));
-}
-
-globalThis.StudioActions.checkApiHealth = checkApiHealth;
 globalThis.StudioActions.initializeStudio();
 globalThis.StudioActions.installMediaStatusHandling();
-void checkApiHealth();
+void globalThis.StudioActions.loadProjects?.();
 globalThis.dispatchEvent(new CustomEvent('studio:ready'));

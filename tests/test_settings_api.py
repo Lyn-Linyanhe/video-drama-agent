@@ -33,6 +33,15 @@ def test_llm_timeout_profile_is_normalized_for_long_script_stages():
     assert _normalize_llm_timeout("600") == "600"
 
 
+def test_deepseek_profile_temperature_is_normalized_to_point_two_five():
+    profile = settings_routes._normalize_audio_profile({
+        "llm_provider": "deepseek",
+        "llm_temperature": "0.7",
+    })
+
+    assert profile["llm_temperature"] == "0.25"
+
+
 def test_reload_llm_agents_replaces_stale_clients(monkeypatch):
     import src.api.routes.settings as settings_routes
 

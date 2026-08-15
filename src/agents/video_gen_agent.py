@@ -580,8 +580,7 @@ class VideoGenerationAgent:
                 label = str(reference_labels[idx - 1] or "").strip()
             if not label:
                 label = self._infer_reference_label(path, idx, len(reference_paths))
-            tag = self._reference_tag_from_label(label)
-            if tag:
+            for tag in self._reference_tags_from_label(label):
                 tag_lines.append(f"{tag} maps to Image {idx}: {label}.")
             lines.append(f"Image {idx}: {label}.")
         if tag_lines:
@@ -623,8 +622,23 @@ class VideoGenerationAgent:
 
     @staticmethod
     def _reference_tag_from_label(label: str) -> str:
-        match = re.match(r"\s*(@[a-zA-Z0-9_]+)", label or "")
+        # Explicit asset tokens are user-facing identifiers, so they may use
+        # Chinese names, colons, hyphens, and other non-whitespace characters.
+        # The old ASCII-only expression silently truncated tokens such as
+        # ``@Hero-front-full`` to ``@Hero`` and rejected ``@角色:正面``.
+        match = re.match(r"\s*(@[^\s=]+)", label or "")
         return match.group(1) if match else ""
+
+    @staticmethod
+    def _reference_tags_from_label(label: str) -> list[str]:
+        """Return the visible @ token and the frozen internal tag, if both exist."""
+        prefix = str(label or "").split("=", 1)[0]
+        tags: list[str] = []
+        for match in re.finditer(r"@[^\s=]+", prefix):
+            tag = match.group(0)
+            if tag not in tags:
+                tags.append(tag)
+        return tags
 
     @staticmethod
     def _prompt_for_attempt(prompt: str, attempt: int, has_references: bool) -> str:
@@ -1213,7 +1227,10 @@ class VideoGenerationAgent:
             and reference_paths[0].replace("\\", "/").lower().endswith("_tail.jpg")
         ) or first_label.startswith("continuity") or "previous frame" in first_label or "上一镜" in first_label
         first_ref_is_scene = bool(reference_paths) and self._looks_like_scene_reference(reference_paths[0])
-        lines = ["竖屏9:16，电影级质感，柔和漫射光。"]
+        # This prompt already contains the complete ordered reference binding.
+        # The generation path checks this marker to avoid appending a second,
+        # divergent binding block before the provider request.
+        lines = ["竖屏9:16，电影级质感，柔和漫射光。", "[Reference binding]"]
         if continuity_tail:
             lines.append("参考图1是上一镜尾帧，必须严格延续上一镜的机位、景别、人物站位、动作进度、光线和时间，不要重新起镜，不要跳切。")
         if reference_labels:
@@ -1221,8 +1238,7 @@ class VideoGenerationAgent:
                 lines.append(f"参考图{idx}：{label}。")
             tag_lines = []
             for idx, label in enumerate(reference_labels[:len(reference_paths)], start=1):
-                tag = self._reference_tag_from_label(str(label or ""))
-                if tag:
+                for tag in self._reference_tags_from_label(str(label or "")):
                     tag_lines.append(f"{tag} maps to reference image {idx}: {label}.")
             if tag_lines:
                 lines[1:1] = ["[Reference tags]", *tag_lines]

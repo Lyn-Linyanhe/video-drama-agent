@@ -100,6 +100,10 @@ def _normalize_audio_profile(profile: dict) -> dict:
         normalized.get("llm_model", ""),
     )
     normalized["llm_timeout"] = _normalize_llm_timeout(normalized.get("llm_timeout", "300"))
+    if str(normalized.get("llm_provider") or "").strip().lower() == "deepseek":
+        # DeepSeek requests use one deterministic temperature in the provider
+        # layer; keep the persisted setting consistent with the effective value.
+        normalized["llm_temperature"] = "0.25"
     normalized.setdefault("kimi_prompt_review_enabled", True)
     normalized.setdefault("kimi_prompt_review_model", "kimi-k2.6")
     normalized.setdefault("kimi_prompt_review_base_url", "https://api.moonshot.cn/v1")
@@ -182,7 +186,9 @@ class SettingsRequest(BaseModel):
     llm_base_url: str = ""
     llm_timeout: str = "1800"
     llm_stream: str = "true"
-    llm_temperature: str = "0.7"
+    # DeepSeek is the default provider and uses a deterministic effective
+    # temperature. Other providers may still ignore this optional setting.
+    llm_temperature: str = "0.25"
     llm_top_p: str = "0.9"
     # ── Dedicated Kimi storyboard-prompt review ──
     kimi_prompt_review_enabled: bool = True

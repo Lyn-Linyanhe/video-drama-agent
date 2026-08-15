@@ -11,6 +11,41 @@ from src.services.video_capabilities import (
 
 router = APIRouter()
 
+
+def _protect_explicit_mentions(prompt: str, references) -> tuple[str, dict[str, str]]:
+    """Replace explicit @ tokens before an LLM revision and remember exact text."""
+    protected = str(prompt or "")
+    placeholders: dict[str, str] = {}
+    for index, reference in enumerate(references or [], start=1):
+        token = str(getattr(reference, "reference_token", "") or "").strip()
+        if not token or token in placeholders.values():
+            continue
+        placeholder = f"__STUDIO_ASSET_MENTION_{index}__"
+        protected = protected.replace(token, placeholder)
+        placeholders[placeholder] = token
+    return protected, placeholders
+
+
+def _restore_explicit_mentions(prompt: str, placeholders: dict[str, str]) -> str:
+    """Restore every protected token; never accept an LLM result that drops one."""
+    restored = str(prompt or "")
+    missing: list[str] = []
+    for placeholder, token in placeholders.items():
+        if placeholder not in restored:
+            if token in restored:
+                continue
+            missing.append(token)
+            continue
+        restored = restored.replace(placeholder, token)
+    if missing:
+        raise ValueError("显式引用在 AI 改写结果中丢失：" + "、".join(missing))
+    return restored
+
+
+def _validate_explicit_reference_token(prompt: str, token: str) -> None:
+    if token and token not in str(prompt or ""):
+        raise HTTPException(422, f"显式引用必须出现在分镜提示词中：{token}")
+
 @router.get("/api/projects/{project_id}/production")
 async def get_project_production(project_id: str):
     """Return the server-persisted single-shot production workspace."""
@@ -54,7 +89,13 @@ async def reextract_project_characters(project_id: str):
     if state.visual_design is None:
         raise HTTPException(409, "项目缺少视觉设计，请先重新解析剧本")
     try:
-        english, chinese = await visual_prompt_agent.reextract_visible_characters(state.script)
+        source_text = state.script_draft_text or (
+            state.user_input if state.input_mode == "script" else ""
+        )
+        english, chinese = await visual_prompt_agent.reextract_visible_characters(
+            state.script,
+            source_text=source_text,
+        )
     except Exception as exc:
         raise HTTPException(502, f"Character extraction failed: {exc}") from exc
     state.visual_design.global_character_descriptions = english
@@ -96,14 +137,55 @@ async def update_project_production_shot(
         from src.schemas.assets import ShotReference
 
         catalog = _reference_catalog(state)["by_id"]
+        # Keep persisted stale references addressable.  Their files may have
+        # disappeared, but the user must still be able to edit the prompt or
+        # remove the reference instead of receiving a misleading "unknown"
+        # asset error on every save.
+        persisted = {item.reference_id: item for item in production.references}
         references: list[ShotReference] = []
         seen: set[str] = set()
         for item in req.references:
-            reference = catalog.get(item.reference_id)
+            reference = catalog.get(item.reference_id) or persisted.get(item.reference_id)
             if reference is None:
                 raise HTTPException(422, f"Unknown reference: {item.reference_id}")
             if reference.reference_id not in seen:
-                references.append(reference.model_copy(update={"source": item.source}))
+                if item.source == "explicit" and not item.token.strip():
+                    raise HTTPException(422, "Explicit asset references require a token")
+                _validate_explicit_reference_token(req.prompt.strip() or prompt.prompt, item.token.strip())
+                selected = reference.model_copy(update={
+                    "source": item.source,
+                    "reference_token": item.token.strip() if item.source == "explicit" else "",
+                    "explicit_base_source": item.explicit_base_source if item.source == "explicit" else "",
+                })
+                requested_version = item.version_id.strip()
+                if requested_version:
+                    try:
+                        from src.utils.asset_versions import ImageAssetVersions
+                        record = ImageAssetVersions(project_store.get_project_dir(project_id)).find_version(
+                            selected.asset_type,
+                            selected.asset_id,
+                            selected.view_type,
+                            requested_version,
+                        )
+                    except (OSError, TypeError, ValueError):
+                        record = None
+                    safe_path = None
+                    if record:
+                        try:
+                            versions = ImageAssetVersions(project_store.get_project_dir(project_id))
+                            candidate = Path(str(record.get("path") or "")).resolve()
+                            candidate.relative_to(versions.asset_root.resolve())
+                            safe_path = candidate
+                        except (OSError, RuntimeError, ValueError):
+                            safe_path = None
+                    if not record or safe_path is None or not safe_path.is_file():
+                        raise HTTPException(409, f"显式引用版本不可用：{requested_version}")
+                    selected = selected.model_copy(update={
+                        "asset_version_id": requested_version,
+                        "image_path": str(safe_path),
+                        "stale": False,
+                    })
+                references.append(selected)
                 seen.add(reference.reference_id)
         production.references = references
     if req.video_override is not None:
@@ -143,8 +225,13 @@ async def revise_project_production_prompt(
 ):
     state = _load_project_state(project_id)
     prompt = _shot_prompt(state, scene_id)
+    production = _ensure_shot_production(state, scene_id)
+    protected_prompt, mention_placeholders = _protect_explicit_mentions(
+        prompt.prompt,
+        production.references,
+    )
     revision = f"""请根据用户意见修改以下中文视频生成提示词，仅输出修改后的完整中文 prompt。
-原始提示词：{prompt.prompt}
+原始提示词：{protected_prompt}
 用户意见：{req.feedback}
 必须保留角色外貌一致性、绑定道具的材质与状态、动作时间轴、镜头语言、环境、灯光和技术约束；只修改用户明确要求的部分。"""
     try:
@@ -155,11 +242,14 @@ async def revise_project_production_prompt(
         )
     except Exception as exc:
         raise HTTPException(502, f"AI prompt revision failed: {exc}") from exc
-    prompt.prompt = updated.strip().strip('"').strip("'")
+    try:
+        updated = _restore_explicit_mentions(updated.strip().strip('"').strip("'"), mention_placeholders)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    prompt.prompt = updated
     state.prompt_overrides[str(scene_id)] = prompt.prompt
     from .jobs import _mark_prompt_review_stale
     _mark_prompt_review_stale(state)
-    _ensure_shot_production(state, scene_id)
     _save_project_state(state)
     return _production_payload(state)
 
@@ -200,7 +290,10 @@ async def generate_project_production_shot(project_id: str, scene_id: int):
     duplicate = next((item for item in active if item["job_type"] == "video.generate" and item["target_id"] == str(scene_id)), None)
     if duplicate:
         return {"job_id": duplicate["job_id"], "production": _production_payload(state)}
-    snapshot = _build_video_generation_snapshot(state, scene_id, policy)
+    try:
+        snapshot = _build_video_generation_snapshot(state, scene_id, policy)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if requires_reference_image(policy) and not snapshot["references"]:
         raise HTTPException(409, f"镜头 {scene_id} 缺少可用参考图，请先生成或添加图片")
     production.last_generation_snapshot = snapshot
@@ -223,6 +316,7 @@ async def generate_project_pending_shots(project_id: str):
     await _prepare_auto_references(state)
     scheduled: list[int] = []
     specs: list[dict] = []
+    skipped: list[dict[str, object]] = []
     active = job_store.list_jobs(project_id, states=ACTIVE_JOB_STATES, limit=500)
     active_targets = {
         item["target_id"]
@@ -240,7 +334,11 @@ async def generate_project_pending_shots(project_id: str):
             validate_video_duration(policy, _shot_prompt(state, scene.scene_id).duration_sec)
         if production.continuity_enabled and not policy["capability"].get("continuity"):
             continue
-        snapshot = _build_video_generation_snapshot(state, scene.scene_id, policy)
+        try:
+            snapshot = _build_video_generation_snapshot(state, scene.scene_id, policy)
+        except ValueError as exc:
+            skipped.append({"scene_id": scene.scene_id, "reason": str(exc)})
+            continue
         if requires_reference_image(policy) and not snapshot["references"]:
             continue
         production.last_generation_snapshot = snapshot
@@ -265,6 +363,7 @@ async def generate_project_pending_shots(project_id: str):
     return {
         "scheduled_scene_ids": scheduled,
         "job_ids": [item["job_id"] for item in jobs],
+        "skipped": skipped,
         "production": _production_payload(state),
     }
 

@@ -11,6 +11,7 @@ import math
 import re
 import unicodedata
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 from src.schemas.scene_state import LocationState
@@ -111,6 +112,12 @@ DYNAMIC_ENVIRONMENT_CUES = {
     # fallback because they do not always contain an explicit actor verb.
     "忽明忽暗", "闪烁", "红光一闪", "一闪", "被雨水打得", "落下",
     "字迹模糊", "被水汽泡得模糊", "水汽泡得模糊", "手电光", "光束扫过",
+    # General action/state variants that frequently appear in compact script
+    # outputs. These are transient shot facts, even when the clause also names
+    # a static fixture such as a door, electrical box, or tunnel.
+    "停在", "停下", "拧开", "拧动", "旋开", "摸向", "触向", "探向", "指向", "伸手",
+    "抓住", "碰到", "拿起", "取出", "撑墙", "撑着墙", "站起", "起身", "消失在",
+    "融为一体", "作为背景", "雨声",
 }
 VOICE_ONLY_NAME_TERMS = {
     "旁白", "画外音", "心声", "内心", "电话", "录音", "广播", "播报", "短信提示音",
@@ -310,11 +317,137 @@ def _scene_visual_text(scene) -> str:
 
 _CHARACTER_APPEARANCE_PATTERNS = (
     r"(?:[0-9]{1,3}|[一二三四五六七八九十百]{1,5})岁",
-    r"(?:米白色|深灰(?:色)?|浅灰(?:色)?|黑色|白色|暗红色|红色|蓝色|棕色|银色|深色|浅色)(?:的)?(?:长风衣|风衣|大衣|雨衣|外套|衬衫|毛衣|卫衣|西装|裙子|牛仔裤|长裤|短裤|皮鞋|运动鞋|靴子|雨靴|口罩|鸭舌帽|帽子|围巾|手套)",
-    r"(?:米白色|深灰(?:色)?|浅灰(?:色)?|黑色|白色|暗红色|红色|蓝色|棕色|银色|深色|浅色)?(?:的)?(?:中长发|长发|短发|卷发|直发|黑发|白发|马尾)",
+    r"(?:米白|深灰|浅灰|黑|白|暗红|红|蓝|棕|银|深|浅)(?:色)?(?:的)?(?:长风衣|风衣|大衣|雨衣|外套|衬衫|毛衣|卫衣|西装|裙子|牛仔裤|长裤|短裤|皮鞋|运动鞋|靴子|雨靴|口罩|鸭舌帽|帽子|围巾|手套)",
+    r"(?:(?:米白|深灰|浅灰|黑|白|暗红|红|蓝|棕|银|深|浅)(?:色)?)?(?:的)?(?:中长发|长发|短发|卷发|直发|黑发|白发|马尾)",
     r"(?:高瘦|瘦高|高大|魁梧|纤细|年轻|中年|少年|少女|冷峻|温和的笑|无温度的眼神)",
-    r"(?:戴着|带着|佩戴)的?(?:口罩|鸭舌帽|帽子|眼镜|手套|围巾)",
+    r"(?:戴着?|带着?|佩戴)的?(?:口罩|鸭舌帽|帽子|眼镜|手套|围巾)",
+    r"(?:口罩|鸭舌帽|帽子|眼镜|手套|围巾)",
+    r"(?:脸型|面型)(?:偏|较|为|呈)?(?:长|圆|偏长|偏圆|椭圆|鹅蛋|瓜子|方|国字|菱形)(?:脸)?",
+    r"肤色(?:偏|较|为|呈)?(?:白皙|偏白|自然|健康|小麦|古铜|冷白|暖白|黝黑|苍白)",
+    r"(?:眉眼|眉形|眼型)(?:偏|较|为|显得|透出)?(?:冷峻|清秀|深邃|锐利|柔和|英气|凌厉|疲惫|温和|细长|浓密|上挑|下垂|杏眼|凤眼|丹凤眼)",
+    r"鼻梁(?:偏|较|为)?(?:高挺|挺直|笔直|自然|低平)",
+    r"(?:嘴唇|唇形)(?:偏|较|为)?(?:薄|厚|自然|紧抿|苍白|红润)",
+    r"(?:左|右)?(?:眼下|眼角|眉间|眉尾|脸颊|下颌)(?:有|带有|留有)?(?:一颗|一道|一块)?(?:小)?(?:痣|疤|疤痕|胎记)",
+    # Keep a broad suffix-based fallback for script-specific adjectives and
+    # clothing terms that are not in the small legacy vocabulary above. The
+    # relation-based extractor below is preferred, so this only covers bare
+    # phrases such as ``银灰色短发`` or ``深棕色制服``.
+    r"(?:[一-龥]{0,8}(?:色|黑|白|灰|红|蓝|绿|棕|紫|金|银|米|深|浅|墨|靛|猩红|卡其|酒红)[一-龥]{0,6})(?:的)?(?:发型|头发|发辫|短发|长发|卷发|直发|马尾|制服|衣服|外套|风衣|大衣|雨衣|夹克|衬衫|针织衫|毛衣|卫衣|西装|礼服|裙子|长裙|短裙|裤子|长裤|短裤|鞋子|皮鞋|运动鞋|靴子|帽子|斗篷|长袍|围巾|手套|眼镜|耳环|项链|手链|手表|腕表|胡须|眉毛|眉眼|鼻梁|嘴唇|面容|脸|身形|体态|身材|气质|眼神|笑容|疤痕|胎记|痣)",
 )
+
+# Appearance relations are intentionally language-oriented rather than plot-
+# oriented. They let a new script describe arbitrary colors, fabrics, cuts,
+# accessories, hair styles, or facial traits without adding another title- or
+# character-specific word to the vocabulary.
+_CHARACTER_APPEARANCE_CUE_RE = re.compile(
+    r"(?P<cue>穿(?!过|越|梭)着?|身穿|身着|披着?|戴着?|带着?|佩戴|留着|留有|扎着|蓄着|"
+    r"有着|长着|面带|脸上(?:有着|有)|眼神(?:中|里)(?:有着|有|透出|流露出)?|"
+    r"气质(?:上)?(?:显得|偏|是)|身形(?:上)?(?:显得|偏|是)|体态(?:上)?(?:显得|偏|是)|"
+    r"肤色(?:偏|是)|发型(?:是)?)\s*"
+    r"(?P<detail>[^，,、。；;！？!?\n]+)"
+)
+_CHARACTER_APPEARANCE_STOP_RE = re.compile(
+    r"(?:并且|同时|随后|然后|接着|而后|但|却|而|准备|转身|走向|跑向|看向|拿起|握住|"
+    r"离开|进入|来到|回头|抬手|低头)"
+)
+_CHARACTER_LEADING_CLASSIFIER_RE = re.compile(
+    r"^(?:一件|一套|一身|一袭|一条|一双|一副|一顶|一头|几缕|一枚|一只|一对)"
+)
+_CHARACTER_LEADING_RELATION_RE = re.compile(
+    r"^(?:他|她|其|该角色|这个人|对方)?"
+    r"(?:穿(?!过|越|梭)着?|身穿|身着|披着?|戴着?|带着?|佩戴|留着|留有|扎着|蓄着|"
+    r"有着|长着|面带|脸上(?:有着|有)|眼神(?:中|里)(?:有着|有|透出|流露出)?|"
+    r"气质(?:上)?(?:显得|偏|是)|身形(?:上)?(?:显得|偏|是)|体态(?:上)?(?:显得|偏|是)|"
+    r"肤色(?:偏|是)|发型(?:是)?)\s*"
+)
+_CHARACTER_INDIRECT_APPEARANCE_CONTEXT_RE = re.compile(
+    r"(?:身边|旁边|照片中|相片中|画面中|镜中|反光中|玻璃上|映出|看见|看到|"
+    r"注意到|发现|远处|背景中|屏幕中|影像中).{0,12}$"
+)
+_CHARACTER_VISUAL_FACT_SHAPE_RE = re.compile(
+    r"(?:衣|袍|裙|裤|衫|服|鞋|靴|帽|发|辫|眼镜|耳环|项链|手表|胡须|眉|脸|"
+    r"面容|身形|体态|身材|气质|眼神|笑|表情|神色|疤|痣|胎记)"
+)
+
+
+def _clean_character_appearance_detail(value: str) -> str:
+    """Normalize one relation-bound appearance phrase without adding prose."""
+    detail = re.sub(r"\s+", "", str(value or "")).strip("，,。；;、 ")
+    if not detail:
+        return ""
+    detail = _CHARACTER_LEADING_RELATION_RE.sub("", detail)
+    detail = _CHARACTER_APPEARANCE_STOP_RE.split(detail, maxsplit=1)[0]
+    detail = _CHARACTER_LEADING_CLASSIFIER_RE.sub("", detail)
+    detail = detail.strip("，,。；;、的 ")
+    if len(detail) < 2 or len(detail) > 32:
+        return ""
+    # A relation can be followed by a narrative state rather than an identity
+    # fact (for example, ``有着动作``). Keep phrases with a recognizable visual
+    # noun, and allow descriptive adjectives when the relation itself is a
+    # visual one such as ``面带`` or ``气质``.
+    if re.search(r"(?:走|跑|拿|握|看|转身|离开|进入|来到|准备|抬手|低头|打开|关闭)", detail):
+        if not re.search(
+            r"(?:衣|袍|裙|裤|衫|服|鞋|靴|帽|发|眼镜|耳环|项链|手表|脸|面容|"
+            r"身形|体态|身材|气质|眼神|笑|疤|痣|肤色)",
+            detail,
+        ):
+            return ""
+    return detail
+
+
+def _character_appearance_facts(text: str, *, allow_indirect: bool = False) -> list[str]:
+    """Extract stable-looking appearance facts using generic language cues."""
+    candidates: list[tuple[int, str]] = []
+    source = str(text or "")
+    for match in _CHARACTER_APPEARANCE_CUE_RE.finditer(source):
+        if (
+            not allow_indirect
+            and _CHARACTER_INDIRECT_APPEARANCE_CONTEXT_RE.search(source[:match.start()])
+        ):
+            continue
+        raw_detail = match.group("detail")
+        pieces = re.split(r"[、/]+", raw_detail)
+        if match.group("cue").startswith(("戴", "带", "佩戴")):
+            pieces = [
+                part
+                for piece in pieces
+                for part in re.split(r"(?:和|及|以及)", piece)
+            ]
+        for offset, piece in enumerate(pieces):
+            piece = re.sub(
+                r"的(?:人|身影|影子|人物|角色|男人|女人|黑影|背影)$",
+                "",
+                piece,
+            )
+            detail = _clean_character_appearance_detail(piece)
+            if detail:
+                candidates.append((match.start() + offset, detail))
+    for value in _find_unique_matches(source, _CHARACTER_APPEARANCE_PATTERNS):
+        value_position = source.find(value)
+        if (
+            not allow_indirect
+            and value_position >= 0
+            and _CHARACTER_INDIRECT_APPEARANCE_CONTEXT_RE.search(source[:value_position])
+        ):
+            continue
+        embedded_cue = _CHARACTER_APPEARANCE_CUE_RE.search(value)
+        if embedded_cue:
+            value = _clean_character_appearance_detail(embedded_cue.group(0)) or value
+        value = _clean_character_appearance_detail(value) or value
+        position = source.find(value)
+        candidates.append((position if position >= 0 else len(source), value))
+
+    facts: list[str] = []
+    for _position, value in sorted(candidates, key=lambda item: (item[0], -len(item[1]))):
+        contained_index = next(
+            (index for index, existing in enumerate(facts) if value in existing or existing in value),
+            None,
+        )
+        if contained_index is None:
+            facts.append(value)
+        elif len(value) > len(facts[contained_index]):
+            facts[contained_index] = value
+    return facts
 
 _PROP_PHYSICAL_DETAIL_PATTERNS = (
     r"暗红色火漆印章",
@@ -347,6 +480,7 @@ def _find_unique_matches(text: str, patterns: tuple[str, ...]) -> list[str]:
     for pattern in patterns:
         for match in re.finditer(pattern, text or "", flags=re.IGNORECASE):
             value = re.sub(r"\s+", "", match.group(0)).strip("，。；、 ")
+            value = re.sub(r"^(?:戴着?|带着?|佩戴)的?", "", value)
             value = {
                 "生锈铜钥匙": "生锈的铜钥匙",
                 "泛黄照片": "泛黄旧照片",
@@ -360,19 +494,336 @@ def _find_unique_matches(text: str, patterns: tuple[str, ...]) -> list[str]:
     return result
 
 
+_CHARACTER_PRONOUN_PREFIX = re.compile(r"^\s*(?:他|她|其|该角色|这个人|对方)")
+_CHARACTER_OBSERVER_OBJECT_CUE = re.compile(r"(?:看见|看到|注意到|发现|望见|瞥见)")
+_CHARACTER_IDENTITY_REVEAL_CUE = re.compile(r"(?:露出|揭下|摘下|显露).{0,20}(?:脸|真面目|身份)")
+_CHARACTER_ANONYMOUS_ENTITY_RE = re.compile(
+    r"(?:一个|一名|某个|某名)?[^。；;！？!?\n]{0,20}"
+    r"(?:人|身影|人物|角色|男人|女人|陌生人|黑影)"
+)
+_CHARACTER_ANAPHORA_RE = re.compile(r"(?:他|她|对方|该人|这个人|身影|人物|黑影)")
+
+
+def _character_is_clause_subject(clause: str, name: str) -> bool:
+    text = str(clause or "").lstrip()
+    if text.startswith(name):
+        if text[len(name):].lstrip().startswith("的"):
+            return False
+        return True
+    # In observer constructions such as ``甲看见乙穿着红衣``, 乙 is the
+    # grammatical subject of the local appearance relation even though the
+    # full clause starts with 甲. Recognize only an immediate visual relation
+    # so object/possessive mentions do not become identity facts.
+    for match in re.finditer(re.escape(name), text):
+        prefix = text[:match.start()]
+        suffix = text[match.end():].lstrip()
+        if (
+            _CHARACTER_OBSERVER_OBJECT_CUE.search(prefix[-16:])
+            and _CHARACTER_LEADING_RELATION_RE.match(suffix)
+        ):
+            return True
+    # A clause can introduce a second subject after a Chinese comma, e.g.
+    # ``对话中，角色甲始终盯着……``. Do not treat possessive/object mentions
+    # such as ``角色甲的父亲`` or ``看见角色甲`` as the subject.
+    return any(
+        part.strip().startswith(name) and not part.strip()[len(name):].lstrip().startswith("的")
+        for part in re.split(r"[，,、：:]", text)
+    )
+
+
+def _character_subject_windows(clause: str, name: str, other_names: set[str]) -> list[str]:
+    """Limit extraction to the target's local subject span.
+
+    A whole action clause may contain two characters (``甲看见乙穿着红衣``).
+    Taking the whole clause would incorrectly assign 乙's clothing to 甲. The
+    nearest other named character is therefore a hard boundary; this keeps the
+    rule independent of any particular name or plot.
+    """
+    text = str(clause or "")
+    if not _character_is_clause_subject(text, name):
+        return []
+    windows: list[str] = []
+    for target_match in re.finditer(re.escape(name), text):
+        start = target_match.start()
+        end = len(text)
+        for other in other_names:
+            if not other or other == name:
+                continue
+            other_match = re.search(re.escape(other), text[target_match.end():])
+            if other_match:
+                end = min(end, target_match.end() + other_match.start())
+        window = text[start:end].strip()
+        if window:
+            windows.append(window)
+    return windows
+
+
+def _character_is_revealed_subject(clause: str, name: str) -> bool:
+    """Recognize a generic identity-reveal clause such as ``露出甲的脸``."""
+    return bool(
+        re.search(
+            rf"(?:露出|揭下|摘下|显露|揭示).{{0,24}}{re.escape(name)}"
+            r"(?:的脸|本人|身份|真面目)",
+            str(clause or ""),
+        )
+    )
+
+
 def _character_facts_from_scenes(name: str, scenes: list) -> list[str]:
+    """Collect stable-looking appearance facts without copying other actors.
+
+    Script prose often places a character name in one clause and describes
+    the same person in the adjacent clause (for example, ``角色甲……。他穿着
+    外套``). Search one adjacent clause when it is either an explicit
+    pronoun continuation or an unambiguous visual description.  A clause that
+    names another character is excluded to avoid assigning their clothing to
+    the current character.
+    """
     facts: list[str] = []
+    target_name = str(name or "").strip()
+    if not target_name:
+        return facts
     for scene in scenes or []:
         action = str(getattr(scene, "action_description", "") or "")
-        if name not in action:
+        if target_name not in action:
             continue
-        for clause in re.split(r"[。；;！？!?\n]+", action):
-            if name not in clause:
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"[。；;！？!?\n]+", action)
+            if clause.strip()
+        ]
+        known_names = {
+            str(value or "").strip()
+            for value in (getattr(scene, "characters", []) or [])
+            if str(value or "").strip()
+        }
+        known_names.update(
+            str(getattr(line, "character", "") or "").strip()
+            for line in (getattr(scene, "dialogue", []) or [])
+            if str(getattr(line, "character", "") or "").strip()
+        )
+        other_names = known_names - {target_name}
+        target_indexes = [index for index, clause in enumerate(clauses) if target_name in clause]
+        for index in target_indexes:
+            target_clause = clauses[index]
+            target_is_subject = _character_is_clause_subject(target_clause, target_name)
+            target_is_revealed = _character_is_revealed_subject(target_clause, target_name)
+            if not target_is_subject and not target_is_revealed:
                 continue
-            for value in _find_unique_matches(clause, _CHARACTER_APPEARANCE_PATTERNS):
-                if value not in facts:
-                    facts.append(value)
+            candidate_indexes = {index}
+            neighbors = [index + 1, index - 1, index - 2]
+            for neighbor in neighbors:
+                if neighbor < 0 or neighbor >= len(clauses):
+                    continue
+                clause = clauses[neighbor]
+                if any(other and other in clause for other in other_names):
+                    continue
+                if not _character_appearance_facts(clause, allow_indirect=neighbor < index):
+                    continue
+                if neighbor > index:
+                    if not (target_is_subject or target_is_revealed) or not _CHARACTER_PRONOUN_PREFIX.match(clause):
+                        continue
+                    if (
+                        not target_is_revealed
+                        and any(other and other in target_clause for other in other_names)
+                        and _CHARACTER_IDENTITY_REVEAL_CUE.search(target_clause)
+                    ):
+                        continue
+                else:
+                    # A preceding descriptive clause can be attached without
+                    # an explicit pronoun when it ends in a generic anonymous
+                    # entity (``一个穿着外套的身影``) or this is the sole named
+                    # character in the shot. Otherwise the referent is
+                    # ambiguous and must not be guessed.
+                    if (
+                        not (target_is_subject or target_is_revealed)
+                        or _CHARACTER_OBSERVER_OBJECT_CUE.search(target_clause)
+                        or (
+                            len(known_names) != 1
+                            and not _CHARACTER_ANONYMOUS_ENTITY_RE.search(clause)
+                        )
+                        or (
+                            neighbor == index - 2
+                            and not any(
+                                _CHARACTER_ANAPHORA_RE.search(bridge)
+                                for bridge in clauses[neighbor + 1:index]
+                            )
+                        )
+                    ):
+                        continue
+                candidate_indexes.add(neighbor)
+            for candidate in sorted(candidate_indexes):
+                if candidate == index and target_is_revealed:
+                    continue
+                candidate_windows = (
+                    _character_subject_windows(clauses[candidate], target_name, other_names)
+                    if candidate == index
+                    else [clauses[candidate]]
+                )
+                for window in candidate_windows:
+                    for value in _character_appearance_facts(
+                        window.removeprefix(target_name),
+                        allow_indirect=candidate != index,
+                    ):
+                        if value not in facts:
+                            facts.append(value)
     return facts[:10]
+
+
+_CHARACTER_FACT_FAMILY_PATTERNS = (
+    re.compile(r"(?:衣|袍|裙|裤|衫|服|鞋|靴|外套|风衣|大衣|雨衣|夹克|西装)"),
+    re.compile(r"(?:发型|头发|短发|长发|卷发|直发|马尾|发色)"),
+    re.compile(r"(?:眼镜|口罩|帽|围巾|手套|耳环|项链|手链|手表|腕表)"),
+    re.compile(r"(?:脸型|面型|面容|下颌|肤色|皮肤)"),
+    re.compile(r"(?:眉|眼|鼻|唇|嘴|五官)"),
+    re.compile(r"(?:身形|体型|体态|身材|高瘦|修长|纤细|健壮|魁梧|微胖)"),
+    re.compile(r"(?:痣|疤|疤痕|胎记)"),
+)
+
+
+def _appearance_fact_families(value: str) -> set[int]:
+    text = str(value or "")
+    return {
+        index
+        for index, pattern in enumerate(_CHARACTER_FACT_FAMILY_PATTERNS)
+        if pattern.search(text)
+    }
+
+
+def _remove_foreign_conflicting_character_facts(
+    name: str,
+    clauses: list[str],
+    own_facts: list[str],
+    scenes: list,
+) -> list[str]:
+    """Drop only facts provably copied from another role and contradicted here."""
+    own_families = set().union(*(_appearance_fact_families(value) for value in own_facts)) if own_facts else set()
+    if not own_families:
+        return clauses
+
+    other_names = {
+        str(candidate or "").strip()
+        for scene in scenes or []
+        for candidate in (getattr(scene, "characters", []) or [])
+        if str(candidate or "").strip() and str(candidate or "").strip() != name
+    }
+    foreign_facts = [
+        fact
+        for other_name in other_names
+        for fact in _character_facts_from_scenes(other_name, scenes)
+    ]
+
+    kept: list[str] = []
+    for clause in clauses:
+        clause_families = _appearance_fact_families(clause)
+        conflicts = bool(clause_families & own_families) and any(
+            clause in foreign_fact or foreign_fact in clause
+            for foreign_fact in foreign_facts
+        )
+        if not conflicts:
+            kept.append(clause)
+    return kept
+
+
+def enrich_character_description(
+    name: str,
+    description: str,
+    scenes: list,
+) -> str:
+    """Merge stable script facts into a terse character identity anchor.
+
+    Detailed descriptions remain untouched. Short/generated descriptions keep
+    their concrete facts and gain only appearance details attributed to the
+    same character; plot actions, locations, props, and other actors are never
+    copied into the identity profile.
+    """
+    character_name = str(name or "").strip()
+    text = str(description or "").strip()
+    facts = _character_facts_from_scenes(character_name, scenes)
+    if not facts:
+        return text
+
+    compact_length = len(re.sub(r"\s+", "", text))
+    if text and compact_length >= 80 and not _is_generic_character_description(text, character_name):
+        return text
+
+    generated_placeholder = _is_generic_character_description(text, character_name)
+    has_name_prefix = bool(
+        character_name
+        and re.match(rf"^{re.escape(character_name)}\s*[：:]", text)
+    )
+    body = re.sub(
+        rf"^{re.escape(character_name)}\s*[：:]\s*",
+        "",
+        text,
+    ).strip("；;。 ")
+    clauses = [] if generated_placeholder else [
+        clause.strip()
+        for clause in re.split(r"[；;。]+", body)
+        if clause.strip()
+    ]
+    clauses = _remove_foreign_conflicting_character_facts(
+        character_name,
+        clauses,
+        facts,
+        scenes,
+    )
+    merged: list[str] = []
+    for value in clauses + facts:
+        value = str(value or "").strip("，,；;。 ")
+        if not value:
+            continue
+        duplicate = next(
+            (index for index, existing in enumerate(merged) if value in existing or existing in value),
+            None,
+        )
+        if duplicate is None:
+            merged.append(value)
+        elif len(value) > len(merged[duplicate]):
+            merged[duplicate] = value
+    if not merged:
+        return text
+    prefix = f"{character_name}：" if character_name and (has_name_prefix or not text) else ""
+    return f"{prefix}{'；'.join(merged)}。"
+
+
+def character_profile_missing_fields(description: str) -> list[str]:
+    """Return missing stable-identity fields for a Chinese character profile."""
+    text = re.sub(r"\s+", "", str(description or ""))
+    missing: list[str] = []
+    checks = (
+        (
+            "性别与年龄段",
+            bool(re.search(
+                r"(?:男性|女性|男孩|女孩|男人|女人|少年|少女|青年|中年|老年|"
+                r"(?:^|[，,；;。])(?:男|女)(?:[，,；;。]|$))",
+                text,
+            ))
+            and bool(re.search(
+                r"(?:(?:约|大约|近)?[0-9一二三四五六七八九十百]{1,5}岁|"
+                r"少年|少女|青年|中年|老年|成年)",
+                text,
+            )),
+        ),
+        ("身高或体型", bool(re.search(r"(?:身高|身形|体型|体态|身材|高瘦|修长|匀称|纤细|瘦削|健壮|魁梧|微胖)", text))),
+        (
+            "脸型与肤色",
+            bool(re.search(r"(?:脸型|面型|面容|下颌|脸部|鹅蛋脸|椭圆脸|瓜子脸|方脸|圆脸|国字脸|菱形脸|长脸)", text))
+            and bool(re.search(r"(?:肤色|皮肤|白皙|冷白|暖白|小麦色|古铜色|黝黑|苍白)", text)),
+        ),
+        ("眉眼鼻唇", bool(re.search(r"(?:眉|眼|鼻|唇|嘴|五官)", text))),
+        ("发型与发色", bool(re.search(r"(?:发型|头发|短发|长发|中长发|卷发|直发|马尾|发色|黑发|白发|棕发)", text))),
+        (
+            "服装颜色与材质",
+            bool(re.search(r"(?:穿|服装|衣|衫|袍|裙|裤|风衣|大衣|外套|夹克|西装|制服)", text))
+            and bool(re.search(r"(?:色|黑|白|灰|红|蓝|绿|棕|紫|米|卡其|棉|羊毛|毛呢|皮革|丝|麻|针织|织物|材质)", text)),
+        ),
+        ("配饰或识别标志", bool(re.search(r"(?:佩戴|眼镜|耳环|耳钉|项链|手链|手表|腕表|帽|口罩|围巾|手套|痣|疤|胎记|标志|辨识)", text))),
+    )
+    if len(text) < 80:
+        missing.append("完整人物侧写（至少80个中文字符）")
+    missing.extend(label for label, passed in checks if not passed)
+    return missing
 
 
 def _prop_facts_from_scenes(
@@ -444,13 +895,58 @@ def _prop_facts_from_scenes(
     return facts[:10]
 
 
-def _is_generic_character_description(value: str) -> bool:
+def _is_legacy_generated_character_fact_list(value: str, name: str) -> bool:
+    """Recognize this module's compact ``name：fact；fact`` output only.
+
+    This deliberately requires the canonical name prefix and semicolon-separated
+    short facts. A normal user-authored paragraph, even if it mentions a colon,
+    remains untouched.
+    """
+    text = str(value or "").strip()
+    target = str(name or "").strip()
+    if not text or not target:
+        return False
+    match = re.match(rf"^{re.escape(target)}\s*[：:]\s*(.+?)\s*[。.!！]?\s*$", text)
+    if not match:
+        return False
+    body = match.group(1).strip()
+    parts = [part.strip() for part in re.split(r"[；;]", body) if part.strip()]
+    if not parts or any(len(part) > 32 for part in parts):
+        return False
+    # Multiple concise facts are also a natural format for user-authored
+    # profiles. Preserve them and let enrichment append missing script facts.
+    if len(parts) > 1:
+        return False
+    if any(re.search(r"[，,。！？!?]", part) for part in parts):
+        return False
+    if any(
+        marker in body
+        for marker in (
+            "剧本", "分镜", "保持", "后续", "不根据", "用户", "需要", "应该", "因为", "所以",
+        )
+    ):
+        return False
+    # Older versions could persist a single extracted phrase that the current
+    # vocabulary no longer recognizes (for example ``脸上的笑容``). Require a
+    # visual-noun shape so a human note such as ``调查记者`` is still preserved.
+    if not _character_appearance_facts(parts[0]) and not _CHARACTER_VISUAL_FACT_SHAPE_RE.search(parts[0]):
+        return False
+    return True
+
+
+def _is_generic_character_description(value: str, name: str = "") -> bool:
     text = str(value or "").strip()
     if not text:
         return True
+    # This fallback is generated by this module.  Keep it repairable so a
+    # later load can upgrade the description after extraction rules improve.
+    if "剧本未提供额外稳定外观细节" in text:
+        return True
+    if _is_legacy_generated_character_fact_list(text, name):
+        return True
     if not any(marker in text for marker in ("画面角色", "角色实体", "出现在分镜", "保持人物身份一致")):
         return False
-    return not bool(_find_unique_matches(text, _CHARACTER_APPEARANCE_PATTERNS))
+    return not bool(_character_appearance_facts(text))
 
 
 def _is_generic_prop_description(value: str) -> bool:
@@ -1278,7 +1774,11 @@ def _merge_environment_text(*values: str) -> str:
     return "；".join(clauses)[:700]
 
 
-def enrich_manifest_descriptions(script: ScriptBreakdown) -> ScriptBreakdown:
+def enrich_manifest_descriptions(
+    script: ScriptBreakdown,
+    *,
+    source_text: str = "",
+) -> ScriptBreakdown:
     """Fill generic manifest descriptions from already parsed shot facts.
 
     This is deliberately deterministic. It repairs the common LLM failure mode
@@ -1313,13 +1813,30 @@ def enrich_manifest_descriptions(script: ScriptBreakdown) -> ScriptBreakdown:
             if str(alias or "").strip()
         )
 
+    character_fact_scenes = list(script.scenes)
+    saved_source = str(source_text or "").strip()
+    if saved_source:
+        character_fact_scenes.append(SimpleNamespace(
+            action_description=saved_source,
+            characters=[
+                item.name
+                for item in manifest.characters
+                if str(getattr(item, "name", "") or "").strip()
+            ],
+            dialogue=[],
+        ))
+
     for character in manifest.characters:
-        if character.appearance_mode != "on_screen" or not _is_generic_character_description(character.description):
+        if character.appearance_mode != "on_screen":
             continue
-        facts = _character_facts_from_scenes(character.name, script.scenes)
-        if facts:
-            character.description = f"{character.name}：{'；'.join(facts)}。"
-        else:
+        repaired = enrich_character_description(
+            character.name,
+            character.description,
+            character_fact_scenes,
+        )
+        if repaired and repaired != character.description:
+            character.description = repaired
+        elif _is_generic_character_description(character.description, character.name):
             character.description = (
                 f"{character.name}：剧本未提供额外稳定外观细节；后续镜头保持同一脸型、发型、"
                 "体态和服装，不根据单个动作临时改造身份。"
@@ -1378,44 +1895,48 @@ def enrich_manifest_descriptions(script: ScriptBreakdown) -> ScriptBreakdown:
         else:
             environment = inferred_environment
 
-        if environment:
-            location.environment_description = environment
-            existing_dressing = str(location.fixed_dressing or "").strip()
-            cleaned_dressing = _clean_environment_description(
-                existing_dressing,
+        # Keep all three reusable location fields on the same deterministic
+        # cleaning path.  Previously this block was guarded by ``if
+        # environment``; legacy projects with an empty inferred environment
+        # therefore retained action prose in ``fixed_dressing`` and anchors.
+        location.environment_description = environment
+
+        existing_dressing = str(location.fixed_dressing or "").strip()
+        cleaned_dressing = _clean_environment_description(
+            existing_dressing,
+            location_scenes,
+            legacy_fragments,
+            known_character_names,
+        )
+        if cleaned_dressing:
+            location.fixed_dressing = _merge_environment_text(cleaned_dressing, environment)
+        elif (
+            not existing_dressing
+            or _has_voice_or_action_cue(existing_dressing)
+            or _contains_legacy_dynamic_fragment(existing_dressing, legacy_fragments)
+        ):
+            location.fixed_dressing = environment
+
+        clean_anchors: list[str] = []
+        for anchor in location.anchor_points or []:
+            cleaned_anchor = _clean_environment_description(
+                anchor,
                 location_scenes,
                 legacy_fragments,
                 known_character_names,
             )
-            if cleaned_dressing:
-                location.fixed_dressing = _merge_environment_text(cleaned_dressing, environment)
-            elif (
-                not existing_dressing
-                or _has_voice_or_action_cue(existing_dressing)
-                or _contains_legacy_dynamic_fragment(existing_dressing, legacy_fragments)
-            ):
-                location.fixed_dressing = environment
-
-            clean_anchors: list[str] = []
-            for anchor in location.anchor_points or []:
-                cleaned_anchor = _clean_environment_description(
-                    anchor,
-                    location_scenes,
-                    legacy_fragments,
-                    known_character_names,
-                )
-                candidate = cleaned_anchor or (
-                    str(anchor).strip()
-                    if not _is_legacy_dynamic_fragment(str(anchor), legacy_fragments)
-                    and not _has_voice_or_action_cue(str(anchor))
-                    and any(term in str(anchor) for term in STATIC_ENVIRONMENT_TERMS)
-                    else ""
-                )
-                if candidate:
-                    clean_anchors.extend(_description_clauses(candidate))
-            location.anchor_points = list(dict.fromkeys(
-                clean_anchors + _stable_location_anchor_points(environment)
-            ))[:6]
+            candidate = cleaned_anchor or (
+                str(anchor).strip()
+                if not _is_legacy_dynamic_fragment(str(anchor), legacy_fragments)
+                and not _has_voice_or_action_cue(str(anchor))
+                and any(term in str(anchor) for term in STATIC_ENVIRONMENT_TERMS)
+                else ""
+            )
+            if candidate:
+                clean_anchors.extend(_description_clauses(candidate))
+        location.anchor_points = list(dict.fromkeys(
+            clean_anchors + _stable_location_anchor_points(environment)
+        ))[:6]
 
         identity = str(location.identity_description or "").strip()
         if _location_identity_needs_repair(identity, location.canonical_name, environment, location_scenes):
@@ -1443,6 +1964,11 @@ def normalize_scene_assets(script: ScriptBreakdown) -> ScriptBreakdown:
 
     name_by_id = {character.asset_id: character.name for character in manifest.characters}
     id_by_name = {character.name: character.asset_id for character in manifest.characters}
+    known_character_names = {
+        str(character.name or "").strip()
+        for character in manifest.characters
+        if str(character.name or "").strip()
+    }
     existing_by_id = {location.location_id: location for location in manifest.locations}
     grouped: dict[str, list[LocationAsset]] = {}
     display_names: dict[str, str] = {}
@@ -1544,6 +2070,7 @@ def normalize_scene_assets(script: ScriptBreakdown) -> ScriptBreakdown:
             and binding.location_id in {item.location_id for item in locations}
         ]
         inferred_environment = _stable_environment_from_scenes(grouped_scenes)
+        legacy_fragments = _legacy_dynamic_fragment_sets(grouped_scenes)
         inferred_time_condition = _location_time_condition_from_scenes(grouped_scenes)
         inferred_weather = _location_weather_from_scenes(grouped_scenes)
         time_values = {item.time_condition.strip() for item in locations if item.time_condition.strip()}
@@ -1662,8 +2189,26 @@ def normalize_scene_assets(script: ScriptBreakdown) -> ScriptBreakdown:
             _safe_location_text(getattr(item, "identity_description", ""), scene_actions)
             for item in locations
         ]
+
+        def clean_reusable_location_text(value: str) -> str:
+            """Remove shot actions while preserving non-narrative custom text."""
+            raw = str(value or "").strip()
+            if not raw or raw in scene_actions:
+                return ""
+            cleaned = _clean_environment_description(
+                raw,
+                grouped_scenes,
+                legacy_fragments,
+                known_character_names,
+            )
+            if cleaned:
+                return cleaned
+            if _has_voice_or_action_cue(raw) or _contains_legacy_dynamic_fragment(raw, legacy_fragments):
+                return ""
+            return raw
+
         safe_environment = [
-            _safe_location_text(getattr(item, "environment_description", ""), scene_actions)
+            clean_reusable_location_text(getattr(item, "environment_description", ""))
             for item in locations
         ]
         if not any(safe_environment) and inferred_environment:
@@ -1673,16 +2218,17 @@ def normalize_scene_assets(script: ScriptBreakdown) -> ScriptBreakdown:
         if not identity_text and environment_text:
             identity_text = _stable_location_identity(name, environment_text)
         fixed_dressing_text = _common_environment_description(
-            [getattr(item, "fixed_dressing", "") for item in locations]
+            [clean_reusable_location_text(getattr(item, "fixed_dressing", "")) for item in locations]
         )
         if not fixed_dressing_text:
             fixed_dressing_text = environment_text
-        anchor_points = list(dict.fromkeys(
-            anchor
-            for item in locations
-            for anchor in (getattr(item, "anchor_points", []) or [])
-            if str(anchor).strip()
-        ))
+        anchor_points: list[str] = []
+        for item in locations:
+            for anchor in getattr(item, "anchor_points", []) or []:
+                cleaned_anchor = clean_reusable_location_text(anchor)
+                if cleaned_anchor:
+                    anchor_points.extend(_description_clauses(cleaned_anchor))
+        anchor_points = list(dict.fromkeys(anchor_points))
         if not anchor_points:
             anchor_points = _stable_location_anchor_points(environment_text)
         normalized_locations.append(LocationAsset(

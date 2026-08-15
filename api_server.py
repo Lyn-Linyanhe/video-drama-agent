@@ -34,6 +34,16 @@ from src.api.routes import (
 
 SESSION_COOKIE = "studio_session"
 SESSION_MAX_AGE_SEC = 60 * 60 * 24
+FRONTEND_CACHE_CONTROL = "no-store, max-age=0, must-revalidate"
+
+
+class StudioStaticFiles(StaticFiles):
+    """Keep the local development frontend in sync with the running server."""
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["Cache-Control"] = FRONTEND_CACHE_CONTROL
+        return response
 
 
 def _auth_enabled() -> bool:
@@ -233,11 +243,11 @@ def create_app() -> FastAPI:
     )
     output_dir = BASE_DIR / "output"
     output_dir.mkdir(exist_ok=True)
-    application.mount("/output", StaticFiles(directory=str(output_dir)), name="output_files")
+    application.mount("/output", StudioStaticFiles(directory=str(output_dir)), name="output_files")
     web_dir = BASE_DIR / "web"
     if web_dir.is_dir():
         mimetypes.add_type("image/webp", ".webp")
-        application.mount("/static", StaticFiles(directory=str(web_dir)), name="studio_static")
+        application.mount("/static", StudioStaticFiles(directory=str(web_dir)), name="studio_static")
     for domain_router in (
         health_routes.router, scripts_routes.router, assets_routes.router,
         production_routes.router, audio_routes.router, jobs_routes.router,
@@ -248,7 +258,10 @@ def create_app() -> FastAPI:
 
     @application.get("/", include_in_schema=False)
     async def serve_studio():
-        return FileResponse(BASE_DIR / "studio.html")
+        return FileResponse(
+            BASE_DIR / "studio.html",
+            headers={"Cache-Control": FRONTEND_CACHE_CONTROL},
+        )
 
     return application
 

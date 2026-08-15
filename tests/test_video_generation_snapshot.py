@@ -226,7 +226,8 @@ def test_video_generation_snapshot_records_reference_tags(tmp_path, monkeypatch)
     snapshot = api_context._build_video_generation_snapshot(state, 1, policy)
 
     assert snapshot["references"][0]["reference_tag"] == "@ref01_character_front_full"
-    assert snapshot["reference_labels"][0].startswith("@ref01_character_front_full = ")
+    assert snapshot["reference_labels"][0].startswith("@character:Hero:front_full -> @ref01_character_front_full = ")
+    assert "@character:Hero:front_full maps to reference image 1" in snapshot["provider_prompt"]
     assert "@ref01_character_front_full maps to reference image 1" in snapshot["provider_prompt"]
 
 
@@ -360,6 +361,10 @@ async def test_video_job_uses_and_persists_frozen_snapshot(tmp_path, monkeypatch
     policy = {"provider": "mock", "model": "mock", "resolution": "720p", "unit_price_rmb_per_sec": 0.0}
     monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: state.shot_productions[1].references)
     snapshot = api_context._build_video_generation_snapshot(state, 1, policy)
+    # A legacy saved task may still carry duplicated metadata for the same
+    # image. The job executor must not upload it twice.
+    snapshot["references"].append(dict(snapshot["references"][0]))
+    snapshot["reference_labels"].append(snapshot["reference_labels"][0])
     state.generation_prompts.shots[0].prompt = "later draft must not be sent"
 
     captured = {}
@@ -387,7 +392,7 @@ async def test_video_job_uses_and_persists_frozen_snapshot(tmp_path, monkeypatch
     )
 
     assert captured["provider_prompt"] == snapshot["provider_prompt"]
-    assert captured["references"] == [item["image_path"] for item in snapshot["references"]]
+    assert captured["references"] == [str(reference_path)]
     assert state.shot_productions[1].video_versions[-1].generation_snapshot == snapshot
     assert result["generation_snapshot"] == snapshot
 

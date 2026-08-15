@@ -1,7 +1,8 @@
 """Abstract base class for image generation API clients."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -25,6 +26,9 @@ class ImageGroupResult:
     images: list[ImageGenResult]
     error_message: str = ""
     provider_name: str = ""
+    # Non-sensitive request/response diagnostics.  Providers must never put
+    # credentials or complete response bodies in this field.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class ImageAPIClient(ABC):

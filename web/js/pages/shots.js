@@ -1,5 +1,6 @@
 const activeProjectJobs = (...args) => globalThis.StudioActions.activeProjectJobs(...args);
 const apiCall = (...args) => globalThis.StudioActions.apiCall(...args);
+const assetPreviewMarkup = (...args) => globalThis.StudioActions.assetPreviewMarkup(...args);
 const beginApiProgress = (...args) => globalThis.StudioActions.beginApiProgress(...args);
 const endApiProgress = (...args) => globalThis.StudioActions.endApiProgress(...args);
 const escapeHtml = (...args) => globalThis.StudioActions.escapeHtml(...args);
@@ -315,16 +316,14 @@ function renderProps() {
     const busy = appState.assetBusy[`prop:${prop.propId}`];
     const missing = images.some(item => item.image_path && (item.media_missing || StudioActions.isMissingMediaPath(item.image_path)));
     const ready = Boolean(confirmedMaster);
-    const preview = image?.image_path
-      ? `<img src="${mediaUrl(image.image_path, image.version_id)}" style="width:100%;aspect-ratio:3/2;object-fit:cover;border-radius:6px;background:#111" alt="">`
-      : '<div style="width:100%;aspect-ratio:3/2;display:grid;place-items:center;background:#151522;border-radius:6px;color:#71717a">正面视图待生成</div>';
+    const preview = assetPreviewMarkup(image, prop.name, missing);
     const statusText = busy ? '生成中' : error ? '生成失败' : missing ? '文件缺失，可重新生成' : pendingMaster ? '待确认母版' : ready ? '母版已确认' : legacyOnly ? '旧六视图，待生成母版' : '待生成母版';
     const action = pendingMaster
       ? `<button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.confirmPropMaster('${encodedId}','${escapeHtml(pendingMaster.version_id || '')}')">确认母版</button>`
       : !confirmedMaster
         ? `<button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.generatePropMaster('${encodedId}')">生成母版</button>`
         : `<button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.generateAssetCard('prop','${encodedId}',false)">${busy ? '终止' : '生成所需视图'}</button>`;
-    return `<div class="card" style="padding:12px;cursor:pointer" onclick="StudioActions.openPropImageEditor(${index})">${preview}<div style="display:flex;justify-content:space-between;gap:8px;margin-top:10px"><b>${escapeHtml(prop.name)}</b><span style="font-size:10px;color:#a1a1aa">${prop.isHandheld ? '手持/操作' : '剧情关键'}</span></div><div style="font-size:11px;color:#a1a1aa;line-height:1.5;margin-top:6px">${escapeHtml(prop.description || '以剧本设定为准')}</div><div style="font-size:10px;color:#71717a;margin-top:6px">镜头 ${escapeHtml((prop.shotIds || []).join('、') || '未绑定')}</div><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${statusText}</span>${action}</div></div>`;
+    return `<div class="card" data-asset-card style="padding:12px;cursor:pointer" onclick="StudioActions.openPropImageEditor(${index})"><div class="asset-card-preview asset-card-preview-prop">${preview}</div><div style="display:flex;justify-content:space-between;gap:8px;margin-top:10px"><b>${escapeHtml(prop.name)}</b><span style="font-size:10px;color:#a1a1aa">${prop.isHandheld ? '手持/操作' : '剧情关键'}</span></div><div style="font-size:11px;color:#a1a1aa;line-height:1.5;margin-top:6px">${escapeHtml(prop.description || '以剧本设定为准')}</div><div style="font-size:10px;color:#71717a;margin-top:6px">镜头 ${escapeHtml((prop.shotIds || []).join('、') || '未绑定')}</div><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span data-asset-status style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${statusText}</span>${action}</div></div>`;
   }).join('');
 }
 

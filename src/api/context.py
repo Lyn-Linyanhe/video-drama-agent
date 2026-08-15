@@ -348,7 +348,10 @@ class PromptEditRequest(BaseModel):
 
 class ProductionReferenceRequest(BaseModel):
     reference_id: str = Field(..., min_length=3, max_length=512)
-    source: Literal["asset", "manual"] = "asset"
+    source: Literal["asset", "manual", "explicit"] = "asset"
+    token: str = Field(default="", max_length=512)
+    version_id: str = Field(default="", max_length=256)
+    explicit_base_source: Literal["", "asset", "manual"] = ""
 
 
 class ProductionShotUpdateRequest(BaseModel):
@@ -462,6 +465,25 @@ _MEDIA_PATH_FIELDS = {
 }
 
 
+def _repair_utf8_mojibake(value: str) -> str:
+    """Recover text that was UTF-8 encoded and decoded as Latin-1.
+
+    A few older project snapshots were written through a Windows console with
+    the wrong code page.  This is deliberately conservative: only return the
+    decoded value when it contains CJK text and the original value can be
+    represented as a single-byte string.  Normal Unicode paths are unchanged.
+    """
+    if not value:
+        return value
+    try:
+        repaired = value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+    if repaired == value or not re.search(r"[\u3400-\u9fff]", repaired):
+        return value
+    return repaired
+
+
 def _relocate_output_media_path(path: str) -> str:
     """Map stale absolute output paths to this checkout's output directory."""
     if not path or re.match(r"^https?://", path, re.IGNORECASE):
@@ -472,8 +494,15 @@ def _relocate_output_media_path(path: str) -> str:
     match = re.search(r"(?:^|/)output/(.+)$", normalized, re.IGNORECASE)
     if not match:
         return path
-    candidate = OUTPUT_DIR / Path(*match.group(1).split("/"))
-    return str(candidate) if candidate.is_file() else path
+    suffix = match.group(1)
+    # Try the persisted suffix first, then the common UTF-8/Latin-1 repair.
+    # This also fixes paths from another checkout because the output root is
+    # always resolved against the currently running workspace.
+    for candidate_suffix in (suffix, _repair_utf8_mojibake(suffix)):
+        candidate = OUTPUT_DIR / Path(*candidate_suffix.split("/"))
+        if candidate.is_file():
+            return str(candidate)
+    return path
 
 
 def _repair_state_media_paths(state: DramaState) -> None:
@@ -535,7 +564,201 @@ def _normalize_legacy_generation_durations(data: dict) -> None:
         normalize_items(script.get("scenes"), 30)
     prompts = data.get("generation_prompts")
     if isinstance(prompts, dict):
-        normalize_items(prompts.get("shots"), 60)
+            normalize_items(prompts.get("shots"), 60)
+
+
+def _repair_character_description_consumers(
+    state: DramaState,
+    previous_manifest_descriptions: dict[str, str] | None = None,
+) -> None:
+    """Propagate repaired manifest descriptions to persisted prompt consumers.
+
+    The manifest is the source of truth for deterministic repairs. Visual
+    registries and old prompt snapshots are denormalized copies, so update
+    only values that still match a generated/fallback description. Detailed
+    user-authored descriptions remain untouched.
+    """
+    script = getattr(state, "script", None)
+    manifest = getattr(script, "asset_manifest", None) if script else None
+    if not manifest:
+        return
+
+    from src.utils.visual_asset_manifest import _is_generic_character_description
+
+    previous = {
+        str(name or "").strip(): str(description or "").strip()
+        for name, description in (previous_manifest_descriptions or {}).items()
+        if str(name or "").strip() and str(description or "").strip()
+    }
+
+    def is_replaceable_legacy(name: str, value: str) -> bool:
+        text = str(value or "").strip()
+        return bool(
+            text
+            and (
+                text == previous.get(name, "")
+                or _is_generic_character_description(text, name)
+            )
+        )
+
+    repaired: dict[str, str] = {}
+    legacy_values: dict[str, set[str]] = {}
+    for character in getattr(manifest, "characters", []) or []:
+        name = str(getattr(character, "name", "") or "").strip()
+        description = str(getattr(character, "description", "") or "").strip()
+        if not name or not description or getattr(character, "appearance_mode", "") != "on_screen":
+            continue
+        repaired[name] = description
+        values = legacy_values.setdefault(name, set())
+        if previous.get(name):
+            values.add(previous[name])
+
+    visual = getattr(state, "visual_design", None)
+    if visual is not None:
+        for field_name in ("global_character_descriptions_cn", "global_character_descriptions"):
+            registry = getattr(visual, field_name, None)
+            if isinstance(registry, dict):
+                # Older visual registries sometimes used the stable asset ID
+                # as the key.  A later edit may rename the display name while
+                # keeping that ID, so synchronize the alias from the manifest
+                # before normal name-based repair.  The manifest remains the
+                # source of truth for this deterministic alias only.
+                for character in getattr(manifest, "characters", []) or []:
+                    canonical_name = str(getattr(character, "name", "") or "").strip()
+                    asset_id = str(getattr(character, "asset_id", "") or "").strip()
+                    description = str(getattr(character, "description", "") or "").strip()
+                    if (
+                        canonical_name
+                        and asset_id
+                        and asset_id != canonical_name
+                        and description
+                        and asset_id in registry
+                    ):
+                        current = str(registry.get(asset_id, "") or "").strip()
+                        if current and current != description and is_replaceable_legacy(canonical_name, current):
+                            legacy_values.setdefault(canonical_name, set()).add(current)
+                            registry[asset_id] = description
+                for name in repaired:
+                    current = str(registry.get(name, "") or "").strip()
+                    if is_replaceable_legacy(name, current):
+                        legacy_values.setdefault(name, set()).add(current)
+        for scene_visual in getattr(visual, "scenes", []) or []:
+            appearances = getattr(scene_visual, "character_appearance", None)
+            if not isinstance(appearances, dict):
+                continue
+            for name in repaired:
+                current = str(appearances.get(name, "") or "").strip()
+                if is_replaceable_legacy(name, current):
+                    legacy_values.setdefault(name, set()).add(current)
+
+    def should_replace(name: str, current: str) -> bool:
+        text = str(current or "").strip()
+        return bool(
+            text
+            and (
+                text in legacy_values.get(name, set())
+                or _is_generic_character_description(text, name)
+            )
+        )
+
+    def replace_text(text: str, *, anchor_only: bool = False) -> str:
+        value = str(text or "")
+        if not value:
+            return value
+        lines = value.splitlines() if anchor_only else [value]
+        for index, line in enumerate(lines):
+            if anchor_only and "【出镜角色与身份锚点】" not in line:
+                continue
+            for name, new_description in repaired.items():
+                new_body = re.sub(
+                    rf"^{re.escape(name)}\s*[：:]\s*",
+                    "",
+                    new_description,
+                )
+                old_values = set(legacy_values.get(name, set()))
+                for registry in (
+                    getattr(getattr(state, "visual_design", None), "global_character_descriptions_cn", {}) or {},
+                    getattr(getattr(state, "visual_design", None), "global_character_descriptions", {}) or {},
+                ):
+                    current = str(registry.get(name, "") or "").strip()
+                    if current and current != new_description and should_replace(name, current):
+                        old_values.add(current)
+                old_values.discard(new_description)
+                for old_description in sorted(old_values, key=len, reverse=True):
+                    if not old_description:
+                        continue
+                    old_body = re.sub(
+                        rf"^{re.escape(name)}\s*[：:]\s*",
+                        "",
+                        old_description,
+                    )
+                    # Replace the exact generated description first.  It can
+                    # be nested after a label (``设定：name：body``) or after
+                    # an already-prefixed anchor (``name：name：body``).
+                    # Keeping only ``new_body`` avoids duplicating the role
+                    # name in those containers.
+                    line = line.replace(old_description, new_body)
+                    for separator in ("：", ":"):
+                        # Historical image prompts used both ``name:body``
+                        # and ``label:name:body`` forms.  The latter does not
+                        # contain ``name:name:body``, so replacing only the
+                        # full generated description misses it.  Replace the
+                        # canonical name/body pair as well as the exact old
+                        # description; all candidates come from persisted
+                        # generated registries, not arbitrary user text.
+                        line = line.replace(
+                            f"{name}{separator}{old_body}",
+                            f"{name}{separator}{new_body}",
+                        )
+                        line = line.replace(
+                            f"{name}{separator}{name}{separator}{old_body}",
+                            f"{name}{separator}{new_body}",
+                        )
+                        line = line.replace(
+                            f"{name}{separator}{old_description}",
+                            f"{name}{separator}{new_body}",
+                        )
+                line = re.sub(
+                    rf"{re.escape(name)}([：:])\s*{re.escape(name)}\1",
+                    rf"{name}\1",
+                    line,
+                )
+            lines[index] = line
+        return "\n".join(lines) if anchor_only else lines[0]
+
+    if visual is not None:
+        for field_name in ("global_character_descriptions_cn", "global_character_descriptions"):
+            registry = getattr(visual, field_name, None)
+            if not isinstance(registry, dict):
+                continue
+            for name, new_description in repaired.items():
+                current = str(registry.get(name, "") or "").strip()
+                if not current or should_replace(name, current):
+                    registry[name] = new_description
+        for scene_visual in getattr(visual, "scenes", []) or []:
+            appearances = getattr(scene_visual, "character_appearance", None)
+            if not isinstance(appearances, dict):
+                continue
+            for name, new_description in repaired.items():
+                current = str(appearances.get(name, "") or "").strip()
+                if current and should_replace(name, current):
+                    appearances[name] = new_description
+
+    prompts = getattr(state, "generation_prompts", None)
+    if prompts is not None:
+        def repair_shot(shot: Any) -> None:
+            shot.prompt = replace_text(getattr(shot, "prompt", ""), anchor_only=True)
+            for child in getattr(shot, "sub_shots", []) or []:
+                repair_shot(child)
+
+        for shot in getattr(prompts, "shots", []) or []:
+            repair_shot(shot)
+
+    images = getattr(getattr(state, "character_images", None), "characters", None) or []
+    for image in images:
+        for field_name in ("image_prompt", "base_prompt"):
+            if hasattr(image, field_name):
+                setattr(image, field_name, replace_text(getattr(image, field_name, "")))
 
 
 def _state_from_json(json_str: str) -> DramaState:
@@ -651,11 +874,23 @@ def _state_from_json(json_str: str) -> DramaState:
         )
 
         normalize_scene_assets(state.script)
+        previous_character_descriptions = {
+            str(character.name or "").strip(): str(character.description or "").strip()
+            for character in state.script.asset_manifest.characters
+            if str(character.name or "").strip()
+        }
         # Apply the same deterministic description repair used after parsing.
         # Without this load-time pass, legacy scene actions and generic prop
         # placeholders remain in the persisted manifest and are reused by
         # every subsequent image prompt after a refresh or restart.
-        enrich_manifest_descriptions(state.script)
+        enrich_manifest_descriptions(
+            state.script,
+            source_text=(
+                state.script_draft_text
+                or (state.user_input if state.input_mode == "script" else "")
+            ),
+        )
+        _repair_character_description_consumers(state, previous_character_descriptions)
         # Apply deterministic manifest cleanup while loading legacy projects so
         # stale virtual entries (SMS/recording content) cannot reach generation
         # or the asset UI after a restart.
@@ -697,7 +932,9 @@ def _state_from_json(json_str: str) -> DramaState:
     _migrate_legacy_shot_references(state)
     _normalize_prompt_overrides(state)
     _repair_scene_group_prompt_snapshots(state)
+    _repair_legacy_storyboard_environment_prompts(state)
     _repair_state_media_paths(state)
+    _normalize_internal_style_labels(state)
     _refresh_prompt_language_status(state)
     return state
 
@@ -712,6 +949,160 @@ def _refresh_prompt_language_status(state: DramaState) -> None:
 
     prompts.needs_refresh = any(not is_chinese_prompt(shot.prompt) for shot in prompts.shots)
     prompts.prompt_language = "mixed" if prompts.needs_refresh else "zh-CN"
+
+
+_INTERNAL_STYLE_ID_LABEL = re.compile(
+    r"(【(?:项目)?视觉媒介】[^：\n]*?)[（(][A-Za-z][A-Za-z0-9_-]*[）)](?:：|:)"
+)
+
+
+def _normalize_internal_style_labels(state: DramaState) -> None:
+    """Remove registry IDs from persisted user/provider-facing prompt text.
+
+    Stable style IDs remain in ``creative_profile.visual_style_id`` for
+    configuration and lookup. They are implementation details, however, and
+    must not appear in the Chinese storyboard prompt shown to users or sent to
+    a provider. Normalize legacy shots recursively so old projects converge
+    when they are opened.
+    """
+    prompts = getattr(state, "generation_prompts", None)
+    if not prompts:
+        return
+
+    def normalize(shot: Any) -> None:
+        prompt = str(getattr(shot, "prompt", "") or "")
+        if prompt:
+            shot.prompt = _INTERNAL_STYLE_ID_LABEL.sub(r"\1：", prompt)
+        for child in getattr(shot, "sub_shots", []) or []:
+            normalize(child)
+
+    for shot in getattr(prompts, "shots", []) or []:
+        normalize(shot)
+
+
+def _repair_legacy_storyboard_environment_prompts(state: DramaState) -> None:
+    """Remove shot-only actions copied into legacy storyboard environment sections.
+
+    The compact visual pipeline now keeps reusable location identity separate
+    from each shot's action. Older snapshots were assembled from a manifest
+    that did not enforce that boundary, so loading a project must repair only
+    the ``[环境]`` section while preserving the action, camera and user edits
+    in every other section.
+    """
+    prompts = getattr(state, "generation_prompts", None)
+    script = getattr(state, "script", None)
+    manifest = getattr(script, "asset_manifest", None) if script else None
+    if not prompts or not manifest or not getattr(prompts, "shots", None):
+        return
+
+    from src.utils.visual_asset_manifest import (
+        _clean_environment_description,
+        _description_clauses,
+        _legacy_dynamic_fragment_sets,
+    )
+
+    env_header = "\u3010\u73af\u5883\u3011"
+    scenes_by_id = {scene.scene_id: scene for scene in getattr(script, "scenes", [])}
+    locations_by_id = {location.location_id: location for location in getattr(manifest, "locations", [])}
+    bindings_by_scene = {
+        binding.scene_id: binding
+        for binding in getattr(manifest, "shot_bindings", [])
+    }
+
+    def location_for_scene(scene_id: int):
+        binding = bindings_by_scene.get(scene_id)
+        if binding and binding.location_id in locations_by_id:
+            return locations_by_id[binding.location_id]
+        return next(
+            (
+                location
+                for location in locations_by_id.values()
+                if scene_id in (getattr(location, "shot_ids", []) or [])
+            ),
+            None,
+        )
+
+    def clean_environment_body(body: str, scene: Any, location: Any) -> str:
+        location_shot_ids = set(getattr(location, "shot_ids", []) or [])
+        location_scenes = [
+            item for item in scenes_by_id.values()
+            if item.scene_id in location_shot_ids
+        ] or ([scene] if scene is not None else [])
+        if not location_scenes:
+            return body.strip()
+        known_names = {
+            str(name or "").strip()
+            for item in location_scenes
+            for name in (getattr(item, "characters", []) or [])
+            if str(name or "").strip()
+        }
+        legacy_fragments = _legacy_dynamic_fragment_sets(location_scenes)
+        cleaned = _clean_environment_description(
+            body,
+            location_scenes,
+            legacy_fragments,
+            known_names,
+        )
+        stable_values = [
+            str(getattr(location, "environment_description", "") or ""),
+            str(getattr(location, "fixed_dressing", "") or ""),
+        ]
+        stable_clauses: list[str] = []
+        for value in stable_values:
+            stable = _clean_environment_description(
+                value,
+                location_scenes,
+                legacy_fragments,
+                known_names,
+            )
+            for clause in _description_clauses(stable):
+                if clause not in stable_clauses:
+                    stable_clauses.append(clause)
+
+        clauses: list[str] = []
+        for value in [*stable_clauses, cleaned]:
+            for clause in _description_clauses(value):
+                if clause not in clauses:
+                    clauses.append(clause)
+        location_name = str(
+            getattr(location, "canonical_name", "")
+            or getattr(scene, "location", "")
+            or ""
+        ).strip()
+        if location_name:
+            clauses.insert(0, location_name)
+        return "；".join(dict.fromkeys(item for item in clauses if item)).strip("；")
+
+    for shot in prompts.shots:
+        prompt = str(getattr(shot, "prompt", "") or "")
+        if env_header not in prompt:
+            continue
+        scene = scenes_by_id.get(getattr(shot, "scene_id", None))
+        location = location_for_scene(getattr(shot, "scene_id", None))
+        if scene is None or location is None:
+            continue
+
+        match = re.search(
+            re.escape(env_header) + r"(?P<body>.*?)(?=\u3010|$)",
+            prompt,
+            flags=re.S,
+        )
+        if not match:
+            continue
+        old_body = match.group("body")
+        new_body = clean_environment_body(old_body, scene, location)
+        if not new_body or (
+            new_body == old_body.strip()
+            and old_body.endswith(("\n", "\r"))
+        ):
+            continue
+        leading_ws = old_body[: len(old_body) - len(old_body.lstrip())]
+        trailing_ws = old_body[len(old_body.rstrip()):]
+        if not trailing_ws:
+            trailing_ws = "\n"
+        replacement_body = leading_ws + new_body + trailing_ws
+        start, end = match.span("body")
+        shot.prompt = prompt[:start] + replacement_body + prompt[end:]
 
 
 def _normalize_prompt_overrides(state: DramaState) -> None:
@@ -1228,6 +1619,170 @@ def _asset_reference_key(reference) -> tuple:
     return reference.asset_type, reference.asset_id, reference.view_type
 
 
+def _reference_value(reference, key: str, default: str = "") -> str:
+    if isinstance(reference, dict):
+        return str(reference.get(key) or default)
+    return str(getattr(reference, key, default) or default)
+
+
+def _public_reference_token(reference) -> str:
+    """Return the stable @ token rendered by the production prompt editor."""
+    token = _reference_value(reference, "reference_token").strip()
+    if token:
+        return token
+    asset_type = _reference_value(reference, "asset_type", "asset")
+    asset_id = _reference_value(reference, "asset_id") or _reference_value(reference, "reference_id")
+    view_type = _reference_value(reference, "view_type", "default")
+    return f"@{asset_type}:{asset_id}:{view_type}"
+
+
+def _reference_submission_key(reference) -> tuple[str, str]:
+    """One physical asset version occupies one provider reference slot."""
+    return (
+        _reference_value(reference, "reference_id"),
+        _reference_value(reference, "asset_version_id"),
+    )
+
+
+def _deduplicate_shot_references(references):
+    """Keep the first occurrence and order for repeated asset-version bindings."""
+    unique = []
+    seen: set[tuple[str, str]] = set()
+    for reference in references or []:
+        key = _reference_submission_key(reference)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(reference)
+    return unique
+
+
+def _reference_text_candidates(reference) -> list[str]:
+    """Names likely to occur in a generated Chinese or English shot description."""
+    candidates = [
+        _reference_value(reference, "asset_id"),
+        _reference_value(reference, "label"),
+    ]
+    label = _reference_value(reference, "label")
+    view_type = _reference_value(reference, "view_type")
+    if view_type and label.lower().endswith(view_type.lower()):
+        candidates.append(label[: -len(view_type)].strip())
+    candidates.extend(
+        candidate.removeprefix("道具 ").removeprefix("角色 ").strip()
+        for candidate in list(candidates)
+        if candidate
+    )
+    normalized: list[str] = []
+    for candidate in sorted(candidates, key=len, reverse=True):
+        if candidate and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
+
+
+def _replace_reference_mentions(text: str, reference, token: str) -> tuple[str, bool]:
+    """Replace every textual occurrence of one asset with its inline @ token."""
+    for candidate in _reference_text_candidates(reference):
+        escaped = re.escape(candidate)
+        if re.fullmatch(r"[A-Za-z0-9_ -]+", candidate):
+            pattern = rf"(?<![@A-Za-z0-9_:-]){escaped}(?![A-Za-z0-9_-])"
+        else:
+            # Chinese names have no word boundary, but they must never be
+            # matched again inside an earlier @character:Name:view token.
+            pattern = rf"(?<![@A-Za-z0-9_:-]){escaped}"
+        replaced, count = re.subn(pattern, token, text, flags=re.IGNORECASE)
+        if count:
+            return replaced, True
+    return text, False
+
+
+def _character_inline_view_rank(prompt: str, reference) -> int:
+    """Choose the one character image that represents this shot in the text."""
+    view_type = _reference_value(reference, "view_type").lower()
+    normalized_prompt = str(prompt or "")
+    if any(term in normalized_prompt for term in ("背面", "背影", "背后", "背身")):
+        preference = ("back", "profile", "front_full", "front_half")
+    elif any(term in normalized_prompt for term in ("侧面", "侧脸", "侧身", "过肩")):
+        preference = ("profile", "front_half", "front_full", "back")
+    elif any(term in normalized_prompt for term in ("全身", "远景", "大全景")):
+        preference = ("front_full", "front_half", "profile", "back")
+    else:
+        preference = ("front_half", "front_full", "profile", "back")
+    for index, marker in enumerate(preference):
+        if marker in view_type:
+            return index
+    return len(preference)
+
+
+def _automatic_references_for_inline_text(prompt: str, references):
+    """Keep one semantic text anchor per character while retaining all uploads."""
+    automatic = [
+        reference
+        for reference in _deduplicate_shot_references(references)
+        if _reference_value(reference, "source", "asset") == "asset"
+    ]
+    character_groups: dict[str, list] = {}
+    for reference in automatic:
+        if _reference_value(reference, "asset_type") == "character":
+            identity = _reference_value(reference, "asset_id") or _reference_value(reference, "reference_id")
+            character_groups.setdefault(identity, []).append(reference)
+    primary_characters = {
+        identity: min(group, key=lambda reference: _character_inline_view_rank(prompt, reference))
+        for identity, group in character_groups.items()
+    }
+    selected = []
+    seen_characters: set[str] = set()
+    for reference in automatic:
+        if _reference_value(reference, "asset_type") != "character":
+            selected.append(reference)
+            continue
+        identity = _reference_value(reference, "asset_id") or _reference_value(reference, "reference_id")
+        if identity in seen_characters:
+            continue
+        selected.append(primary_characters[identity])
+        seen_characters.add(identity)
+    return selected
+
+
+def _inline_automatic_asset_mentions(prompt: str, references) -> str:
+    """Embed automatic image assets where their text constraints are expressed.
+
+    The prompt remains plain text for persistence and providers.  The frontend
+    renders the stable @ tokens as image chips, while the task snapshot maps
+    each distinct asset version to one uploaded reference image.
+    """
+    text = str(prompt or "").strip()
+    automatic = _automatic_references_for_inline_text(text, references)
+    if not automatic:
+        return text
+
+    prefixes: list[str] = []
+    for reference in automatic:
+        if _reference_value(reference, "asset_type") != "scene":
+            continue
+        token = _public_reference_token(reference)
+        if token not in text:
+            prefixes.append(
+                f"本镜场景设定在：{token}。空间结构、环境细节、光线、天气、时间与主色调必须以该场景图为准。"
+            )
+
+    for reference in automatic:
+        asset_type = _reference_value(reference, "asset_type")
+        if asset_type == "scene":
+            continue
+        token = _public_reference_token(reference)
+        if token in text:
+            continue
+        text, found = _replace_reference_mentions(text, reference, token)
+        if found:
+            continue
+        if asset_type == "character":
+            prefixes.append(f"出镜人物：{token}。脸型、发型、服装、体态与身份特征必须保持一致。")
+        elif asset_type == "prop":
+            prefixes.append(f"关键道具：{token}。造型、材质、尺寸与画面中的使用状态必须保持一致。")
+
+    return "\n".join([*prefixes, text]).strip()
+
+
 def _default_shot_references(state: DramaState, scene_id: int):
     from src.schemas.prompt import GenerationPrompts
 
@@ -1264,11 +1819,47 @@ def _reconcile_shot_references(state: DramaState, scene_id: int):
         if reference.source == "manual":
             reconciled.append(reference)
             continue
+        if reference.source == "explicit":
+            reconciled.append(_resolve_explicit_reference_version(state, reference))
+            continue
         latest = latest_by_identity.pop(_asset_reference_key(reference), None)
         reconciled.append(latest or reference.model_copy(update={"stale": True}))
     reconciled.extend(latest_by_identity.values())
-    production.references = reconciled
-    return reconciled
+    production.references = _deduplicate_shot_references(reconciled)
+    return production.references
+
+
+def _resolve_explicit_reference_version(state: DramaState, reference):
+    """Keep an explicit @ reference on the selected image version when possible."""
+    version_id = str(getattr(reference, "asset_version_id", "") or "").strip()
+    if not version_id or reference.asset_type not in {"character", "scene", "prop"}:
+        return reference
+    try:
+        from src.utils.asset_versions import ImageAssetVersions
+
+        versions = ImageAssetVersions(project_store.get_project_dir(state.project_id))
+        record = versions.find_version(reference.asset_type, reference.asset_id, reference.view_type, version_id)
+    except (OSError, TypeError, ValueError):
+        record = None
+    if record is None:
+        # Legacy projects may have a version id in state without a migrated
+        # asset-manifest record. Keep a still-existing path usable rather than
+        # breaking an otherwise valid reference; missing files remain stale.
+        return reference.model_copy(update={
+            "stale": not bool(reference.image_path and Path(reference.image_path).is_file()),
+        })
+    path = str(record.get("path") or "")
+    if not path:
+        return reference.model_copy(update={"stale": True})
+    try:
+        resolved_path = Path(path).resolve()
+        resolved_path.relative_to(versions.asset_root.resolve())
+    except (OSError, ValueError):
+        return reference.model_copy(update={"stale": True})
+    return reference.model_copy(update={
+        "image_path": str(resolved_path),
+        "stale": not resolved_path.is_file(),
+    })
 
 
 def _policy_prompt_provider(policy: dict) -> str:
@@ -1310,7 +1901,9 @@ def _reference_label_for_item(item: dict, index: int) -> str:
     label = str(item.get("label") or item.get("asset_id") or "reference").strip()
     asset_type = str(item.get("asset_type") or "reference").strip()
     view_type = str(item.get("view_type") or "").strip()
-    return f"{tag} = {asset_type}: {label}" + (f" ({view_type})" if view_type else "")
+    token = _public_reference_token(item)
+    prefix = f"{token} -> " if token else ""
+    return prefix + f"{tag} = {asset_type}: {label}" + (f" ({view_type})" if view_type else "")
 
 
 def _visual_style_snapshot(profile) -> dict:
@@ -1342,9 +1935,19 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
 
     raw_prompt = _shot_prompt(state, scene_id).model_copy(deep=True)
     raw_prompt.duration_sec = _duration_for_video_policy(raw_prompt.duration_sec, policy)
+    reconciled_references = _deduplicate_shot_references(_reconcile_shot_references(state, scene_id))
+    raw_prompt.prompt = _inline_automatic_asset_mentions(raw_prompt.prompt, reconciled_references)
+    unavailable_explicit = [
+        reference.reference_token or reference.reference_id
+        for reference in reconciled_references
+        if reference.source == "explicit"
+        and (not reference.image_path or not Path(reference.image_path).is_file() or reference.stale)
+    ]
+    if unavailable_explicit:
+        raise ValueError("显式引用不可用：" + "、".join(unavailable_explicit))
     references = [
         reference.model_dump()
-        for reference in _reconcile_shot_references(state, scene_id)
+        for reference in reconciled_references
         if reference.image_path and Path(reference.image_path).is_file() and not reference.stale
     ]
     continuity_reference_added = False
@@ -1363,6 +1966,10 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
                 "label": tail_label or "前一镜尾帧",
                 "stale": False,
             })
+    # Keep the semantic priority stable before applying provider limits:
+    # continuity tail > explicit @ mention > manual selection > automatic binding.
+    priority = {"continuity": 0, "explicit": 1, "manual": 2, "asset": 3}
+    references.sort(key=lambda item: priority.get(str(item.get("source") or "asset"), 3))
     capability = policy.get("capability") or {}
     reference_mode = "text_to_video"
     dropped_references: list[dict[str, str]] = []
@@ -1389,6 +1996,27 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         accepted_paths = {str(item.get("path")) for item in accepted_items}
         accepted_roles = {str(item.get("path")): str(item.get("role") or "") for item in accepted_items}
         dropped_references = [dict(item) for item in plan.get("dropped_references") or []]
+        explicit_paths = {
+            str(item.get("image_path"))
+            for item in references
+            if item.get("source") == "explicit"
+        }
+        dropped_explicit = [
+            item for item in dropped_references if str(item.get("path") or "") in explicit_paths
+        ]
+        if dropped_explicit:
+            labels = [str(item.get("reference_token") or item.get("reference_id") or item.get("path"))
+                      for item in references if str(item.get("image_path")) in {str(d.get("path") or "") for d in dropped_explicit}]
+            raise ValueError("显式引用因模型限制无法提交：" + "、".join(labels))
+        missing_explicit = [
+            item for item in references
+            if item.get("source") == "explicit"
+            and str(item.get("image_path")) not in accepted_paths
+        ]
+        if missing_explicit:
+            labels = [str(item.get("reference_token") or item.get("reference_id") or item.get("label"))
+                      for item in missing_explicit]
+            raise ValueError("显式引用未被供应商接受：" + "、".join(labels))
         references = [
             item for item in references
             if str(item.get("image_path")) in accepted_paths
@@ -1409,6 +2037,11 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
             else True
         )
         if not supports_references:
+            explicit_references = [item for item in references if item.get("source") == "explicit"]
+            if explicit_references:
+                labels = [str(item.get("reference_token") or item.get("reference_id") or item.get("label"))
+                          for item in explicit_references]
+                raise ValueError(f"显式引用不支持参考图：{', '.join(labels)}")
             reference_mode = "text_to_video"
             dropped_references = [
                 {"path": item["image_path"], "reason": f"{model} does not support reference images"}
@@ -1439,6 +2072,11 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
                 )
             maximum = max(0, maximum)
             if maximum == 0:
+                explicit_references = [item for item in references if item.get("source") == "explicit"]
+                if explicit_references:
+                    labels = [str(item.get("reference_token") or item.get("reference_id") or item.get("label"))
+                              for item in explicit_references]
+                    raise ValueError("显式引用因模型限制无法提交：" + "、".join(labels))
                 dropped_references = [
                     {"path": item["image_path"], "reason": f"{model} does not support reference images"}
                     for item in references
@@ -1453,9 +2091,18 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
                     }
                     for item in references[maximum:]
                 ]
+                dropped_explicit = [
+                    item for item in references[maximum:]
+                    if item.get("source") == "explicit"
+                ]
+                if dropped_explicit:
+                    labels = [str(item.get("reference_token") or item.get("reference_id") or item.get("label"))
+                              for item in dropped_explicit]
+                    raise ValueError("显式引用因模型限制无法提交：" + "、".join(labels))
                 references = references[:maximum]
     for index, item in enumerate(references, start=1):
         item["reference_tag"] = _reference_tag_for_item(item, index)
+        item["inline_token"] = _public_reference_token(item)
     prepared, effective = video_agent.prepare_shot_request(
         raw_prompt,
         generation_prompts=state.generation_prompts,
@@ -1500,6 +2147,7 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         effective["provider_prompt"] = final_provider_prompt
         effective["effective_prompt"] = final_provider_prompt
     style_snapshot = _visual_style_snapshot(state.creative_profile)
+    explicit_references = [item for item in references if item.get("source") == "explicit"]
     return {
         "scene_id": scene_id,
         "raw_prompt": raw_prompt.prompt,
@@ -1512,6 +2160,9 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         "provider_negative_prompt": prepared.negative_prompt,
         "negative_prompt_mode": effective["negative_prompt_mode"],
         "references": references,
+        "explicit_references": explicit_references,
+        "manual_references": [item for item in references if item.get("source") == "manual"],
+        "automatic_references": [item for item in references if item.get("source") == "asset"],
         "accepted_references": references,
         "dropped_references": dropped_references,
         "reference_mode": reference_mode,
@@ -1542,7 +2193,7 @@ def _migrate_legacy_shot_references(state: DramaState) -> None:
     for production in state.shot_productions.values():
         migrated = []
         for reference in production.references:
-            if reference.source == "manual":
+            if reference.source in {"manual", "explicit"}:
                 migrated.append(reference)
                 continue
             resolved = catalog.get(reference.reference_id) or by_identity.get(_asset_reference_key(reference))
@@ -1692,7 +2343,10 @@ def _production_payload(state: DramaState) -> dict:
             if video_policy.get("provider") == "seedance"
             else _clamp_production_duration(prompt.duration_sec)
         )
-        display_prompt = prompt.model_copy(update={"duration_sec": display_duration})
+        display_prompt = prompt.model_copy(update={
+            "duration_sec": display_duration,
+            "prompt": _inline_automatic_asset_mentions(prompt.prompt, production.references),
+        })
         effective = compose_video_prompt(
             _policy_prompt_provider(video_policy),
             state.generation_prompts,
@@ -1746,14 +2400,13 @@ async def _run_shot_video_job(project_id: str, scene_id: int, version_id: str) -
     try:
         state = _load_project_state(project_id)
         production = _ensure_shot_production(state, scene_id)
-        prompt = _shot_prompt(state, scene_id)
-        reference_paths = [item.image_path for item in production.references if Path(item.image_path).is_file()]
-        reference_labels = [
-            f"{item.asset_type}：{item.label or item.asset_id}（{item.view_type}）"
-            for item in production.references
+        prompt = _shot_prompt(state, scene_id).model_copy(deep=True)
+        valid_references = [
+            item
+            for item in _deduplicate_shot_references(production.references)
             if Path(item.image_path).is_file()
         ]
-        valid_references = [item for item in production.references if Path(item.image_path).is_file()]
+        prompt.prompt = _inline_automatic_asset_mentions(prompt.prompt, valid_references)
         reference_paths = [item.image_path for item in valid_references]
         reference_labels = [
             _reference_label_for_item(item.model_dump(), index)
@@ -2064,20 +2717,58 @@ def _character_identity(name: str) -> str:
 
 
 def _character_description(state: DramaState, name: str) -> str:
-    """Prefer the Chinese appearance registry while accepting legacy English-keyed projects."""
+    """Return the richest stable appearance description available for a role.
+
+    Projects keep the same description in several denormalized places: the
+    visual-stage registry, the asset manifest and (for older projects) a
+    legacy English registry.  Previously the first matching registry value was
+    returned immediately.  A short visual-stage value could therefore hide a
+    more detailed manifest description, leaving the image prompt dominated by
+    generic asset constraints.  Merge matching values conservatively and keep
+    the manifest as a fallback source without inventing facts.
+    """
     visual = state.visual_design
     identity = _character_identity(name)
+
+    def matches(candidate_name: Any) -> bool:
+        candidate = str(candidate_name or "").strip()
+        return bool(candidate) and (candidate == name or _character_identity(candidate) == identity)
+
+    def body(value: Any, candidate_name: str = "") -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        # Descriptions repaired from manifests are often stored as
+        # ``角色名：事实``.  The prompt already supplies the role name, so
+        # remove only that leading label and preserve all other wording.
+        prefixes = [str(candidate_name or "").strip(), str(name or "").strip()]
+        for prefix in sorted({item for item in prefixes if item}, key=len, reverse=True):
+            text = re.sub(rf"^{re.escape(prefix)}\s*[：:]\s*", "", text)
+        return text.strip("；;。 ")
+
+    def generic(value: str) -> bool:
+        try:
+            from src.utils.visual_asset_manifest import _is_generic_character_description
+
+            return _is_generic_character_description(value, name)
+        except Exception:
+            return False
+
+    chinese_values: list[str] = []
+    legacy_values: list[str] = []
     if visual:
-        descriptions = (
-            getattr(visual, "global_character_descriptions_cn", {}) or {},
-            getattr(visual, "global_character_descriptions", {}) or {},
-        )
-        for registry in descriptions:
-            if name in registry and str(registry[name]).strip():
-                return str(registry[name]).strip()
-            for candidate_name, description in registry.items():
-                if _character_identity(candidate_name) == identity and str(description).strip():
-                    return str(description).strip()
+        for field_name, target in (
+            ("global_character_descriptions_cn", chinese_values),
+            ("global_character_descriptions", legacy_values),
+        ):
+            registry = getattr(visual, field_name, {}) or {}
+            if not isinstance(registry, dict):
+                continue
+            for candidate_name, value in registry.items():
+                if matches(candidate_name):
+                    cleaned = body(value, str(candidate_name))
+                    if cleaned and cleaned not in target:
+                        target.append(cleaned)
 
     manifest = getattr(getattr(state, "script", None), "asset_manifest", None)
     matched = None
@@ -2091,6 +2782,36 @@ def _character_description(state: DramaState, name: str) -> str:
             if name in candidate_names or identity in {_character_identity(item) for item in candidate_names}:
                 matched = character
                 break
+
+    manifest_values: list[str] = []
+    if matched is not None:
+        description = body(getattr(matched, "description", ""), getattr(matched, "name", ""))
+        if description and description not in manifest_values:
+            manifest_values.append(description)
+        costume_states = getattr(matched, "costume_states", {}) or {}
+        if isinstance(costume_states, dict):
+            for state_name, state_desc in costume_states.items():
+                detail = body(f"{state_name}：{state_desc}")
+                if detail and detail not in manifest_values:
+                    manifest_values.append(detail)
+
+    # Chinese is the preferred display/provider language.  When it is absent,
+    # retain the legacy registry value; otherwise add only manifest details
+    # that are not already covered by the preferred text.  Generic placeholders
+    # never take precedence over a concrete manifest description.
+    preferred_values = chinese_values or legacy_values
+    preferred = preferred_values[0] if preferred_values else ""
+    if preferred and generic(preferred) and manifest_values:
+        preferred = ""
+    merged: list[str] = []
+    for value in ([preferred] if preferred else []) + manifest_values + preferred_values[1:]:
+        if not value or generic(value):
+            continue
+        if value in merged or any(value in existing or existing in value for existing in merged):
+            continue
+        merged.append(value)
+    if merged:
+        return "；".join(merged).strip("；;。 ") + "。"
 
     parts: list[str] = []
     names_for_scene_match = {name, identity}
@@ -2126,7 +2847,9 @@ def _character_description(state: DramaState, name: str) -> str:
     }
     for scene in (getattr(getattr(state, "script", None), "scenes", []) or []):
         scene_names = set(getattr(scene, "characters", []) or [])
-        scene_names.update(_character_identity(item) for item in scene_names)
+        # Normalize legacy names without mutating the set while its iterator
+        # is active. Older projects may store names such as ``顾衡 (Gu Heng)``.
+        scene_names.update(_character_identity(item) for item in list(scene_names))
         action = str(getattr(scene, "action_description", "") or "").strip()
         if not action:
             continue

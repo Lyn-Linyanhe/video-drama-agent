@@ -20,9 +20,10 @@ from tests.test_asset_generation_api import _client
 class FakeWanClient:
     provider_name = "wan"
 
-    def __init__(self, root: Path, count: int = 4):
+    def __init__(self, root: Path, count: int = 4, sequence_reference_counted: bool = False):
         self.root = root
         self.count = count
+        self.sequence_reference_counted = sequence_reference_counted
         self.single_calls = []
         self.sequence_calls = []
         self.edit_calls = []
@@ -42,7 +43,8 @@ class FakeWanClient:
 
     async def generate_sequence(self, prompt, reference_paths, n, resolution):
         self.sequence_calls.append((prompt, list(reference_paths), n, resolution))
-        return ImageGroupResult(True, [self._image("group") for _ in range(self.count)], provider_name="wan")
+        metadata = {"sequence_reference_counted": True} if self.sequence_reference_counted else {}
+        return ImageGroupResult(True, [self._image("group") for _ in range(self.count)], provider_name="wan", metadata=metadata)
 
     async def edit_image(self, prompt, reference_paths, resolution):
         self.edit_calls.append((prompt, list(reference_paths), resolution))
@@ -106,6 +108,42 @@ def test_wan_group_request_uses_sequential_four_image_contract(tmp_path, monkeyp
     asyncio.run(client.generate_sequence("same character", [str(reference)], 4, "2K"))
     assert captured["parameters"] == {"enable_sequential": True, "n": 4, "size": "2K"}
     assert captured["content"][-1] == {"text": "same character"}
+
+
+def test_wan_sequence_adds_reference_to_provider_count_for_derived_views(tmp_path, monkeypatch):
+    reference = tmp_path / "reference.png"
+    Image.new("RGB", (240, 240), "white").save(reference)
+    client = WanImageClient("test-key", "wan2.7-image-pro")
+    captured = {}
+
+    async def fake_create(content, parameters):
+        captured["parameters"] = parameters
+        return ImageGroupResult(True, [])
+
+    monkeypatch.setattr(client, "_create", fake_create)
+    result = asyncio.run(client.generate_sequence("scene views", [str(reference)], 3, "2K"))
+
+    # n is the total sequential count at the provider: one locked master plus
+    # three newly generated views.  The service still asks for three outputs.
+    assert captured["parameters"] == {"enable_sequential": True, "n": 4, "size": "2K"}
+    assert result.metadata["requested_output_count"] == 3
+    assert result.metadata["provider_requested_n"] == 4
+
+
+def test_wan_urls_accepts_supported_result_aliases_and_deduplicates():
+    body = {
+        "output": {
+            "choices": [{"message": {"content": [{"type": "image", "image": "https://img/one"}]}}],
+            "results": [{"image_url": "https://img/two"}, {"url": "https://img/one"}],
+            "images": ["https://img/three"],
+        }
+    }
+
+    assert WanImageClient._urls(body) == [
+        "https://img/one",
+        "https://img/two",
+        "https://img/three",
+    ]
 
 
 def test_wan_group_client_uses_official_async_task_contract():
@@ -242,6 +280,27 @@ def test_incomplete_wan_group_does_not_activate_partial_views(tmp_path, monkeypa
     state = api_context._load_project_state(project_id)
     images = state.character_images.characters if state.character_images else []
     assert not any(image.generation_mode == "reference_group" for image in images)
+
+
+def test_wan_sequence_group_uses_locked_master_when_provider_excludes_it(tmp_path, monkeypatch):
+    _enable_wan(monkeypatch)
+    _, project_id = _prepare_character_project(tmp_path, monkeypatch)
+    fake = FakeWanClient(tmp_path, count=3, sequence_reference_counted=True)
+    monkeypatch.setattr(asset_generation, "client_for_policy", lambda _policy: fake)
+
+    asyncio.run(asset_generation.regenerate_image_asset(
+        project_id,
+        RegenerateImageRequest(
+            asset_type="character", asset_id="hero", view_type="front_half",
+            provider="wan", model="wan2.7-image-pro", resolution="2K",
+        ),
+    ))
+    result = asyncio.run(asset_generation.generate_character_reference_group(project_id, "hero"))
+
+    state = api_context._load_project_state(project_id)
+    images = [image for image in state.character_images.characters if image.character_name == "hero"]
+    assert {image.view_type for image in images} == {"front_half", "front_full", "left_profile", "back_full"}
+    assert {image.group_id for image in images} == {result["group_id"]}
 
 
 def test_wan_character_batch_creation_uses_self_healing_reference_group(tmp_path, monkeypatch):

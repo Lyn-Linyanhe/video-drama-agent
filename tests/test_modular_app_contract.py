@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 from pathlib import Path
+from urllib.parse import quote
 
 import api_server
 
@@ -66,6 +67,33 @@ def test_studio_shell_and_native_modules_are_served():
     audio = client.get("/static/js/components/audio-timeline.js")
     assert audio.status_code == 200
     assert "productionAudioTimelineHtml" in audio.text
+
+
+def test_studio_frontend_resources_are_not_served_from_a_stale_browser_cache():
+    client = TestClient(api_server.app)
+
+    page = client.get("/")
+    assert page.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
+    assert "bootstrap.js?v=20260815-image-preview-repair" in page.text
+
+    module = client.get("/static/js/pages/production-actions.js")
+    assert module.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
+
+
+def test_production_reference_images_are_versioned_for_media_cache_invalidation():
+    source = Path("web/js/pages/production.js").read_text(encoding="utf-8")
+    assert "const versionId = reference.asset_version_id || reference.version_id || '';" in source
+    assert "return mediaUrl(reference.image_path, versionId);" in source
+
+
+def test_generated_media_is_not_served_from_a_stale_browser_cache():
+    files = [path for path in Path("output").rglob("*") if path.is_file()]
+    assert files, "the project must retain its generated output assets"
+    relative = files[0].relative_to(Path("output")).as_posix()
+
+    response = TestClient(api_server.app).get(f"/output/{quote(relative, safe='/')}")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
 
 
 def test_seedance_ui_contract_exposes_current_models_and_reference_decisions():

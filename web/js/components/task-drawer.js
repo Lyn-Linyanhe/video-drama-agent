@@ -93,11 +93,18 @@ function updateJobDrivenControls() {
   if (activeImageEditor) {
     const prefix = `${activeImageEditor.assetId}:`;
     const related = activeProjectJobs(job => (
-      (job.job_type === 'asset.generate' && job.target_type === activeImageEditor.assetType && String(job.target_id).startsWith(prefix))
+      (job.job_type === 'asset.generate' && job.target_type === activeImageEditor.assetType && (
+        String(job.target_id) === activeImageEditor.assetId || String(job.target_id).startsWith(prefix)
+      ) && (activeImageEditor.assetType !== 'scene'
+        || String(job.payload?.state_id || '') === (activeImageEditor.stateId || '')))
       || (activeImageEditor.assetType === 'character' && job.job_type === 'character.reference.group' && job.target_type === 'character' && String(job.target_id) === activeImageEditor.assetId)
+      || (activeImageEditor.assetType === 'scene' && job.job_type === 'scene.reference.group' && job.target_type === 'scene' && String(job.target_id) === activeImageEditor.assetId && String(job.payload?.state_id || '') === (activeImageEditor.stateId || ''))
+      || (activeImageEditor.assetType === 'prop' && job.job_type === 'prop.reference.group' && job.target_type === 'prop' && String(job.target_id) === activeImageEditor.assetId)
       || (activeImageEditor.assetType === 'scene' && job.job_type === 'scene.reference.edit' && job.target_type === 'scene' && String(job.target_id).startsWith(prefix) && String(job.payload?.state_id || '') === (activeImageEditor.stateId || ''))
     ));
-    const current = related.find(job => job.target_id === `${activeImageEditor.assetId}:${activeImageEditor.viewType}`);
+    const current = related.find(job => job.target_id === `${activeImageEditor.assetId}:${activeImageEditor.viewType}`)
+      || related.find(job => job.job_type === 'asset.generate' && String(job.target_id) === activeImageEditor.assetId)
+      || (activeImageEditor.assetType !== 'character' && related.find(job => job.job_type.endsWith('.reference.group')));
     const groupJob = related.find(job => job.job_type === 'character.reference.group');
     const singleButton = document.getElementById('btn-image-regenerate');
     const allButton = document.getElementById('btn-image-generate-all');

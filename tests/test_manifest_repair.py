@@ -7,7 +7,11 @@ from src.schemas.script import (
     VisualAssetManifest,
     VisualCharacterAsset,
 )
-from src.utils.visual_asset_manifest import repair_asset_manifest, validate_asset_manifest
+from src.utils.visual_asset_manifest import (
+    normalize_scene_assets,
+    repair_asset_manifest,
+    validate_asset_manifest,
+)
 
 
 def _manifest_with_single_location(scenes, *, characters=None, props=None):
@@ -194,6 +198,59 @@ def test_repair_manifest_removes_legacy_noun_fragments_from_dynamic_actions():
     for transient in ("摄像头", "电箱", "铁门", "木门"):
         assert transient not in repaired.environment_description
         assert all(transient not in anchor for anchor in repaired.anchor_points)
+
+
+def test_normalize_scene_assets_cleans_dynamic_clauses_from_merged_dressing_and_anchors():
+    """Location merging must not reintroduce shot-only actions from legacy fields."""
+    action = "\u987e\u8861\u6478\u5411\u5899\u8fb9\u7535\u7bb1"
+    static_fixture = "\u5899\u9762\u6c34\u75d5"
+    scene = Scene(
+        scene_id=1,
+        duration_sec=3,
+        location="\u5730\u4e0b\u901a\u9053",
+        characters=["\u987e\u8861"],
+        action_description=action,
+        camera_direction="\u4e2d\u666f",
+        emotion_tone="\u7d27\u5f20",
+    )
+    script = _manifest_with_single_location([scene])
+    location = script.asset_manifest.locations[0]
+    location.environment_description = static_fixture
+    location.fixed_dressing = f"{static_fixture}\uff1b{action}"
+    location.anchor_points = [static_fixture, action]
+
+    normalize_scene_assets(script)
+
+    normalized = script.asset_manifest.locations[0]
+    assert action not in normalized.fixed_dressing
+    assert all(action not in anchor for anchor in normalized.anchor_points)
+    assert static_fixture in normalized.fixed_dressing
+    assert static_fixture in normalized.anchor_points
+
+
+def test_repair_manifest_cleans_dynamic_dressing_and_anchors_when_environment_is_empty():
+    """Repair must clear action-only legacy fields even without inferred environment text."""
+    action = "\u987e\u8861\u8d70\u5165\u623f\u95f4"
+    scene = Scene(
+        scene_id=1,
+        duration_sec=3,
+        location="\u5730\u4e0b\u5ba4",
+        characters=["\u987e\u8861"],
+        action_description=action,
+        camera_direction="\u4e2d\u666f",
+        emotion_tone="\u7d27\u5f20",
+    )
+    script = _manifest_with_single_location([scene])
+    location = script.asset_manifest.locations[0]
+    location.environment_description = ""
+    location.fixed_dressing = action
+    location.anchor_points = [action]
+
+    repair_asset_manifest(script)
+
+    repaired = script.asset_manifest.locations[0]
+    assert repaired.fixed_dressing == ""
+    assert repaired.anchor_points == []
 
 
 def test_repair_manifest_uses_bindings_as_prop_source_of_truth_and_drops_stale_prop():

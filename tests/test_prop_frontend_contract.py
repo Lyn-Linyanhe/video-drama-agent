@@ -27,6 +27,16 @@ def test_prop_reference_group_refreshes_asset_ui_and_task_drawer():
     assert "job.job_type === 'prop.reference.group'" in editor
 
 
+def test_image_editor_job_controls_match_batch_and_single_asset_targets():
+    drawer = Path("web/js/components/task-drawer.js").read_text(encoding="utf-8")
+
+    assert "String(job.target_id) === activeImageEditor.assetId" in drawer
+    assert "String(job.payload?.state_id || '')" in drawer
+    assert "related.find(job => job.job_type === 'asset.generate'" in drawer
+    assert "scene.reference.group" in drawer
+    assert "prop.reference.group" in drawer
+
+
 def test_scene_frontend_cards_and_editor_are_state_aware():
     script = Path("web/js/pages/script.js").read_text(encoding="utf-8")
     cards = Path("web/js/components/asset-cards.js").read_text(encoding="utf-8")

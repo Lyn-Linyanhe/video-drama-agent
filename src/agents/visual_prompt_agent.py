@@ -1,5 +1,6 @@
 """Generate visual design and Chinese video prompts in one LLM call."""
 
+import asyncio
 import random
 import re
 import hashlib
@@ -9,6 +10,8 @@ from src.schemas.prompt import GenerationPrompts, ShotPrompt
 from src.utils.llm import get_llm_client
 from src.utils.visual_asset_manifest import (
     binding_for_scene,
+    character_profile_missing_fields,
+    enrich_character_description,
     location_for_scene,
     on_screen_character_names,
     props_for_scene,
@@ -473,7 +476,7 @@ COMPACT_SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提�
 - shots[].prompt 必须保持空字符串；不要复述角色资产、场景资产、道具资产、画幅或通用技术约束。
 - 差异字段保持短小：subject_state、environment_delta、camera_motion、lighting_delta、prop_state 各不超过 80 个汉字，action_timeline 不超过 180 个汉字，negative_prompt 不超过 100 个汉字；每个字段最多两句。
 - 不得新增剧本或资产清单中不存在的角色、地点、道具或剧情事件。
-- 角色外貌描述必须稳定、具体；每个镜头只描述实际出镜角色，绝不把仅配音角色写入画面。
+- 角色外貌描述必须是可直接交给图片模型的完整稳定锚点，每个实际出镜角色写成约 80-180 个汉字，至少覆盖：性别与年龄段、身高或体型、脸型与肤色、眉眼鼻唇等面部特征、发型与发色、服装款式/主色/材质、配饰和一项可辨识标志。剧本没有明确的外貌字段时，可以依据人物身份、情绪和项目风格补充一套克制且稳定的设计，但不得使用“外貌以剧本为准”“未提供外貌”等占位语，也不得把动作、地点、道具或其他角色的特征写进来。每个镜头只描述实际出镜角色，绝不把仅配音角色写入画面。
 - 动作时间轴需按镜头时长清晰描述；负面约束使用中文短语。
 - 所有字段使用中文，保持同一地点的空间、陈设、时间天气和主光方向连续。
 """
@@ -500,6 +503,8 @@ class VisualPromptAgent:
         creative_profile=None,
         telemetry: dict | None = None,
         progress_callback=None,
+        source_text: str = "",
+        _repair_character_profiles: bool = True,
     ) -> tuple[VisualDesign, GenerationPrompts]:
         """Generate visual design and API prompts from the script.
 
@@ -519,6 +524,8 @@ class VisualPromptAgent:
                 creative_profile=creative_profile,
                 telemetry=telemetry,
                 progress_callback=progress_callback,
+                source_text=source_text,
+                _repair_character_profiles=_repair_character_profiles,
             )
 
         scenes_text = self._format_scenes(script)
@@ -572,6 +579,16 @@ class VisualPromptAgent:
             telemetry=telemetry,
             phase="script.visualize",
         )
+        if _repair_character_profiles and self._registry_needs_profile_repair(
+            output.global_character_descriptions_cn,
+            script,
+        ):
+            repaired_en, repaired_cn = await self.reextract_visible_characters(
+                script,
+                source_text=source_text,
+            )
+            output.global_character_descriptions = repaired_en
+            output.global_character_descriptions_cn = repaired_cn
         return self._split_output(output, script, prompt_overrides, creative_profile)
 
     async def _run_stepwise(
@@ -582,6 +599,8 @@ class VisualPromptAgent:
         creative_profile=None,
         telemetry: dict | None = None,
         progress_callback=None,
+        source_text: str = "",
+        _repair_character_profiles: bool = True,
     ) -> tuple[VisualDesign, GenerationPrompts]:
         """For Kimi, generate one scene per request to reduce provider timeout risk."""
         if telemetry is not None:
@@ -621,6 +640,8 @@ class VisualPromptAgent:
                 prompt_overrides=prompt_overrides,
                 creative_profile=creative_profile,
                 telemetry=call_metrics,
+                source_text=source_text,
+                _repair_character_profiles=False,
             )
 
             if not overall_style:
@@ -654,6 +675,14 @@ class VisualPromptAgent:
                     "output_chars": call_metrics.get("output_chars", 0),
                 })
 
+        if _repair_character_profiles and self._registry_needs_profile_repair(global_cn, script):
+            repaired_en, repaired_cn = await self.reextract_visible_characters(
+                script,
+                source_text=source_text,
+            )
+            global_en.update(repaired_en)
+            global_cn.update(repaired_cn)
+
         script.duration_sec = sum(int(scene.duration_sec or 0) for scene in script.scenes)
         return (
             VisualDesign(
@@ -674,24 +703,151 @@ class VisualPromptAgent:
             ),
         )
 
-    async def reextract_visible_characters(self, script: ScriptBreakdown) -> tuple[dict[str, str], dict[str, str]]:
+    async def reextract_visible_characters(
+        self,
+        script: ScriptBreakdown,
+        *,
+        source_text: str = "",
+    ) -> tuple[dict[str, str], dict[str, str]]:
         """Refresh only visible-role appearance registries without rewriting shot prompts."""
         manifest_text = self._format_manifest(script)
+        scenes_text = self._format_scenes(script)
+        source_section = (
+            f"\n\n用户确认的完整剧本文本：\n{_compact_visual_text(source_text, 16000)}"
+            if str(source_text or "").strip()
+            else ""
+        )
         user_prompt = f"""请仅重新提取以下短剧中实际出镜角色的形象设定，不要修改分镜、地点、视频提示词或任何剧情。
 
 视觉资产清单：
 {manifest_text}
 
-只输出 appearance_mode=on_screen 的角色。global_character_descriptions 用英文，global_character_descriptions_cn 用中文；两张表必须使用资产清单中的规范角色名作为 key。每个描述必须包含稳定外貌、发型、体型、服装颜色和材质、标志特征，供角色图和视频参考图一致使用。"""
-        output = await self.llm.generate_structured(
-            system_prompt="你是影视角色设定师。只输出结构化角色外貌表，不得新增角色。",
-            user_prompt=user_prompt,
-            output_schema=_CharacterRegistryOutput,
-            temperature=0.35,
+结构化镜头：
+{scenes_text}{source_section}
+
+只输出 appearance_mode=on_screen 的角色。优先填写 characters 列表，每项必须包含资产清单中的 asset_id、规范角色名 name、英文 description_en 和中文 description_cn；旧版 global_character_descriptions 与 global_character_descriptions_cn 字典仅用于兼容。
+每个中文人物侧写必须写成 80-180 个汉字，并完整覆盖：性别与年龄段、身高或体型、脸型与肤色、眉眼鼻唇等五官、发型与发色、服装款式/主色/材质、配饰和至少一项可辨识标志。
+剧本未明确的外貌槽位可以依据人物身份、性格和项目风格做克制、稳定的视觉设计，但不得使用“未提供外貌”“以剧本为准”等占位语；不得写入动作、地点、剧情状态、手持道具或其他角色特征。"""
+        system_prompt = (
+            "你是影视角色设定师。只输出结构化角色外貌表，不得新增角色。"
+            "人物侧写是后续角色母版、分镜参考图和视频一致性的权威身份档案，必须具体、完整、可视化。"
         )
-        return (
-            self._canonical_character_registry(output.global_character_descriptions, script, english=True),
-            self._canonical_character_registry(output.global_character_descriptions_cn, script, english=False),
+
+        async def request_profiles(prompt: str):
+            return await self.llm.generate_structured(
+                system_prompt=system_prompt,
+                user_prompt=prompt,
+                output_schema=_CharacterRegistryOutput,
+                temperature=0.35,
+                phase="character.reextract",
+            )
+
+        def canonicalize(output: "_CharacterRegistryOutput") -> tuple[dict[str, str], dict[str, str]]:
+            english_values = dict(output.global_character_descriptions or {})
+            chinese_values = dict(output.global_character_descriptions_cn or {})
+            for item in output.characters or []:
+                key = str(item.asset_id or item.name or "").strip()
+                if not key:
+                    continue
+                if str(item.description_en or "").strip():
+                    english_values[key] = item.description_en.strip()
+                if str(item.description_cn or "").strip():
+                    chinese_values[key] = item.description_cn.strip()
+            return (
+                self._canonical_character_registry(english_values, script, english=True),
+                self._canonical_character_registry(chinese_values, script, english=False),
+            )
+
+        def validation_errors(chinese: dict[str, str]) -> dict[str, list[str]]:
+            manifest = script.asset_manifest
+            if not manifest:
+                return {}
+            return {
+                character.name: character_profile_missing_fields(chinese.get(character.name, ""))
+                for character in manifest.characters
+                if character.appearance_mode == "on_screen"
+                and character_profile_missing_fields(chinese.get(character.name, ""))
+            }
+
+        output = await request_profiles(user_prompt)
+        english, chinese = canonicalize(output)
+        errors = validation_errors(chinese)
+        if errors:
+            visible_characters = {
+                character.name: character
+                for character in (script.asset_manifest.characters if script.asset_manifest else [])
+                if character.appearance_mode == "on_screen"
+            }
+            semaphore = asyncio.Semaphore(2)
+
+            async def repair_one(name: str, fields: list[str]):
+                character = visible_characters[name]
+                relevant_script = script.model_copy(deep=True)
+                relevant_script.scenes = [
+                    scene.model_copy(deep=True)
+                    for scene in script.scenes
+                    if name in (scene.characters or []) or name in str(scene.action_description or "")
+                ]
+                relevant_scenes = self._format_scenes(relevant_script)
+                prompt = f"""上一次输出不合格，请只补全以下一个实际出镜角色的人物侧写。
+
+asset_id: {character.asset_id}
+name: {character.name}
+当前侧写: {chinese.get(name, '') or character.description}
+缺失项: {'、'.join(fields)}
+
+与该角色有关的结构化镜头：
+{relevant_scenes}
+
+用户确认剧本文本：
+{_compact_visual_text(source_text, 6000)}
+
+description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身高或体型、脸型与肤色、眉眼鼻唇、发型与发色、服装款式/主色/材质、配饰和可辨识标志。
+保留当前侧写与剧本中已经明确的事实；缺失槽位可做克制、稳定的视觉设计。不得写动作、地点、剧情状态、手持道具或其他角色特征。"""
+                async with semaphore:
+                    result = await self.llm.generate_structured(
+                        system_prompt=system_prompt,
+                        user_prompt=prompt,
+                        output_schema=_CharacterRegistryOutput,
+                        temperature=0.3,
+                        phase="character.reextract.single",
+                    )
+                repaired_english, repaired_chinese = canonicalize(result)
+                return (
+                    name,
+                    repaired_english.get(name, ""),
+                    repaired_chinese.get(name, ""),
+                )
+
+            repaired_entries = await asyncio.gather(*(
+                repair_one(name, fields)
+                for name, fields in errors.items()
+            ))
+            for name, english_description, chinese_description in repaired_entries:
+                english[name] = english_description
+                chinese[name] = chinese_description
+            errors = validation_errors(chinese)
+        if errors:
+            error_text = "；".join(
+                f"{name}缺少{'、'.join(fields)}"
+                for name, fields in errors.items()
+            )
+            raise ValueError(f"人物侧写不完整：{error_text}")
+        return english, chinese
+
+    def _registry_needs_profile_repair(
+        self,
+        registry: dict[str, str],
+        script: ScriptBreakdown,
+    ) -> bool:
+        manifest = script.asset_manifest
+        if not manifest:
+            return False
+        canonical = self._canonical_character_registry(registry or {}, script, english=False)
+        return any(
+            character_profile_missing_fields(canonical.get(character.name, ""))
+            for character in manifest.characters
+            if character.appearance_mode == "on_screen"
         )
 
     def _format_scenes(self, script: ScriptBreakdown) -> str:
@@ -891,7 +1047,9 @@ class VisualPromptAgent:
         style = get_visual_style(style_id)
         style_layer = style["prompt_layers"]["shot"]
         modifier_text = "、".join(modifiers)
-        style_block = f"【视觉媒介】{style['name']}（{style_id}）：{style_layer}"
+        # Keep the stable style id in project state, but do not expose the
+        # internal registry key in user/provider-facing Chinese prompts.
+        style_block = f"【视觉媒介】{style['name']}：{style_layer}"
         if modifier_text:
             style_block += f" 补充标签：{modifier_text}。"
         location = location_for_scene(script, scene.scene_id)
@@ -956,7 +1114,10 @@ class VisualPromptAgent:
         for character in manifest.characters:
             if character.appearance_mode != "on_screen":
                 continue
-            identities = {self._character_identity(character.name)}
+            identities = {
+                self._character_identity(character.name),
+                self._character_identity(character.asset_id),
+            }
             identities.update(self._character_identity(alias) for alias in character.aliases)
             description = next(
                 (value for key, value in entries if self._character_identity(key) in identities and value.strip()),
@@ -967,6 +1128,12 @@ class VisualPromptAgent:
                     description = character.description or f"{character.name}, visible on-screen character; keep appearance consistent with the script."
                 else:
                     description = character.description or f"{character.name}，实际出镜角色；外观以剧本设定为准，并保持镜头间一致。"
+            if not english:
+                description = enrich_character_description(
+                    character.name,
+                    description,
+                    script.scenes,
+                )
             canonical[character.name] = description
         return canonical
 
@@ -1056,6 +1223,14 @@ class _CompactVisualPromptOutput(BaseModel):
     shots: list[_CompactShotVisualPrompt] = Field(description="One compact delta record per scene")
 
 
+class _CharacterProfileEntry(BaseModel):
+    asset_id: str = Field(description="Stable character asset ID from the manifest")
+    name: str = Field(description="Canonical character name from the manifest")
+    description_en: str = Field(description="Complete stable appearance profile in English")
+    description_cn: str = Field(description="80-180 Chinese characters covering all stable appearance fields")
+
+
 class _CharacterRegistryOutput(BaseModel):
+    characters: list[_CharacterProfileEntry] = Field(default_factory=list)
     global_character_descriptions: dict[str, str] = Field(default_factory=dict)
     global_character_descriptions_cn: dict[str, str] = Field(default_factory=dict)

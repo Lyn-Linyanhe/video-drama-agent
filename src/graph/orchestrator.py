@@ -52,6 +52,9 @@ def build_drama_graph(
             scene_images=state.scene_images,
             prompt_overrides=state.prompt_overrides,
             creative_profile=state.creative_profile,
+            source_text=state.script_draft_text or (
+                state.user_input if state.input_mode == "script" else ""
+            ),
         )
         state.log(f"   风格: {visual.overall_style} | 色调: {visual.color_palette}")
         state.log(f"   目标 API: {prompts.api_provider} | {len(prompts.shots)} 个镜头 prompt")
@@ -270,6 +273,9 @@ def create_stage1_graph(script_agent, visual_prompt_agent):
         visual, prompts = await visual_prompt_agent.run(
             state.script,
             prompt_overrides=state.prompt_overrides,
+            source_text=state.script_draft_text or (
+                state.user_input if state.input_mode == "script" else ""
+            ),
         )
         state.log(f"   风格: {visual.overall_style} | {len(prompts.shots)} 个镜头 prompt")
         return {"visual_design": visual, "generation_prompts": prompts}

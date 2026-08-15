@@ -249,8 +249,8 @@ def test_group_prompt_uses_layered_views_in_required_order():
     prompt, count = build_scene_group_prompt(_state(), "loc_room", state_id="rain")
 
     assert count == 3
-    assert "Reference lock" in prompt
-    assert "Lock one reusable location: same complete room or building envelope" in prompt
+    assert "参考锁定" in prompt
+    assert "锁定一个可复用地点：保持相同的完整房间或建筑外壳" in prompt
     assert "地点身份：旧客厅" in prompt
     assert "场景状态：雨夜" in prompt
     assert "空间尺度锁" in prompt

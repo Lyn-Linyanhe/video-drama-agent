@@ -11,7 +11,9 @@ import src.config as config
 from src.api import context as api_context
 from src.api.context import (
     _build_video_generation_snapshot,
+    _production_payload,
     ProductionReferenceRequest,
+    ProductionShotUpdateRequest,
     _reconcile_shot_references,
     _reference_catalog,
     _state_from_json,
@@ -19,6 +21,7 @@ from src.api.context import (
     _sync_active_shot_asset,
 )
 from src.api.routes.production import _schedule_shot_video_job
+from src.api.routes import production as production_routes
 from src.graph.state import DramaState
 from src.agents.video_gen_agent import VideoGenerationAgent
 from src.schemas.character import CharacterImage, CharacterImageAssets
@@ -125,6 +128,483 @@ def test_production_reference_request_accepts_manual_source():
     assert reference.source == "manual"
 
 
+def test_production_reference_request_accepts_explicit_mention_token():
+    reference = ProductionReferenceRequest(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        token="@Hero-front-full",
+        version_id="hero-v2",
+    )
+
+    assert reference.source == "explicit"
+    assert reference.token == "@Hero-front-full"
+    assert reference.version_id == "hero-v2"
+
+
+def test_reference_label_parser_preserves_hyphenated_and_chinese_tokens():
+    assert VideoGenerationAgent._reference_tag_from_label(
+        "@Hero-front-full -> character: Hero (front_full)"
+    ) == "@Hero-front-full"
+    assert VideoGenerationAgent._reference_tag_from_label(
+        "@角色:正面 -> character: 角色 (front)"
+    ) == "@角色:正面"
+    assert VideoGenerationAgent._reference_tag_from_label("character: Hero") == ""
+
+
+def test_explicit_reference_token_must_exist_in_prompt():
+    with pytest.raises(HTTPException, match="必须出现在分镜提示词"):
+        production_routes._validate_explicit_reference_token(
+            "镜头中没有资产标记。",
+            "@Hero-front-full",
+        )
+
+
+def test_prompt_revision_protects_and_restores_explicit_mentions():
+    references = [
+        ShotReference(
+            reference_id="character|Hero|front_full",
+            source="explicit",
+            reference_token="@Hero-front-full",
+            asset_type="character",
+            asset_id="Hero",
+            view_type="front_full",
+            image_path="hero.png",
+        )
+    ]
+
+    protected, placeholders = production_routes._protect_explicit_mentions(
+        "镜头保持 @Hero-front-full 的外貌。",
+        references,
+    )
+    restored = production_routes._restore_explicit_mentions(
+        protected.replace("MENTION_1", "MENTION_1"),
+        placeholders,
+    )
+
+    assert "@Hero-front-full" not in protected
+    assert "@Hero-front-full" in restored
+
+
+def test_prompt_revision_rejects_output_that_drops_explicit_mention():
+    references = [
+        ShotReference(
+            reference_id="character|Hero|front_full",
+            source="explicit",
+            reference_token="@Hero-front-full",
+            asset_type="character",
+            asset_id="Hero",
+            view_type="front_full",
+            image_path="hero.png",
+        )
+    ]
+
+    protected, placeholders = production_routes._protect_explicit_mentions(
+        "@Hero-front-full 等待。",
+        references,
+    )
+
+    with pytest.raises(ValueError, match="显式引用"):
+        production_routes._restore_explicit_mentions("只剩普通文本", placeholders)
+
+
+def test_prompt_revision_accepts_llm_output_that_keeps_literal_token():
+    _, placeholders = production_routes._protect_explicit_mentions(
+        "@Hero-front-full 等待。",
+        [ShotReference(reference_id="x", source="explicit", reference_token="@Hero-front-full", asset_type="character", asset_id="Hero", view_type="front_full", image_path="hero.png")],
+    )
+
+    restored = production_routes._restore_explicit_mentions("@Hero-front-full 继续等待。", placeholders)
+
+    assert restored == "@Hero-front-full 继续等待。"
+
+
+def test_explicit_reference_token_is_persisted_on_shot_reference():
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        reference_token="@Hero-front-full",
+        explicit_base_source="manual",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        image_path="hero.png",
+    )
+
+    restored = ShotReference.model_validate(reference.model_dump())
+
+    assert restored.reference_token == "@Hero-front-full"
+    assert restored.explicit_base_source == "manual"
+
+
+def test_explicit_reference_survives_reconcile_and_state_round_trip(tmp_path, monkeypatch):
+    image_path = tmp_path / "hero-v2.png"
+    image_path.write_bytes(b"image")
+    state = _state()
+    explicit = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        reference_token="@Hero-front-full",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        asset_version_id="hero-v2",
+        image_path=str(image_path),
+    )
+    state.shot_productions[1] = ShotProductionState(scene_id=1, references=[explicit])
+
+    monkeypatch.setattr(api_context, "_default_shot_references", lambda *_: [])
+
+    reconciled = _reconcile_shot_references(state, 1)
+    restored = _state_from_json(_state_to_json(state))
+
+    assert reconciled[0].source == "explicit"
+    assert reconciled[0].reference_token == "@Hero-front-full"
+    assert reconciled[0].asset_version_id == "hero-v2"
+    assert restored.shot_productions[1].references[0].source == "explicit"
+
+
+def test_generation_snapshot_rejects_missing_explicit_reference(tmp_path, monkeypatch):
+    state = _state()
+    explicit = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        reference_token="@Hero-front-full",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        asset_version_id="hero-deleted",
+        image_path=str(tmp_path / "deleted.png"),
+    )
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: [explicit])
+
+    with pytest.raises(ValueError, match="显式引用.*不可用"):
+        _build_video_generation_snapshot(
+            state,
+            1,
+            {"provider": "mock", "model": "mock-video", "resolution": "720p"},
+        )
+
+
+def test_generation_snapshot_rejects_dropped_explicit_reference(tmp_path, monkeypatch):
+    state = _state()
+    first = tmp_path / "scene.png"
+    second = tmp_path / "hero.png"
+    first.write_bytes(b"image")
+    second.write_bytes(b"image")
+    references = [
+        ShotReference(
+            reference_id="scene|room|wide",
+            source="asset",
+            asset_type="scene",
+            asset_id="room",
+            view_type="wide",
+            image_path=str(first),
+        ),
+        ShotReference(
+            reference_id="character|Hero|front_full",
+            source="explicit",
+            reference_token="@Hero-front-full",
+            asset_type="character",
+            asset_id="Hero",
+            view_type="front_full",
+            image_path=str(second),
+        ),
+    ]
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: references)
+
+    snapshot = _build_video_generation_snapshot(
+        state,
+        1,
+        {
+            "provider": "mock",
+            "model": "mock-single-reference",
+            "resolution": "720p",
+            "capability": {"image_to_video": True, "multi_reference": False, "max_reference_images": 1},
+        },
+    )
+
+    assert [item["image_path"] for item in snapshot["references"]] == [str(second)]
+    assert snapshot["references"][0]["source"] == "explicit"
+
+
+def test_generation_snapshot_rejects_explicit_reference_for_text_only_model(tmp_path, monkeypatch):
+    state = _state()
+    image_path = tmp_path / "hero.png"
+    image_path.write_bytes(b"image")
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        reference_token="@Hero-front-full",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        image_path=str(image_path),
+    )
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: [reference])
+
+    with pytest.raises(ValueError, match="显式引用.*不支持参考图"):
+        _build_video_generation_snapshot(
+            state,
+            1,
+            {
+                "provider": "mock",
+                "model": "mock-text-only",
+                "resolution": "720p",
+                "capability": {"image_to_video": False, "multi_reference": False, "max_reference_images": 0},
+            },
+        )
+
+
+def test_generation_snapshot_rejects_explicit_reference_missing_from_seedance_plan(tmp_path, monkeypatch):
+    state = _state()
+    image_path = tmp_path / "hero.png"
+    image_path.write_bytes(b"image")
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        reference_token="@Hero-front-full",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        image_path=str(image_path),
+    )
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: [reference])
+    policy = {
+        "provider": "seedance",
+        "model": "doubao-seedance-2-0-fast-260128",
+        "resolution": "720p",
+        "capability": {"image_to_video": True, "multi_reference": True, "max_reference_images": 9},
+    }
+    fake_agent = SimpleNamespace(
+        api_client=SimpleNamespace(plan_reference_inputs=lambda *_args, **_kwargs: {"items": [], "dropped_references": []}),
+    )
+    import src.services.video_capabilities as video_capabilities
+    monkeypatch.setattr(video_capabilities, "video_agent_for_policy", lambda _policy: fake_agent)
+
+    with pytest.raises(ValueError, match="显式引用.*未被供应商接受"):
+        _build_video_generation_snapshot(state, 1, policy)
+
+
+def test_generation_snapshot_rejects_explicit_reference_when_limit_is_zero(tmp_path, monkeypatch):
+    state = _state()
+    image_path = tmp_path / "hero.png"
+    image_path.write_bytes(b"image")
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        reference_token="@Hero-front-full",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        image_path=str(image_path),
+    )
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: [reference])
+
+    with pytest.raises(ValueError, match="显式引用.*模型限制"):
+        _build_video_generation_snapshot(
+            state,
+            1,
+            {
+                "provider": "mock",
+                "model": "mock-zero-reference",
+                "resolution": "720p",
+                "capability": {"image_to_video": True, "multi_reference": False, "max_reference_images": 0},
+            },
+        )
+
+
+def test_generation_snapshot_prioritizes_explicit_reference_over_automatic_reference(tmp_path, monkeypatch):
+    state = _state()
+    automatic_path = tmp_path / "scene.png"
+    explicit_path = tmp_path / "hero.png"
+    automatic_path.write_bytes(b"image")
+    explicit_path.write_bytes(b"image")
+    references = [
+        ShotReference(
+            reference_id="scene|room|wide",
+            source="asset",
+            asset_type="scene",
+            asset_id="room",
+            view_type="wide",
+            image_path=str(automatic_path),
+        ),
+        ShotReference(
+            reference_id="character|Hero|front_full",
+            source="explicit",
+            reference_token="@Hero-front-full",
+            asset_type="character",
+            asset_id="Hero",
+            view_type="front_full",
+            image_path=str(explicit_path),
+        ),
+    ]
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: references)
+
+    snapshot = _build_video_generation_snapshot(
+        state,
+        1,
+        {
+            "provider": "mock",
+            "model": "mock-single-reference",
+            "resolution": "720p",
+            "capability": {"image_to_video": True, "multi_reference": False, "max_reference_images": 1},
+        },
+    )
+
+    assert [item["image_path"] for item in snapshot["references"]] == [str(explicit_path)]
+    assert snapshot["references"][0]["source"] == "explicit"
+
+
+def test_explicit_reference_rebinds_to_locked_history_path(tmp_path, monkeypatch):
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(scene_id=1, references=[
+        ShotReference(
+            reference_id="character|Hero|front_full",
+            source="explicit",
+            reference_token="@Hero-front-full",
+            asset_type="character",
+            asset_id="Hero",
+            view_type="front_full",
+            asset_version_id="hero-v1",
+            image_path=str(tmp_path / "active.png"),
+        )
+    ])
+    history_path = tmp_path / "assets" / "characters" / "Hero" / "history" / "hero-v1.png"
+    history_path.parent.mkdir(parents=True)
+    history_path.write_bytes(b"image")
+    manifest = tmp_path / "assets" / "asset_manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"versions": {
+        "character:Hero:front_full": [{"id": "hero-v1", "path": str(history_path), "active": False}]
+    }}), encoding="utf-8")
+    monkeypatch.setattr(api_context.project_store, "get_project_dir", lambda _project_id: tmp_path)
+    monkeypatch.setattr(api_context, "_default_shot_references", lambda *_: [])
+
+    references = _reconcile_shot_references(state, 1)
+
+    assert references[0].image_path == str(history_path)
+    assert references[0].stale is False
+
+
+@pytest.mark.asyncio
+async def test_single_shot_generation_converts_explicit_reference_failure_to_conflict(monkeypatch):
+    state = _state()
+    production = ShotProductionState(scene_id=1)
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_shot_prompt", lambda _state, _scene_id: state.generation_prompts.shots[0])
+    async def prepare(_state):
+        return None
+    monkeypatch.setattr(production_routes, "_prepare_auto_references", prepare)
+    monkeypatch.setattr(production_routes, "_ensure_shot_production", lambda _state, _scene_id: production)
+    monkeypatch.setattr(production_routes, "normalize_video_policy", lambda *_args, **_kwargs: {
+        "provider": "mock", "model": "mock", "resolution": "720p", "capability": {"continuity": False},
+    })
+    monkeypatch.setattr(production_routes.job_store, "list_jobs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        production_routes,
+        "_build_video_generation_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("显式引用不可用：@Hero-front-full")),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await production_routes.generate_project_production_shot(state.project_id, 1)
+
+    assert error.value.status_code == 409
+    assert "显式引用不可用" in str(error.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_saving_with_a_stale_explicit_reference_does_not_report_unknown_asset(tmp_path, monkeypatch):
+    """A missing locked file must remain editable so the user can remove it."""
+    state = _state()
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="explicit",
+        reference_token="@Hero-front-full",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        image_path=str(tmp_path / "deleted.png"),
+        stale=True,
+    )
+    production = ShotProductionState(scene_id=1, references=[reference])
+    state.shot_productions[1] = production
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_ensure_shot_production", lambda *_args: production)
+    monkeypatch.setattr(
+        production_routes,
+        "_reference_catalog",
+        lambda _state: {"by_id": {}, "characters": [], "scenes": [], "props": [], "auto_reference_ids": set()},
+    )
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production_routes, "_production_payload", lambda _state: {"ok": True})
+
+    result = await production_routes.update_project_production_shot(
+        state.project_id,
+        1,
+        ProductionShotUpdateRequest(
+            prompt="Hero waits. @Hero-front-full",
+            references=[ProductionReferenceRequest(
+                reference_id=reference.reference_id,
+                source="explicit",
+                token=reference.reference_token,
+            )],
+        ),
+    )
+
+    assert result == {"ok": True}
+    assert production.references[0].stale is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_history_reference_must_stay_inside_project_asset_root(tmp_path, monkeypatch):
+    state = _state()
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="asset",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        image_path=str(tmp_path / "active.png"),
+    )
+    production = ShotProductionState(scene_id=1, references=[reference])
+    state.shot_productions[1] = production
+    outside_path = tmp_path / "outside.png"
+    outside_path.write_bytes(b"image")
+    project_dir = tmp_path / "project"
+    manifest_path = project_dir / "assets" / "asset_manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps({"versions": {
+        "character:Hero:front_full": [{"id": "hero-v1", "path": str(outside_path)}],
+    }}), encoding="utf-8")
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_ensure_shot_production", lambda *_args: production)
+    monkeypatch.setattr(
+        production_routes,
+        "_reference_catalog",
+        lambda _state: {
+            "by_id": {reference.reference_id: reference},
+            "characters": [], "scenes": [], "props": [], "auto_reference_ids": set(),
+        },
+    )
+    monkeypatch.setattr(production_routes.project_store, "get_project_dir", lambda _project_id: project_dir)
+
+    with pytest.raises(HTTPException, match="显式引用版本不可用"):
+        await production_routes.update_project_production_shot(
+            state.project_id,
+            1,
+            ProductionShotUpdateRequest(
+                prompt="Hero waits. @Hero-front-full",
+                references=[ProductionReferenceRequest(
+                    reference_id=reference.reference_id,
+                    source="explicit",
+                    token="@Hero-front-full",
+                    version_id="hero-v1",
+                )],
+            ),
+        )
+
+
 def test_active_video_version_remains_compatible_with_generated_assets():
     state = _state()
     state.shot_productions[1] = ShotProductionState(
@@ -155,6 +635,26 @@ def test_explicit_reference_labels_preserve_manual_reference_order_in_prompt():
     assert "Hero front view" in rendered
     assert "rainy street wide view" in rendered
     assert rendered.index("Hero front view") < rendered.index("rainy street wide view")
+
+
+def test_multi_reference_provider_prompt_is_not_rebound_before_submission():
+    prompt = ShotPrompt(scene_id=1, prompt="Hero waits.", duration_sec=5)
+    agent = VideoGenerationAgent()
+    labels = ["@character:Hero:front_full -> @ref01_character_front_full = character: Hero"]
+
+    rendered = agent._build_multi_reference_prompt(
+        prompt,
+        ["character.png"],
+        reference_labels=labels,
+    )
+
+    assert "[Reference binding]" in rendered
+    assert agent._finalize_provider_prompt(
+        rendered,
+        prompt,
+        ["character.png"],
+        labels,
+    ) == rendered
 
 
 def test_reference_catalog_accepts_legacy_scene_reference_ids(tmp_path):
@@ -444,12 +944,134 @@ def test_generation_snapshot_freezes_current_scene_prompt_and_reference(tmp_path
     state.generation_prompts.shots[0].prompt = "later draft"
 
     assert snapshot["scene_id"] == 1
-    assert snapshot["raw_prompt"] == "Hero waits."
-    assert "Hero waits." in snapshot["provider_prompt"]
+    assert snapshot["raw_prompt"] == "@character:Hero:front_full waits."
+    assert "@character:Hero:front_full waits." in snapshot["provider_prompt"]
     assert "参考图1" in snapshot["provider_prompt"]
     expected_reference = reference.model_dump()
     expected_reference["reference_tag"] = "@ref01_character_front_full"
+    expected_reference["inline_token"] = "@character:Hero:front_full"
     assert snapshot["references"] == [expected_reference]
+
+
+def test_production_payload_inlines_automatic_asset_mentions_into_prompt(monkeypatch):
+    """The editable prompt must show where generated image assets constrain the text."""
+    state = _state()
+    state.generation_prompts.shots[0].prompt = "Hero opens the letter in the room."
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        references=[
+            ShotReference(
+                reference_id="scene|room|wide",
+                source="asset",
+                asset_type="scene",
+                asset_id="room",
+                view_type="wide",
+                image_path="room.png",
+                label="room wide",
+            ),
+            ShotReference(
+                reference_id="character|Hero|front_full",
+                source="asset",
+                asset_type="character",
+                asset_id="Hero",
+                view_type="front_full",
+                image_path="hero.png",
+                label="Hero front_full",
+            ),
+            ShotReference(
+                reference_id="prop|letter|front",
+                source="asset",
+                asset_type="prop",
+                asset_id="letter",
+                view_type="front",
+                image_path="letter.png",
+                label="Prop letter",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        api_context,
+        "_reconcile_shot_references",
+        lambda state, scene_id: state.shot_productions[scene_id].references,
+    )
+
+    payload = _production_payload(state)
+    prompt = payload["productions"][0]["prompt"]["prompt"]
+
+    assert "本镜场景设定在：@scene:room:wide" in prompt
+    assert "@character:Hero:front_full opens" in prompt
+    assert "@prop:letter:front" in prompt
+
+
+def test_generation_snapshot_deduplicates_one_asset_mentioned_multiple_times(tmp_path, monkeypatch):
+    """Repeated inline mentions of one image occupy one provider reference slot."""
+    state = _state()
+    image_path = tmp_path / "hero.png"
+    image_path.write_bytes(b"image")
+    state.generation_prompts.shots[0].prompt = "Hero turns. Hero speaks."
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="asset",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        asset_version_id="hero-v2",
+        image_path=str(image_path),
+        label="Hero front_full",
+    )
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: [reference, reference.model_copy(deep=True)])
+
+    snapshot = _build_video_generation_snapshot(
+        state,
+        1,
+        {
+            "provider": "mock",
+            "model": "mock-multi-reference",
+            "resolution": "720p",
+            "capability": {"image_to_video": True, "multi_reference": True, "max_reference_images": 9},
+        },
+    )
+
+    assert snapshot["raw_prompt"].count("@character:Hero:front_full") == 2
+    assert [item["image_path"] for item in snapshot["references"]] == [str(image_path)]
+    assert len(snapshot["accepted_references"]) == 1
+
+
+def test_generation_snapshot_uses_one_primary_character_view_for_inline_mentions(tmp_path, monkeypatch):
+    """Multiple identity views stay available to the provider without nesting @ tokens."""
+    state = _state()
+    state.generation_prompts.shots[0].prompt = "苏眠站在屋檐下。苏眠抬头看向远方。"
+    references = []
+    for view_type in ("back_full", "left_profile", "front_full", "front_half"):
+        image_path = tmp_path / f"sumian-{view_type}.png"
+        image_path.write_bytes(b"image")
+        references.append(ShotReference(
+            reference_id=f"character|苏眠|{view_type}",
+            source="asset",
+            asset_type="character",
+            asset_id="苏眠",
+            view_type=view_type,
+            asset_version_id=f"sumian-{view_type}-v1",
+            image_path=str(image_path),
+            label=f"苏眠 {view_type}",
+        ))
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: references)
+
+    snapshot = _build_video_generation_snapshot(
+        state,
+        1,
+        {
+            "provider": "mock",
+            "model": "mock-multi-reference",
+            "resolution": "720p",
+            "capability": {"image_to_video": True, "multi_reference": True, "max_reference_images": 9},
+        },
+    )
+
+    assert snapshot["raw_prompt"].count("@character:苏眠:front_half") == 2
+    assert "@character:@character" not in snapshot["raw_prompt"]
+    assert "@character:苏眠:back_full" not in snapshot["raw_prompt"]
+    assert len(snapshot["references"]) == 4
 
 
 def test_generation_snapshot_places_continuity_tail_frame_before_asset_references(tmp_path, monkeypatch):
@@ -525,8 +1147,8 @@ def test_multi_reference_prompt_emphasizes_continuity_and_view_consistency():
 
     assert "[Reference hierarchy]" in rendered
     assert "Use character references only to lock identity" in rendered
-    assert "[Single-take rule]" in rendered
-    assert "no shot-reverse-shot" in rendered
+    assert "【单镜头连续拍摄规则】" in rendered
+    assert "正反打" in rendered
     assert "上一镜尾帧" in rendered
     assert "正面、侧面和背面" in rendered
     assert "人物转身" in rendered
@@ -547,9 +1169,9 @@ def test_multi_reference_prompt_respects_explicit_timed_edit_plan():
         ],
     )
 
-    assert "[Planned edit rule]" in rendered
-    assert "Cuts are allowed only where the prompt explicitly specifies" in rendered
-    assert "[Single-take rule]" not in rendered
+    assert "【计划剪辑规则】" in rendered
+    assert "只允许在提示词明确写出时长" in rendered
+    assert "【单镜头连续拍摄规则】" not in rendered
 
 
 def test_reference_identity_bundle_preserves_assets_that_share_a_path(tmp_path):

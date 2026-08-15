@@ -12,7 +12,7 @@ from typing import Any
 
 # Bump this whenever the canonical scene identity/state/view contract changes.
 # Existing versions remain readable, while newly generated assets are auditable.
-SCENE_PROMPT_TEMPLATE_VERSION = 9
+SCENE_PROMPT_TEMPLATE_VERSION = 10
 PROP_PROMPT_TEMPLATE_VERSION = 3
 
 
@@ -318,9 +318,8 @@ def _provider_payloads(
 
 def _reference_lock(asset_type: str, art_style: str = "") -> str:
     common = (
-        "Reference lock: this image will be reused as a strict video reference. "
-        "Prioritize stable identity over dramatic composition. "
-        "Do not invent alternate versions, extra subjects, text, logos, labels, frames, panels or UI."
+        "参考锁定：本图将作为严格的视频参考素材重复使用。优先保持身份和结构稳定，不追求夸张构图。"
+        "不得擅自生成替代版本、额外主体、文字、标识、标签、边框、分屏或 UI 元素。"
     )
     if asset_type == "character":
         from src.agents.image_gen_agent import is_anime_art_style
@@ -328,25 +327,25 @@ def _reference_lock(asset_type: str, art_style: str = "") -> str:
         if is_anime_art_style(art_style):
             return (
                 common
-                + " Lock one animation character identity: same face design, age impression, hairline, hairstyle, "
-                "body proportion, costume silhouette, fabric colors, shoes and distinctive marks, with the same line-art and coloring language."
+                + "锁定一个动漫角色身份：保持相同脸型设计、年龄感、发际线、发型、人体比例、服装轮廓、"
+                "面料颜色、鞋子和辨识性特征，并保持相同线稿与上色语言。"
             )
         return (
             common
-            + " Lock one real actor identity: same face geometry, age impression, hairline, hairstyle, "
-            "body proportion, costume silhouette, fabric texture, colors, shoes and distinctive marks."
+            + "锁定一个真人演员身份：保持相同脸部几何、年龄感、发际线、发型、人体比例、服装轮廓、"
+            "面料纹理、颜色、鞋子和辨识性特征。"
         )
     if asset_type == "scene":
         return (
             common
-            + " Lock one reusable location: same complete room or building envelope, same floor plan, camera axis, "
-            "doors, windows, furniture, anchor objects, materials, weather, time of day, main light direction and color palette. "
-            "Never shrink the location into a booth, kiosk, phone booth, box, or cropped doorway. Empty set only."
+            + "锁定一个可复用地点：保持相同的完整房间或建筑外壳、平面布局、镜头轴线、门窗、家具、"
+            "锚点物件、材质、天气、时间段、主光方向和色彩方案。不得将地点缩成柜台、小亭、电话亭、盒子或裁切的门口；"
+            "只能生成空场景。"
         )
     return (
         common
-        + " Lock one reusable prop: same silhouette, scale, material, color, wear marks, movable parts and visible state. "
-        "Single object only, centered and fully visible."
+        + "锁定一个可复用道具：保持相同轮廓、尺寸、材质、颜色、磨损痕迹、可动部件和可见状态。"
+        "只能出现单件道具，主体居中且完整可见。"
     )
 
 
@@ -422,13 +421,61 @@ def _scene_location_context(state: Any, location_id: str, state_id: str = ""):
     return location_asset, location_state, scene, resolved_state_id
 
 
-def _non_action_environment(location_asset: Any, scene: Any) -> str:
-    """Return reusable environment text, excluding a copied shot action."""
+def _location_reference_text(value: Any, scenes: list[Any]) -> str:
+    """Return reusable location text without transient shot facts.
+
+    Loading a project repairs the persisted manifest, but prompt composition is
+    also a boundary for legacy callers that construct a state in memory or
+    carry an older manifest snapshot. Reuse the canonical manifest cleaner here
+    so stale actions cannot reach an image provider even before a reload.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    from src.utils.visual_asset_manifest import (
+        TRANSIENT_ENVIRONMENT_TERMS,
+        _clean_environment_description,
+        _has_voice_or_action_cue,
+    )
+
+    has_dynamic_cue = _has_voice_or_action_cue(text)
+    has_transient_term = any(
+        term and term.casefold() in text.casefold()
+        for term in TRANSIENT_ENVIRONMENT_TERMS
+    )
+    cleaned = _clean_environment_description(text, scenes)
+    if cleaned and not has_dynamic_cue and not has_transient_term:
+        # Preserve punctuation and detailed custom wording when the value is
+        # already static. This keeps legacy prompt deduplication stable.
+        return text
+    if cleaned:
+        return cleaned
+    # Preserve detailed custom/English identity text when it is not visibly
+    # narrative, but never fall back to a known action, virtual content, or
+    # transient prop clause.
+    if has_dynamic_cue or has_transient_term:
+        return ""
+    return text
+
+
+def _location_scenes(location_asset: Any, scene: Any, script: Any = None) -> list[Any]:
+    scenes = list(getattr(getattr(script, "script", None), "scenes", []) or []) if script is not None else []
+    if script is not None and not scenes:
+        scenes = list(getattr(script, "scenes", []) or [])
+    shot_ids = set(getattr(location_asset, "shot_ids", []) or [])
+    selected = [item for item in scenes if getattr(item, "scene_id", None) in shot_ids]
+    if selected:
+        return selected
+    return [scene] if scene is not None else []
+
+
+def _non_action_environment(location_asset: Any, scene: Any, script: Any = None) -> str:
+    """Return reusable environment text, excluding copied shot actions."""
     environment = str(getattr(location_asset, "environment_description", "") or "").strip()
     action = str(getattr(scene, "action_description", "") or "").strip()
     if environment and action and environment == action:
         return ""
-    return environment
+    return _location_reference_text(environment, _location_scenes(location_asset, scene, script))
 
 
 def build_scene_prompt_layers(
@@ -440,6 +487,7 @@ def build_scene_prompt_layers(
 ) -> dict[str, Any]:
     """Build auditable scene prompt layers for one location state and view."""
     location_asset, location_state, scene, resolved_state_id = _scene_location_context(state, location_id, state_id)
+    location_scenes = _location_scenes(location_asset, scene, state)
     location_name = (
         getattr(location_asset, "canonical_name", "")
         or getattr(scene, "location", "")
@@ -447,10 +495,17 @@ def build_scene_prompt_layers(
     )
     identity_parts = [
         _sanitize_scene_anchor_text(f"地点身份：{location_name}"),
-        _sanitize_scene_anchor_text(getattr(location_asset, "identity_description", "")),
-        _sanitize_scene_anchor_text(_non_action_environment(location_asset, scene)),
-        _sanitize_scene_anchor_text(getattr(location_asset, "fixed_dressing", "")),
-        _sanitize_scene_anchor_text("空间锚点：" + "、".join(getattr(location_asset, "anchor_points", []) or [])),
+        _sanitize_scene_anchor_text(_location_reference_text(getattr(location_asset, "identity_description", ""), location_scenes)),
+        _sanitize_scene_anchor_text(_non_action_environment(location_asset, scene, state)),
+        _sanitize_scene_anchor_text(_location_reference_text(getattr(location_asset, "fixed_dressing", ""), location_scenes)),
+        _sanitize_scene_anchor_text(
+            "空间锚点：" + "、".join(
+                cleaned
+                for anchor in (getattr(location_asset, "anchor_points", []) or [])
+                for cleaned in [_location_reference_text(anchor, location_scenes)]
+                if cleaned
+            )
+        ),
     ]
     identity = _join_unique(identity_parts)
     if not identity.strip():
@@ -479,7 +534,7 @@ def build_scene_prompt_layers(
     scale_lock = _scene_scale_lock(
         location_name,
         getattr(location_asset, "identity_description", ""),
-        _non_action_environment(location_asset, scene),
+        _non_action_environment(location_asset, scene, state),
         state_layer,
     )
 
@@ -540,7 +595,7 @@ def build_scene_group_prompt(
     location_asset = next((item for item in (getattr(manifest, "locations", []) or []) if item.location_id == asset_id), None)
     scene = next((item for item in (getattr(getattr(state, "script", None), "scenes", []) or []) if item.scene_id == getattr(location_asset, "representative_scene_id", 0)), None)
     location = getattr(location_asset, "canonical_name", "") or getattr(scene, "location", "") or asset_id
-    environment = _non_action_environment(location_asset, scene) or "以场景身份、固定陈设与项目设定为准"
+    environment = _non_action_environment(location_asset, scene, state) or "以场景身份、固定陈设与项目设定为准"
     time_condition = getattr(location_asset, "time_condition", "") or "以剧本设定为准"
     visual = getattr(state, "visual_design", None)
     profile = getattr(state, "creative_profile", None)
@@ -650,7 +705,7 @@ def _character_project_constraint(style: str, ratio: str) -> str:
         f"项目视觉约束：艺术风格必须为{style}；本图是角色一致性参考图，必须使用真人写实摄影风格，"
         "必须像真实演员在摄影棚拍摄的定妆参考照，禁止任何绘画化、角色原画化、虚拟偶像化、数字人化或夸张美术化处理。"
         f"保持当前单视图固定比例，不改为{ratio}视频画幅。"
-        "English hard constraint: real human actor photo, live-action casting reference, photorealistic studio photography, real skin pores, real fabric, neutral studio lighting."
+        "真人硬性约束：真实演员照片、真人实拍定妆参考、写实影棚摄影、真实皮肤毛孔、真实服装面料和中性影棚灯光。"
     )
 
 
@@ -668,6 +723,7 @@ def compose_asset_prompt(
     custom = saved_custom if custom_instructions is None else custom_instructions.strip()
     style_mode = ""
     style_diagnostics: dict[str, object] = {}
+    character_description = ""
 
     if asset_type == "character":
         from src.agents.image_gen_agent import (
@@ -686,9 +742,10 @@ def compose_asset_prompt(
         profile = getattr(state, "creative_profile", None)
         style = resolve_profile_style(profile)["name"] if profile is not None else "电影级真人写实"
         style_mode = character_style_mode(style)
-        base = _join([build_character_image_prompt(asset_id, _character_description(state, asset_id), view_type, art_style=style), _locked_project_constraint(state, asset_type)])
+        character_description = _character_description(state, asset_id)
+        base = _join([build_character_image_prompt(asset_id, character_description, view_type, art_style=style), _locked_project_constraint(state, asset_type)])
         effective = _join([build_character_image_prompt(
-            asset_id, _character_description(state, asset_id), view_type, custom, art_style=style,
+            asset_id, character_description, view_type, custom, art_style=style,
         ), _locked_project_constraint(state, asset_type)])
         negative = build_character_negative_prompt(view_type, art_style=style)
         style_diagnostics = diagnose_character_prompt(style, effective, negative)
@@ -880,6 +937,7 @@ def compose_asset_prompt(
         "width": width,
         "height": height,
         "prompt_template_version": template_version,
+        "character_description": character_description,
         "project_constraints": _locked_project_constraint(state, asset_type),
         "requirement_signature": requirement_signature,
         "style_mode": style_mode,

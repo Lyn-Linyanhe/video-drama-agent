@@ -14,8 +14,8 @@ def test_prop_prompt_contains_identity_and_view_constraints():
     assert "standard_views" not in prompt["provider_prompts"]
     assert prompt["provider_prompts"]["back"] == prompt["provider_prompt"]
     assert prompt["requirement_signature"]
-    assert "Reference lock" in prompt["provider_prompt"]
-    assert "Lock one reusable prop" in prompt["provider_prompt"]
+    assert "参考锁定" in prompt["provider_prompt"]
+    assert "锁定一个可复用道具" in prompt["provider_prompt"]
 
 
 def test_user_text_is_additive_and_does_not_replace_system_constraints():

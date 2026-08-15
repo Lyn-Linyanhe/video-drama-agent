@@ -78,7 +78,7 @@ def test_cached_style_catalog_rehydrates_a_reset_project_session():
 
 def test_studio_uses_current_module_cache_version():
     html = (ROOT / "studio.html").read_text(encoding="utf-8")
-    assert "20260811-asset-quality-references" in html
+    assert "20260815-image-preview-repair" in html
 
 
 def test_project_restore_reads_saved_style_and_resets_session():
