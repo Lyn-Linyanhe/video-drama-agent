@@ -1239,7 +1239,7 @@ class VideoGenerationAgent:
             tag_lines = []
             for idx, label in enumerate(reference_labels[:len(reference_paths)], start=1):
                 for tag in self._reference_tags_from_label(str(label or "")):
-                    tag_lines.append(f"{tag} maps to reference image {idx}: {label}.")
+                    tag_lines.append(f"{tag} maps to reference image {idx}.")
             if tag_lines:
                 lines[1:1] = ["[Reference tags]", *tag_lines]
         elif first_ref_is_scene:

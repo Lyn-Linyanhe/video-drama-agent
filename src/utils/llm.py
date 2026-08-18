@@ -28,9 +28,10 @@ T = TypeVar("T", bound=BaseModel)
 OPENAI_COMPATIBLE_BASE_URLS = {
     "deepseek": "https://api.deepseek.com/v1",
     "kimi": "https://api.moonshot.cn/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
 }
 
-PLAIN_JSON_STRUCTURED_PROVIDERS = {"deepseek", "kimi"}
+PLAIN_JSON_STRUCTURED_PROVIDERS = {"deepseek", "kimi", "qwen"}
 
 # A 60-second timeout is too short for the long structured requests used by
 # script analysis and visual decomposition.  Keep the setting user-visible,

@@ -57,7 +57,12 @@ function renderProjectJobs() {
   document.getElementById('project-jobs-count').textContent = String(count);
   document.getElementById('project-jobs-project').textContent = appState.projectName || (appState.projectId ? `项目 ${appState.projectId.slice(0,8)}` : '尚未打开项目');
   const root = document.getElementById('project-jobs-list');
-  if (!projectJobs.length) { root.innerHTML = '<div class="project-jobs-empty">当前项目暂无任务</div>'; updateJobDrivenControls(); return; }
+  if (!projectJobs.length) {
+    root.innerHTML = '<div class="project-jobs-empty">当前项目暂无任务</div>';
+    updateJobDrivenControls();
+    renderScriptProgress();
+    return;
+  }
   const groups = [
     ['进行中', job => ['queued','running','validating'].includes(job.state)],
     ['需要处理', job => ['failed','interrupted','canceled'].includes(job.state)],
@@ -72,6 +77,51 @@ function renderProjectJobs() {
     }).join('')}`;
   }).join('');
   updateJobDrivenControls();
+  renderScriptProgress();
+}
+
+function latestScriptJob(predicate) {
+  return projectJobs
+    .filter(predicate)
+    .slice()
+    .sort((a, b) => String(b.updated_at || b.created_at || '').localeCompare(String(a.updated_at || a.created_at || '')))[0] || null;
+}
+
+function renderScriptProgress() {
+  const container = document.getElementById('script-progress');
+  if (!container) return;
+  const fill = document.getElementById('script-progress-fill');
+  const label = document.getElementById('script-progress-label');
+  const percentEl = document.getElementById('script-progress-percent');
+  if (!fill || !label || !percentEl) return;
+
+  const analyze = latestScriptJob(job => job.job_type === 'script.analyze' || job.job_type === 'script.generate');
+  const visualize = latestScriptJob(job => job.job_type === 'script.visualize');
+  const analyzeActive = analyze && ['queued', 'running', 'validating'].includes(analyze.state);
+  const visualizeActive = visualize && ['queued', 'running', 'validating'].includes(visualize.state);
+  let show = false;
+  let pct = 0;
+  let text = '';
+
+  if (analyzeActive) {
+    pct = 5 + ((analyze.progress?.percent || 0) / 100) * 40;
+    text = '正在解析剧本结构';
+    show = true;
+  } else if (visualizeActive) {
+    pct = 50 + ((visualize.progress?.percent || 0) / 100) * 45;
+    text = '正在生成视觉与分镜提示词';
+    show = true;
+  } else if (visualize && visualize.state === 'succeeded') {
+    pct = 100;
+    text = '剧本解析完成';
+    show = true;
+  }
+
+  container.style.display = show ? 'block' : 'none';
+  fill.style.width = `${Math.round(pct)}%`;
+  label.textContent = text;
+  percentEl.textContent = `${Math.round(pct)}%`;
+  fill.classList.toggle('progressing', Boolean(show && (analyzeActive || visualizeActive)));
 }
 
 function updateJobDrivenControls() {

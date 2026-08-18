@@ -10,6 +10,20 @@
 <link rel="stylesheet" href="/static/css/assets.css">
 <link rel="stylesheet" href="/static/css/production.css?v=20260814-shot-editor-layout">
 <link rel="stylesheet" href="/static/css/audio.css?v=20260809-audio-workspace">
+<style>
+  #script-progress-fill.progressing::after {
+    content: '';
+    display: block;
+    height: 100%;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.5), transparent);
+    animation: script-progress-shimmer 1.4s linear infinite;
+  }
+  @keyframes script-progress-shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(350%); }
+  }
+</style>
 </head>
 <body>
 
@@ -66,6 +80,15 @@
         <h3 style="margin-bottom:12px">剧本工作区</h3>
         <div id="script-workspace" class="card" style="min-height:210px;padding:20px"></div>
         <input id="script-file-input" type="file" accept=".txt,.docx,.md" style="display:none" onchange="StudioActions.importScriptSource(this)">
+        <div id="script-progress" style="margin-top:16px;display:none">
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-bottom:6px">
+            <span id="script-progress-label" style="color:#d4d4d8">正在解析剧本</span>
+            <span id="script-progress-percent" style="color:#a1a1aa">0%</span>
+          </div>
+          <div style="height:6px;background:#2a2a40;border-radius:3px;overflow:hidden">
+            <div id="script-progress-fill" style="width:0%;height:100%;background:linear-gradient(90deg,#6366f1,#22d3ee);border-radius:3px;transition:width .35s ease"></div>
+          </div>
+        </div>
         <div id="script-result" style="margin-top:16px;display:none">
           <h4 id="script-result-title" style="margin-bottom:8px">剧本解析</h4>
           <div id="script-readable-analysis"></div>
@@ -218,7 +241,7 @@
             <span class="settings-capability">必需</span>
           </div>
           <div class="settings-form-grid">
-            <div class="settings-field"><label for="cfg-llm-provider">服务商</label><select id="cfg-llm-provider" onchange="StudioActions.onProviderChange('llm')"><option value="deepseek">DeepSeek</option><option value="kimi">Kimi</option><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></div>
+            <div class="settings-field"><label for="cfg-llm-provider">服务商</label><select id="cfg-llm-provider" onchange="StudioActions.onProviderChange('llm')"><option value="deepseek">DeepSeek</option><option value="kimi">Kimi</option><option value="qwen">通义千问</option><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select></div>
             <div class="settings-field"><label for="cfg-llm-model">模型</label><select id="cfg-llm-model"></select></div>
             <div class="settings-field full"><label for="cfg-llm-key">API Key</label><div class="settings-secret"><input type="password" id="cfg-llm-key" data-secret-field="llm_key" autocomplete="new-password" placeholder="输入 API Key"><button type="button" onclick="StudioActions.togglePwd('cfg-llm-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-llm-key')">清除</button></div><small>密钥不会返回到浏览器；留空保存会保留已配置值。</small></div>
           </div>
@@ -579,6 +602,6 @@ document.addEventListener('DOMContentLoaded', function() {
   arkModelSelect.value = models.includes(previous) ? previous : models[0];
 });
 </script>
-<script type="module" src="/static/js/bootstrap.js?v=20260815-image-preview-repair"></script>
+<script type="module" src="/static/js/bootstrap.js?v=20260818-script-progress"></script>
 </body>
 </html>

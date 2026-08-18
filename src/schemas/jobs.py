@@ -30,7 +30,7 @@ class JobError(BaseModel):
 
 
 class QualityReport(BaseModel):
-    status: Literal["passed", "warning", "failed", "skipped"] = "skipped"
+    status: Literal["passed", "warning", "failed", "skipped", "unreviewed"] = "skipped"
     technical_checks: list[dict[str, Any]] = Field(default_factory=list)
     visual_review: dict[str, Any] = Field(
         default_factory=lambda: {"status": "skipped", "reason": "未配置视觉审核"}

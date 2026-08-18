@@ -38,16 +38,18 @@ LEGACY_AUDIO_PROFILE_FIELDS = (
     "minimax_api_key",
 )
 
-OPENAI_COMPATIBLE_LLM_PROVIDERS = {"openai", "deepseek", "kimi"}
+OPENAI_COMPATIBLE_LLM_PROVIDERS = {"openai", "deepseek", "kimi", "qwen"}
 LLM_DEFAULT_BASE_URLS = {
     "openai": "https://api.openai.com/v1",
     "deepseek": "https://api.deepseek.com/v1",
     "kimi": "https://api.moonshot.cn/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
 }
 LLM_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "deepseek": "deepseek-v4-flash",
     "kimi": "kimi-k2.6",
+    "qwen": "qwen-plus",
 }
 
 
@@ -67,6 +69,8 @@ def _normalize_llm_model(provider: str, model: str) -> str:
             return "deepseek-v4-pro"
     if provider_key == "kimi" and model_name in {"", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"}:
         return LLM_DEFAULT_MODELS["kimi"]
+    if provider_key == "qwen" and not model_name:
+        return LLM_DEFAULT_MODELS["qwen"]
     return model_name
 
 

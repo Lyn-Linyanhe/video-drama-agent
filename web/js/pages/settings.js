@@ -6,6 +6,7 @@ const PROVIDER_MODELS = {
     openai: ['gpt-4o','gpt-4o-mini','gpt-4-turbo'],
     deepseek: ['deepseek-v4-flash','deepseek-v4-pro'],
     kimi: ['kimi-k2.6','kimi-k2.5','kimi-k2','moonshot-v1'],
+    qwen: ['qwen-plus','qwen-turbo','qwen-max'],
   },
 };
 
@@ -47,9 +48,9 @@ function onProviderChange(type) {
     const models = PROVIDER_MODELS.llm[p] || [];
     sel.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
     if (models.includes(previous)) sel.value = previous;
-    const defaultBase = p === 'deepseek' ? 'https://api.deepseek.com/v1' : p === 'kimi' ? 'https://api.moonshot.cn/v1' : '留空使用服务商默认地址';
+    const defaultBase = p === 'deepseek' ? 'https://api.deepseek.com/v1' : p === 'kimi' ? 'https://api.moonshot.cn/v1' : p === 'qwen' ? 'https://dashscope.aliyuncs.com/compatible-mode/v1' : '留空使用服务商默认地址';
     document.getElementById('cfg-llm-base').placeholder = defaultBase;
-    document.getElementById('cfg-nav-llm').textContent = p === 'deepseek' ? 'DeepSeek' : p === 'kimi' ? 'Kimi' : p === 'openai' ? 'OpenAI' : 'Anthropic';
+    document.getElementById('cfg-nav-llm').textContent = p === 'deepseek' ? 'DeepSeek' : p === 'kimi' ? 'Kimi' : p === 'qwen' ? '通义千问' : p === 'openai' ? 'OpenAI' : 'Anthropic';
   }
   if (type === 'video') {
     const selector = document.getElementById('cfg-video-api');

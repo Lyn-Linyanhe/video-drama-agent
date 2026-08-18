@@ -318,6 +318,8 @@ function resetProjectSession(overrides = {}) {
   if (structuredEditor) structuredEditor.value = '';
   const scriptResult = document.getElementById('script-result');
   if (scriptResult) scriptResult.style.display = 'none';
+  const scriptProgress = document.getElementById('script-progress');
+  if (scriptProgress) scriptProgress.style.display = 'none';
   const finalContainer = document.getElementById('final-video-container');
   if (finalContainer) { finalContainer.style.display = 'none'; finalContainer.innerHTML = ''; }
   const preview = document.getElementById('preview-player');

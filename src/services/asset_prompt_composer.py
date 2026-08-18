@@ -372,7 +372,7 @@ SCENE_VIEW_DESCRIPTIONS = {
     "scene_center": "正面中心线大全景，镜头正对空间中心轴，严格居中对称，展示前景、中景、后景和主要空间锚点。",
     "scene_left_45": "以中心线为参考的左前方45度大全景，保持同一空间结构，只改变机位到左前侧观察。",
     "scene_right_45": "以中心线为参考的右前方45度大全景，保持同一空间结构，只改变机位到右前侧观察。",
-    "scene_reverse": "从空间最深处向外拍摄的反向中心大全景，展示出口方向和反向空间关系。",
+    "scene_reverse": "反向中心大全景：机位与正面中心视角严格相反180度，镜头转向空间另一侧，展示正面视角看不到的那一面（背面墙、另一侧陈设或相反方向），保持同一空间结构与陈设，画面内容与正面中心图明显不同。",
     # Compatibility aliases for old projects.  They deliberately use separate
     # contracts so a legacy medium image cannot contain both a wide-establishing
     # and a medium-detail instruction.
@@ -643,7 +643,7 @@ def build_scene_group_prompt(
         "scene_center": "正面中心线大全景，镜头正对空间中心轴，严格居中对称。",
         "scene_left_45": "以中心线为参考的左前方45度大全景，镜头对准核心区域。",
         "scene_right_45": "以中心线为参考的右前方45度大全景，镜头对准核心区域。",
-        "scene_reverse": "从空间最深处向外拍摄的正中心全景。",
+        "scene_reverse": "反向中心大全景：机位与正面中心视角严格相反180度，镜头转向空间另一侧，展示正面视角看不到的那一面，保持同一空间结构与陈设，画面内容与正面中心图明显不同。",
     }
     views = [f"第{index}张：{view_labels[view_id]}" for index, view_id in enumerate(view_ids, start=1)]
     extra = f"\n用户补充要求：{custom_instructions.strip()}。补充要求不得改变机位顺序、空间结构、固定陈设、时间天气或主光方向。" if custom_instructions.strip() else ""

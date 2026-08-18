@@ -74,7 +74,7 @@ def test_studio_frontend_resources_are_not_served_from_a_stale_browser_cache():
 
     page = client.get("/")
     assert page.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
-    assert "bootstrap.js?v=20260815-image-preview-repair" in page.text
+    assert "bootstrap.js?v=20260818-script-progress" in page.text
 
     module = client.get("/static/js/pages/production-actions.js")
     assert module.headers["cache-control"] == "no-store, max-age=0, must-revalidate"

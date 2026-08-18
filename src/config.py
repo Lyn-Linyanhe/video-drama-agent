@@ -12,7 +12,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # LLM Configuration
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic")  # "anthropic", "openai", "deepseek", or "kimi"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic")  # "anthropic", "openai", "deepseek", "kimi", or "qwen"
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
 if os.getenv("LLM_PROVIDER", "anthropic") == "deepseek":
     if LLM_MODEL in {"", "deepseek-chat"}:
@@ -23,6 +23,8 @@ if os.getenv("LLM_PROVIDER", "anthropic") == "kimi" and LLM_MODEL in {
     "", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k",
 }:
     LLM_MODEL = "kimi-k2.6"
+if os.getenv("LLM_PROVIDER", "anthropic") == "qwen" and not os.getenv("LLM_MODEL", "").strip():
+    LLM_MODEL = "qwen-plus"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # For custom endpoints

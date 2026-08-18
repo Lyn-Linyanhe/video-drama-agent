@@ -259,7 +259,7 @@ class ScriptAgent:
         phase: str = "script.generate",
     ) -> ScriptBreakdown:
         """Generate the script and repair one semantically invalid manifest response."""
-        if getattr(self.llm, "provider", "") in {"kimi", "deepseek"}:
+        if getattr(self.llm, "provider", "") in {"kimi", "deepseek", "qwen"}:
             return await self._generate_compact(user_prompt, temperature, telemetry, phase)
 
         prompt = user_prompt + VISUAL_ASSET_RULES

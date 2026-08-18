@@ -981,7 +981,12 @@ def _generated_prop_description_needs_repair(
 
 def _has_voice_or_action_cue(value: str) -> bool:
     text = str(value or "")
-    if any(cue in text for cue in _ENVIRONMENT_DYNAMIC_CUES):
+    person_action_cues = {
+        "背靠", "站立", "站起", "靠墙", "瘫坐", "坐下", "躺着", "跪", "蜷缩", "斜靠", "倚",
+        "抬手", "举手", "伸手", "挥手", "摆手", "抵住", "按住", "握住", "轻叩", "猛击", "敲门",
+        "拍门", "拍打", "探头", "侧身", "俯身", "弯腰", "直起身", "打量", "扫视", "踮脚",
+    }
+    if any(cue in text for cue in _ENVIRONMENT_DYNAMIC_CUES | person_action_cues):
         return True
     return bool(re.search(r"(?:是|这是|那是).{0,8}(?:摄像头|声音|录音|脚步)", text))
 
@@ -1121,6 +1126,74 @@ def _character_is_visible_in_scene(scene, name: str) -> bool:
     return False
 
 
+def _infer_character_gender(script: ScriptBreakdown, name: str) -> str:
+    """Infer gender markers from dialogue and action text for pronoun repair."""
+    text = str(name or "")
+    for scene in script.scenes:
+        if name in str(getattr(scene, "action_description", "") or ""):
+            text += " " + str(getattr(scene, "action_description", "") or "")
+        for line in scene.dialogue:
+            if str(line.character or "").strip() == name:
+                text += " " + str(line.line or "")
+    if re.search(r"(?:女性|女孩|女人|她|少女|女主)", text):
+        return "女"
+    if re.search(r"(?:男性|男孩|男人|他|少年|男主)", text):
+        return "男"
+    return ""
+
+
+def _resolve_generic_pronouns(script: ScriptBreakdown) -> dict[str, str]:
+    """Map generic character terms to canonical names before asset extraction.
+
+    Single-character scenes establish an unambiguous mapping. Multi-character
+    scenes only use gender agreement when exactly one candidate matches, so an
+    ambiguous "他/她" never silently binds to the wrong asset.
+    """
+    generic_gender = {
+        "男生": "男", "男主": "男", "男人": "男", "男子": "男", "男孩": "男", "少年": "男", "小伙": "男",
+        "女生": "女", "女主": "女", "女人": "女", "女子": "女", "女孩": "女", "少女": "女", "姑娘": "女",
+    }
+    def visible_names(scene) -> list[str]:
+        return [
+            str(name or "").strip()
+            for name in (scene.characters or [])
+            if str(name or "").strip() and not _looks_voice_only_name(str(name or "").strip())
+        ]
+
+    resolved: dict[str, str] = {}
+    for scene in script.scenes:
+        visible = visible_names(scene)
+        if len(visible) != 1:
+            continue
+        action = str(getattr(scene, "action_description", "") or "")
+        for term in generic_gender:
+            if term in action:
+                resolved[term] = visible[0]
+
+    for scene in script.scenes:
+        visible = visible_names(scene)
+        if not visible:
+            continue
+        action = str(getattr(scene, "action_description", "") or "")
+        if not action:
+            continue
+        for term, gender in generic_gender.items():
+            if term not in action:
+                continue
+            target = resolved.get(term, "")
+            if not target and len(visible) == 1:
+                target = visible[0]
+            if not target:
+                candidates = [name for name in visible if _infer_character_gender(script, name) == gender]
+                if len(candidates) == 1:
+                    target = candidates[0]
+            if target:
+                action = action.replace(term, target)
+                resolved[term] = target
+        scene.action_description = action
+    return resolved
+
+
 def _revealed_character_aliases(script: ScriptBreakdown) -> dict[str, str]:
     """Resolve explicit disguise reveals without guessing ordinary nicknames."""
     disguise_names = {"黑衣人", "蒙面人", "神秘人", "陌生人", "兜帽人", "面具人"}
@@ -1216,6 +1289,7 @@ def build_manifest_from_scenes(
     on_screen_by_scene: dict[int, list[str]] = {}
     voice_only_by_scene: dict[int, list[str]] = {}
     revealed_aliases = _revealed_character_aliases(script)
+    pronoun_aliases = _resolve_generic_pronouns(script)
 
     for scene in script.scenes:
         visible: list[str] = []
@@ -1262,7 +1336,10 @@ def build_manifest_from_scenes(
             name=name,
             appearance_mode="on_screen",
             description=f"画面角色，出现在分镜 {', '.join(str(scene.scene_id) for scene in script.scenes if name in on_screen_by_scene.get(scene.scene_id, []))}",
-            aliases=list(dict.fromkeys(character_aliases.get(name, []))),
+            aliases=list(dict.fromkeys(
+                character_aliases.get(name, [])
+                + [term for term, resolved in pronoun_aliases.items() if resolved == name]
+            )),
         )
         for name in character_names
     ]
@@ -1666,6 +1743,7 @@ def _stable_environment_from_scenes(scenes: list) -> str:
             "人物", "两人", "他们", "她们", "他", "她",
             "黑衣人", "蒙面人", "神秘人", "陌生人", "兜帽人", "面具人",
         })
+        names.update({"男生", "女生", "男主", "女主", "男人", "女人", "男子", "女子", "男孩", "女孩", "少年", "少女", "小伙", "姑娘"})
         action = str(getattr(scene, "action_description", "") or "")
         # Commas are useful boundaries for Chinese action prose: the static
         # tail often follows a short movement clause in the same sentence.
