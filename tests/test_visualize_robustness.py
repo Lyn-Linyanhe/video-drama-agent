@@ -633,10 +633,10 @@ def test_sanitize_drops_gaze_and_psychology_clauses():
 def test_sanitize_dedupes_repeated_clauses():
     from src.agents.visual_prompt_agent import _sanitize_environment
 
-    env = "雨棚边缘雨水成线滴落。雨棚边缘雨水成线滴落；门灯照亮湿润台阶。门灯照亮湿润台阶"
+    env = "门灯照亮湿润台阶。门灯照亮湿润台阶；街角路灯亮着。街角路灯亮着"
     out = _sanitize_environment(env)
-    assert out.count("雨棚边缘雨水成线滴落") == 1
     assert out.count("门灯照亮湿润台阶") == 1
+    assert out.count("街角路灯亮着") == 1
 
 
 def test_assembled_prompt_env_is_clean_and_deduplicated():

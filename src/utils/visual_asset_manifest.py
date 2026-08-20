@@ -110,7 +110,7 @@ DYNAMIC_ENVIRONMENT_CUES = {
     # These describe a temporary visual state or an event, not a reusable
     # location identity. They used to slip through the compact-manifest
     # fallback because they do not always contain an explicit actor verb.
-    "忽明忽暗", "闪烁", "红光一闪", "一闪", "被雨水打得", "落下",
+    "忽明忽暗", "闪烁", "红光一闪", "一闪", "被雨水打得", "落下", "滴落",
     "字迹模糊", "被水汽泡得模糊", "水汽泡得模糊", "手电光", "光束扫过",
     # General action/state variants that frequently appear in compact script
     # outputs. These are transient shot facts, even when the clause also names
