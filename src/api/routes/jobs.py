@@ -492,7 +492,15 @@ async def _job_script_visualize(context, payload: dict) -> dict:
         latest.visual_stage = "ready"
         latest.visual_stage_error = ""
         latest.visual_job_id = context.job_id
+        # Merge per-scene/global records produced by the visual agent (Plan B
+        # parallel telemetry) with the project's existing persisted history.
         requests = list((latest.visual_performance or {}).get("requests") or [])
+        seen_keys = {(item.get("stage"), item.get("scene_id", 0)) for item in requests}
+        for agent_req in list((llm_metrics or {}).get("requests") or []):
+            key = (agent_req.get("stage"), agent_req.get("scene_id", 0))
+            if key not in seen_keys:
+                requests.append(agent_req)
+                seen_keys.add(key)
         requests.append({
             "stage": "visualize", "elapsed_ms": round((time.perf_counter() - started) * 1000),
             "provider": getattr(visual_prompt_agent.llm, "provider", ""),
@@ -548,6 +556,7 @@ async def _job_script_visualize(context, payload: dict) -> dict:
         "visual_design": visual.model_dump(),
         "generation_prompts": generation_prompts.model_dump(),
         "prompt_review": latest.prompt_review,
+        "visual_performance": latest.visual_performance,
     }
 
 
@@ -607,43 +616,31 @@ async def _job_asset_generate(context, payload: dict) -> dict:
             "generation_mode": item.get("generation_mode", ""),
             "quality_report": item.get("quality_report", (response.get("quality_reports") or {}).get(request.view_type, {})),
         }
-    for attempt in range(2):
-        context.check_cancelled()
-        try:
-            context.progress("submitting_provider", 0, 1, "正在提交图片生成")
-            with bind_generation_hooks(_job_hooks(context)):
-                response = await _regenerate_image_asset(
-                    context.project_id, request, quality_check=True,
-                    project_lock=context.project_lock,
-                )
-            last_quality = response.get("quality")
-            if last_quality:
-                context.quality(last_quality)
-            state = _state_from_json(response["state_json"])
-            record = _asset_record(
-                state, request.asset_type, request.asset_id, request.view_type,
-            )
-            active = next((item for item in response.get("history", []) if item.get("active")), {})
-            return {
-                "asset_type": request.asset_type,
-                "asset_id": request.asset_id,
-                "view_type": request.view_type,
-                "version_id": active.get("id", ""),
-                "image_path": record.image_path if record else "",
-                "quality_report": last_quality or {},
-            }
-        except MediaQualityFailure as exc:
-            last_quality = exc.report
-            context.quality(last_quality)
-            if attempt == 0:
-                job_store.add_event(
-                    context.job_id, "quality_retry", "running", "validating",
-                    "确定性质量检查失败，自动重试一次",
-                )
-                request.seed = secrets.randbelow(999999) + 1
-                continue
-            raise
-    raise MediaQualityFailure("图片质量检查失败", last_quality or {})
+    context.check_cancelled()
+    context.progress("submitting_provider", 0, 1, "正在提交图片生成")
+    with bind_generation_hooks(_job_hooks(context)):
+        response = await _regenerate_image_asset(
+            context.project_id, request, quality_check=True,
+            project_lock=context.project_lock,
+        )
+    last_quality = response.get("quality")
+    if last_quality:
+        context.quality(last_quality)
+    state = _state_from_json(response["state_json"])
+    record = _asset_record(
+        state, request.asset_type, request.asset_id, request.view_type,
+    )
+    active = next((item for item in response.get("history", []) if item.get("active")), {})
+    return {
+        "asset_type": request.asset_type,
+        "asset_id": request.asset_id,
+        "view_type": request.view_type,
+        "version_id": active.get("id", ""),
+        "image_path": record.image_path if record else "",
+        "quality_report": last_quality or {},
+        "history": response.get("history", []),
+        "candidate": not bool(active),
+    }
 
 
 async def _job_character_reference_group(context, payload: dict) -> dict:

@@ -27,6 +27,19 @@ const syncJobsToAssetState = (...args) => globalThis.StudioActions.syncJobsToAss
 const syncScriptAssets = (...args) => globalThis.StudioActions.syncScriptAssets(...args);
 const updateJobDrivenControls = (...args) => globalThis.StudioActions.updateJobDrivenControls(...args);
 
+const IMAGE_ASSET_JOB_TYPES = new Set([
+  'asset.generate',
+  'character.reference.group',
+  'character.reference.edit',
+  'scene.reference.group',
+  'scene.reference.edit',
+  'prop.reference.group',
+]);
+
+function isImageAssetJob(job) {
+  return IMAGE_ASSET_JOB_TYPES.has(job?.job_type);
+}
+
 async function refreshCurrentProjectData({renderShots = true, refreshProduction = true, preserveScriptEditor = false} = {}) {
   if (!appState.projectId) return;
   const snapshot = projectSessionSnapshot();
@@ -168,7 +181,7 @@ async function refreshForTerminalProjectJob(job) {
     await loadProductionWorkspace({patch: false});
     return;
   }
-  if (['asset.generate', 'character.reference.group', 'character.reference.edit', 'scene.reference.group', 'scene.reference.edit', 'prop.reference.group'].includes(job.job_type)) {
+  if (isImageAssetJob(job)) {
     await refreshCurrentProjectData({renderShots: false, refreshProduction: false});
     return;
   }
@@ -184,12 +197,12 @@ function handleProjectJobEvent(payload) {
   renderProjectJobs();
   updateJobDrivenControls();
   patchProductionJobState(job);
-  if (['asset.generate', 'character.reference.group', 'character.reference.edit', 'scene.reference.group', 'scene.reference.edit', 'prop.reference.group'].includes(job.job_type)) {
+  if (isImageAssetJob(job)) {
     renderRoles(); renderScenes(); renderProps();
   }
   if (job.job_type === 'prompt.review' && isTerminalJob(job)) {
     refreshForTerminalProjectJob(job).catch(error => console.error('刷新任务结果失败:', error));
-  } else if (!isTerminalJob(previous) && job.state === 'succeeded') {
+  } else if (!isTerminalJob(previous) && (job.state === 'succeeded' || (isImageAssetJob(job) && isTerminalJob(job)))) {
     refreshForTerminalProjectJob(job).catch(error => console.error('刷新任务结果失败:', error));
   }
 }
@@ -260,6 +273,12 @@ async function showProjectJobDetails(jobId) {
     const events = data.events || [];
     const generationSnapshot = job.payload?.generation_snapshot || job.result?.generation_snapshot || {};
     const promptReview = job.result?.report;
+    const visualRequests = (job.result?.visual_performance?.requests) || [];
+    const sceneRequests = visualRequests.filter(r => r && r.stage === 'visualize_scene');
+    const totalRequest = visualRequests.filter(r => r && r.stage === 'visualize')[0] || null;
+    const visualPerfBlock = (sceneRequests.length || totalRequest)
+      ? `<h4 style="margin:18px 0 7px;font-size:12px">视觉生成明细</h4>${totalRequest ? `<div style="color:#d4d4d8;margin-bottom:4px">总耗时 ${escapeHtml(String(totalRequest.elapsed_ms || 0))}ms · 尝试 ${escapeHtml(String(totalRequest.attempts || 1))} 次${totalRequest.fallback_used ? ' · 已回落单次生成' : ''}</div>` : ''}${sceneRequests.length ? `<div style="max-height:220px;overflow:auto;border:1px solid #27272a;border-radius:6px">${sceneRequests.map(item => `<div style="padding:6px 8px;border-bottom:1px solid #27272a;display:flex;gap:8px;font-size:11px"><span style="color:#a1a1aa;min-width:72px">镜头 ${escapeHtml(String(item.scene_id))}</span><span>${escapeHtml(String(item.elapsed_ms || 0))}ms</span><span>尝试 ${escapeHtml(String(item.attempts || 0))}</span>${item.fallback_used ? `<span style="color:#fbbf24">回落</span>` : ''}</div>`).join('')}</div>` : ''}`
+      : '';
     const accepted_references = generationSnapshot.accepted_references || generationSnapshot.references || [];
     const dropped_references = generationSnapshot.dropped_references || [];
     const referenceDecision = (generationSnapshot.reference_mode || accepted_references.length || dropped_references.length)
@@ -270,6 +289,7 @@ async function showProjectJobDetails(jobId) {
       ${job.error ? `<div style="margin-top:16px;padding:10px;border-left:3px solid #ef4444;background:#271719"><b>${escapeHtml(job.error.message)}</b><div style="color:#fca5a5;margin-top:4px">${escapeHtml(job.error.suggestion || '')}</div></div>` : ''}
       ${referenceDecision}
       ${promptReview ? `<h4 style="margin:18px 0 7px;font-size:12px">Kimi 分镜审核</h4><div style="color:${promptReview.passed ? '#86efac' : '#fbbf24'}">总分 ${escapeHtml(String(promptReview.overall_score || 0))} · ${promptReview.passed ? '通过' : '需修改'}</div><div style="margin-top:6px;color:#d4d4d8">${escapeHtml(promptReview.summary || '')}</div>${(promptReview.issues || []).map(item => `<div style="margin-top:6px;padding:7px;background:#27272a"><b>${escapeHtml(item.severity)} · 镜头 ${escapeHtml(String(item.scene_id || '全片'))}</b><br>${escapeHtml(item.description)}<br><span style="color:#a1a1aa">${escapeHtml(item.suggestion)}</span></div>`).join('')}` : ''}
+      ${visualPerfBlock}
       <h4 style="margin:18px 0 7px;font-size:12px">质量检查</h4>${checks.length ? checks.map(item => `<div style="padding:5px 0;color:${item.passed ? '#86efac' : '#fca5a5'}">${item.passed ? '通过' : '失败'} · ${escapeHtml(item.message)}</div>`).join('') : `<div style="color:#71717a">${escapeHtml(job.quality?.visual_review?.reason || '没有质量报告')}</div>`}
       <h4 style="margin:18px 0 7px;font-size:12px">任务事件</h4>${events.map(event => `<div style="padding:6px 0;border-bottom:1px solid #27272a"><span style="color:#71717a">${escapeHtml(event.created_at || '')}</span><br>${escapeHtml(event.message || event.stage || '')}</div>`).join('') || '<div style="color:#71717a">暂无事件</div>'}`;
     document.getElementById('modal-job-detail').style.display = 'flex';
@@ -348,6 +368,7 @@ const __moduleActions = {
   connectProjectJobEvents,
   startProjectJobPolling,
   refreshForTerminalProjectJob,
+  isImageAssetJob,
   handleProjectJobEvent,
   submitProjectJob,
   waitForProjectJob,

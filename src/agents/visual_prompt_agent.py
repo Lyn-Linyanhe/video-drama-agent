@@ -1,6 +1,7 @@
 """Generate visual design and Chinese video prompts in one LLM call."""
 
 import asyncio
+import time
 import random
 import re
 import hashlib
@@ -514,6 +515,24 @@ COMPACT_SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提�
 _PARALLEL_VISUALIZE_CONCURRENCY = 4
 
 
+def _build_continuity_segment(prev_shot) -> str:
+    """Build a deterministic carry-over segment from the previous shot's state fields."""
+    prev_state = []
+    for label, value in (
+        ("主体状态", getattr(prev_shot, "subject_state", "")),
+        ("环境", getattr(prev_shot, "environment_delta", "")),
+        ("光线", getattr(prev_shot, "lighting_delta", "")),
+        ("关键道具", getattr(prev_shot, "prop_state", "")),
+    ):
+        value = str(value or "").strip()
+        if value:
+            prev_state.append(f"{label}：{value}")
+    if prev_state:
+        return f"【顺承上一镜】本镜承接上一镜结尾画面状态，开头保持与上一镜一致——{'；'.join(prev_state)}。"
+    return "【顺承上一镜】本镜承接上一镜结尾画面状态，开场保持与上一镜一致的姿态、站位、空间与光线。"
+
+
+
 def _merge_visualize_telemetry(target: dict, inc: dict) -> None:
     """Accumulate per-call LLM metrics into a shared telemetry dict (no reset)."""
     if not isinstance(target, dict) or not isinstance(inc, dict):
@@ -590,6 +609,7 @@ class VisualPromptAgent:
                 prompt_overrides=prompt_overrides,
                 creative_profile=creative_profile,
                 telemetry=telemetry,
+                progress_callback=progress_callback,
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
             )
@@ -709,15 +729,21 @@ class VisualPromptAgent:
             phase="script.visualize.global",
         )
 
-    async def _run_parallel_scene_deltas(self, script, manifest_text, global_out, profile, telemetry=None):
+    async def _run_parallel_scene_deltas(self, script, manifest_text, global_out, profile, telemetry=None, progress_callback=None):
         """Phase 2: per-scene compact deltas, run concurrently with bounded retry."""
         global_cn = global_out.global_character_descriptions_cn or {}
         global_cn_text = "\n".join(f"- {k}: {v}" for k, v in global_cn.items()) or ("\u65e0")
         profile_style = getattr(profile, "art_style", "") or "\u5199\u5b9e"
         profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
         sem = asyncio.Semaphore(_PARALLEL_VISUALIZE_CONCURRENCY)
+        completed = 0
+        total = len(script.scenes)
+        if telemetry is not None and "requests" not in telemetry:
+            telemetry["requests"] = []
 
         async def one(scene):
+            nonlocal completed
+            t0 = time.perf_counter()
             single = script.model_copy(deep=True)
             single.scenes = [scene.model_copy(deep=True)]
             single.duration_sec = scene.duration_sec
@@ -749,6 +775,28 @@ class VisualPromptAgent:
                             telemetry=metric,
                             phase="script.visualize.delta",
                         )
+                        completed += 1
+                        if progress_callback:
+                            progress_callback(
+                                "visualize_scene",
+                                completed,
+                                total,
+                                f"已完成 {completed}/{total} 镜视觉差异",
+                            )
+                        if telemetry is not None:
+                            telemetry.setdefault("requests", []).append({
+                                "stage": "visualize_scene",
+                                "scene_id": scene.scene_id,
+                                "elapsed_ms": round((time.perf_counter() - t0) * 1000),
+                                "attempts": metric.get("attempts", 0),
+                                "repair_attempts": metric.get("repair_attempts", 0),
+                                "fallback_used": bool(metric.get("fallback_used", False)),
+                                "input_chars": metric.get("input_chars", 0),
+                                "output_chars": metric.get("output_chars", 0),
+                                "transport_attempts": metric.get("transport_attempts", 0),
+                                "transport_retries": metric.get("transport_retries", 0),
+                                "timeout_sec": metric.get("timeout_sec", 0),
+                            })
                         return shot, metric
                     except Exception as exc:
                         last = exc
@@ -766,15 +814,30 @@ class VisualPromptAgent:
                 _merge_visualize_telemetry(telemetry, metric)
         return [shot for shot, _metric in results]
 
-    async def _run_parallel_visualize(self, script, *, prompt_overrides, creative_profile, telemetry, source_text, _repair_character_profiles):
+    async def _run_parallel_visualize(self, script, *, prompt_overrides, creative_profile, telemetry, source_text, _repair_character_profiles, progress_callback=None):
         """Plan B: two-phase parallel; falls back to single-shot on persistent failure."""
         try:
             manifest_text = self._format_manifest(script)
             profile = creative_profile
             profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
             gmetrics = {}
+            g_started = time.perf_counter()
             global_out = await self._generate_global_visual(script, manifest_text, profile, gmetrics)
-            shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry)
+            if telemetry is not None:
+                telemetry.setdefault("requests", []).append({
+                    "stage": "visualize_global",
+                    "scene_id": 0,
+                    "elapsed_ms": round((time.perf_counter() - g_started) * 1000),
+                    "attempts": gmetrics.get("attempts", 0),
+                    "repair_attempts": gmetrics.get("repair_attempts", 0),
+                    "fallback_used": bool(gmetrics.get("fallback_used", False)),
+                    "input_chars": gmetrics.get("input_chars", 0),
+                    "output_chars": gmetrics.get("output_chars", 0),
+                    "transport_attempts": gmetrics.get("transport_attempts", 0),
+                    "transport_retries": gmetrics.get("transport_retries", 0),
+                    "timeout_sec": gmetrics.get("timeout_sec", 0),
+                })
+            shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry, progress_callback=progress_callback)
             if telemetry is not None:
                 _merge_visualize_telemetry(telemetry, gmetrics)
             output = _CompactVisualPromptOutput(
@@ -798,6 +861,16 @@ class VisualPromptAgent:
         except Exception:
             if telemetry is not None:
                 telemetry["fallback_used"] = True
+                # Keep the aggregate attempt counter accurate when phase 2 fails
+                # partway: sum the per-request records that already happened so
+                # the single-shot fallback counter does not hide prior calls.
+                attempted = sum(
+                    int(req.get("attempts") or 0)
+                    for req in (telemetry.get("requests") or [])
+                    if isinstance(req, dict)
+                )
+                if attempted:
+                    telemetry["attempts"] = max(int(telemetry.get("attempts") or 0), attempted)
             return await self._run_single_shot(
                 script,
                 prompt_overrides=prompt_overrides,
@@ -1147,6 +1220,7 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 _sanitize_shot_output(shot, script, scene)
         _dedupe_repeated_shot_deltas(output, script)
 
+        prev_shot = None
         for scene in script.scenes:
             shot = shot_by_scene.get(scene.scene_id)
 
@@ -1179,9 +1253,10 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 seed = int(digest[:12], 16) % 999999 + 1
 
             if shot:
-                prompt = self._assemble_compact_shot_prompt(script, scene, shot, output, creative_profile)
+                prompt = self._assemble_compact_shot_prompt(script, scene, shot, output, creative_profile, prev_shot)
             else:
                 prompt = scene.action_description
+            prev_shot = shot
 
             prompt_shots.append(ShotPrompt(
                 scene_id=scene.scene_id,
@@ -1243,10 +1318,22 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             protected_scene_ids=protected_scene_ids,
         )
 
+        # The timed composer rewrites each shot prompt, so carry-over segments
+        # must be appended after that step instead of being embedded earlier.
+        delta_by_scene = {item.scene_id: item for item in (output.shots or [])}
+        prev_delta = None
+        for scene in script.scenes:
+            if getattr(scene, "continuity_from_prev", False) and prev_delta is not None:
+                target = next((sp for sp in prompts.shots if sp.scene_id == scene.scene_id), None)
+                if target is not None and "【顺承上一镜】" not in target.prompt:
+                    segment = _build_continuity_segment(prev_delta)
+                    target.prompt = target.prompt.rstrip() + "\n" + segment
+            prev_delta = delta_by_scene.get(scene.scene_id, prev_delta)
+
         return visual, prompts
 
     @staticmethod
-    def _assemble_compact_shot_prompt(script, scene, shot, output, creative_profile=None) -> str:
+    def _assemble_compact_shot_prompt(script, scene, shot, output, creative_profile=None, prev_shot=None) -> str:
         """Expand compact LLM scene differences with deterministic production context."""
         from src.services.visual_styles import get_visual_style, resolve_visual_style
 
@@ -1309,6 +1396,23 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         prop_state = getattr(shot, 'prop_state', '')
         if prop_state:
             parts.append(f"【关键道具】{prop_state}。")
+        prev_state = []
+        if getattr(scene, "continuity_from_prev", False) and prev_shot is not None:
+            for label, value in (
+                ("主体状态", getattr(prev_shot, "subject_state", "")),
+                ("环境", getattr(prev_shot, "environment_delta", "")),
+                ("光线", getattr(prev_shot, "lighting_delta", "")),
+                ("关键道具", getattr(prev_shot, "prop_state", "")),
+            ):
+                value = str(value or "").strip()
+                if value:
+                    prev_state.append(f"{label}：{value}")
+        if prev_state:
+            parts.append(f"【顺承上一镜】本镜承接上一镜结尾画面状态，开头保持与上一镜一致——{'；'.join(prev_state)}。")
+        elif getattr(scene, "continuity_from_prev", False) and prev_shot is not None:
+            # 旧契约镜头（single-shot 回落）没有结构化画面状态字段时，
+            # 仍保留承接语义，但不泄露上一镜动作/剧情细节。
+            parts.append("【顺承上一镜】本镜承接上一镜结尾画面状态，开场保持与上一镜一致的姿态、站位、空间与光线。")
         return "\n".join(part for part in parts if part.strip())
 
     @staticmethod

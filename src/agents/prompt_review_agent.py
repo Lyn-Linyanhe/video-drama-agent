@@ -15,6 +15,7 @@ from src.schemas.prompt_review import (
 )
 from src.schemas.script import ScriptBreakdown
 from src.schemas.visual import VisualDesign
+from src.utils.visual_asset_manifest import binding_for_scene
 
 
 SYSTEM_PROMPT = """你是短剧分镜提示词审核总监。你只审核文本，不生成或改写提示词。
@@ -337,6 +338,68 @@ class PromptReviewAgent:
         return normalized
 
     @staticmethod
+    def _continuity_issues(script: ScriptBreakdown, prompts: GenerationPrompts) -> list[PromptReviewIssue]:
+        """Deterministic structural gate for shots explicitly marked as continuing the previous one.
+
+        Only scenes with ``continuity_from_prev=True`` are checked so adjacent shots that
+        simply happen to share a location are never flagged. Rules stay at the schema level
+        (location binding, prop binding) to avoid unreliable free-text semantic guessing.
+        """
+        issues: list[PromptReviewIssue] = []
+        manifest = getattr(script, "asset_manifest", None)
+        scenes = list(script.scenes)
+        index_by_id = {scene.scene_id: idx for idx, scene in enumerate(scenes)}
+        for scene in scenes:
+            if not getattr(scene, "continuity_from_prev", False):
+                continue
+            idx = index_by_id.get(scene.scene_id)
+            if idx is None:
+                continue
+            reason = str(getattr(scene, "continuity_reason", "") or "")
+            if idx == 0:
+                issues.append(PromptReviewIssue(
+                    scene_id=scene.scene_id,
+                    severity="critical",
+                    category="continuity",
+                    description=f"镜头 {scene.scene_id} 是首镜，不能标记为承接上一镜",
+                    suggestion="取消该镜头的承接标记，或调整镜头顺序",
+                    evidence=reason,
+                ))
+                continue
+            prev = scenes[idx - 1]
+            if manifest is None:
+                continue
+            cur_binding = binding_for_scene(script, scene.scene_id)
+            prev_binding = binding_for_scene(script, prev.scene_id)
+            if cur_binding and prev_binding and cur_binding.location_id != prev_binding.location_id:
+                issues.append(PromptReviewIssue(
+                    scene_id=scene.scene_id,
+                    severity="critical",
+                    category="continuity",
+                    description=(
+                        f"镜头 {scene.scene_id} 标记承接上一镜，但地点不同"
+                        f"（{prev_binding.location_id} → {cur_binding.location_id}）"
+                    ),
+                    suggestion="承接镜头必须与上一镜处于同一地点，或取消承接标记",
+                    evidence=reason,
+                ))
+            prev_props = set(prev_binding.prop_ids or []) if prev_binding else set()
+            cur_props = set(cur_binding.prop_ids or []) if cur_binding else set()
+            if prev_props and not cur_props:
+                issues.append(PromptReviewIssue(
+                    scene_id=scene.scene_id,
+                    severity="major",
+                    category="continuity",
+                    description=(
+                        f"镜头 {scene.scene_id} 承接上一镜，但未绑定上一镜关键道具"
+                        f"（{', '.join(sorted(prev_props))}）"
+                    ),
+                    suggestion="为承接镜头保留上一镜关键道具绑定，或说明道具已移出画面",
+                    evidence=", ".join(sorted(prev_props)),
+                ))
+        return issues
+
+    @staticmethod
     def _apply_deterministic_checks(
         script: ScriptBreakdown,
         prompts: GenerationPrompts,
@@ -345,6 +408,7 @@ class PromptReviewAgent:
         prompt_ids = {item.scene_id for item in prompts.shots}
         scene_ids = {item.scene_id for item in script.scenes}
         issues = list(result.issues)
+        issues.extend(PromptReviewAgent._continuity_issues(script, prompts))
         for scene in script.scenes:
             if scene.scene_id not in prompt_ids:
                 issues.append(PromptReviewIssue(
