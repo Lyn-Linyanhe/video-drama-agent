@@ -511,6 +511,9 @@ COMPACT_SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提�
 """
 
 
+_PARALLEL_VISUALIZE_CONCURRENCY = 4
+
+
 class VisualPromptAgent:
     """Agent that generates visual design and Chinese video prompts in one pass.
 
@@ -553,6 +556,15 @@ class VisualPromptAgent:
                 creative_profile=creative_profile,
                 telemetry=telemetry,
                 progress_callback=progress_callback,
+                source_text=source_text,
+                _repair_character_profiles=_repair_character_profiles,
+            )
+        if getattr(self.llm, "provider", "") == "deepseek" and len(script.scenes) > 1:
+            return await self._run_parallel_visualize(
+                script,
+                prompt_overrides=prompt_overrides,
+                creative_profile=creative_profile,
+                telemetry=telemetry,
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
             )
@@ -617,6 +629,110 @@ class VisualPromptAgent:
             repaired_en, repaired_cn = await self.reextract_visible_characters(
                 script,
                 source_text=source_text,
+            )
+            output.global_character_descriptions = repaired_en
+            output.global_character_descriptions_cn = repaired_cn
+        return self._split_output(output, script, prompt_overrides, creative_profile)
+
+    async def _generate_global_visual(self, script, manifest_text, profile, telemetry):
+        """Phase 1: one call for global visual design + all on-screen character profiles."""
+        profile_style = getattr(profile, "art_style", "") or "\u5199\u5b9e"
+        profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
+        user = f"""\u4ec5\u8f93\u51fa\u5168\u5c40\u89c6\u89c9\u65b9\u6848\u548c\u6240\u6709\u5b9e\u9645\u51fa\u955c\u89d2\u8272\u7684\u5916\u8c8c\uff0c\u4e0d\u8981\u8f93\u51fa\u4efb\u4f55\u955c\u5934\uff08shots\uff09\u3002
+**\u5267\u672c\u6807\u9898**: {script.title}
+**\u7c7b\u578b**: {script.genre}
+**\u603b\u65f6\u957f**: {script.duration_sec}\u79d2
+**\u9879\u76ee\u827a\u672f\u98ce\u683c**: {profile_style}
+**\u9879\u76ee\u6700\u7ec8\u89c6\u9891\u753b\u5e45**: {profile_ratio}
+
+**\u89c6\u89c9\u8d44\u4ea7\u7ed1\u5b9a\uff08\u6743\u5a01\uff09**:
+{manifest_text}
+
+\u5fc5\u987b\u8f93\u51fa 6 \u4e2a\u952e\uff1a
+1. overall_style\uff08= \u9879\u76ee\u827a\u672f\u98ce\u683c\uff09
+2. color_palette\uff08\u4e2d\u6587\u914d\u8272\uff09
+3. aspect_ratio\uff08= \u9879\u76ee\u753b\u5e45\uff09
+4. global_negative_prompt\uff08\u4e2d\u6587\u8d1f\u9762\u77ed\u8bed\uff09
+5. global_character_descriptions\uff1a\u952e\u4e3a\u89d2\u8272 asset_id\uff0c\u503c\u4e3a\u82f1\u6587\u5916\u8c8c
+6. global_character_descriptions_cn\uff1a\u952e\u4e3a\u89d2\u8272 asset_id\uff0c\u503c\u4e3a\u5b8c\u6574\u4e2d\u6587\u5916\u8c8c\u4fa7\u5199\uff08\u7ea680-180\u5b57\uff0c\u542b\u6027\u522b\u5e74\u9f84\u8eab\u9ad8\u8138\u578b\u4e94\u5b98\u53d1\u578b\u670d\u88c5\u914d\u9970\u8fa8\u8bc6\u6807\u5fd7\uff09
+\u53ea\u8f93\u51fa\u4e00\u4e2a JSON \u5bf9\u8c61\uff0c\u4e0d\u8981 markdown\u3002"""
+        return await self.llm.generate_structured(
+            system_prompt=COMPACT_SYSTEM_PROMPT,
+            user_prompt=user,
+            output_schema=_GlobalVisualOutput,
+            temperature=0.7,
+            telemetry=telemetry,
+            phase="script.visualize.global",
+        )
+
+    async def _run_parallel_scene_deltas(self, script, manifest_text, global_out, profile, telemetry=None):
+        """Phase 2: per-scene compact deltas, run concurrently with bounded retry."""
+        global_cn = global_out.global_character_descriptions_cn or {}
+        global_cn_text = "\n".join(f"- {k}: {v}" for k, v in global_cn.items()) or ("\u65e0")
+        profile_style = getattr(profile, "art_style", "") or "\u5199\u5b9e"
+        profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
+        sem = asyncio.Semaphore(_PARALLEL_VISUALIZE_CONCURRENCY)
+
+        async def one(scene):
+            single = script.model_copy(deep=True)
+            single.scenes = [scene.model_copy(deep=True)]
+            single.duration_sec = scene.duration_sec
+            scenes_text = self._format_scenes(single)
+            user = f"""\u53ea\u8f93\u51fa\u7b2c {scene.scene_id} \u955c\u7684\u7d27\u51d1\u5dee\u5f02\uff0c\u4e0d\u8981\u8f93\u51fa\u5168\u5c40\u5b57\u6bb5\uff0c\u4e0d\u8981\u590d\u8ff0\u89d2\u8272\u5916\u8c8c/\u573a\u666f\u8d44\u4ea7/\u753b\u5e45\u3002
+**\u5267\u672c**: {script.title} | {script.genre} | \u672c\u955c\u65f6\u957f {scene.duration_sec}s
+**\u9879\u76ee\u827a\u672f\u98ce\u683c**: {profile_style} | \u753b\u5e45 {profile_ratio}
+
+**\u672c\u955c\u573a\u666f\u4e0e\u955c\u5934**:
+{scenes_text}
+
+**\u89c6\u89c9\u8d44\u4ea7\u7ed1\u5b9a**:
+{manifest_text}
+
+**\u5df2\u786e\u8ba4\u89d2\u8272\u5916\u8c8c\u951a\u70b9\uff08\u76f4\u63a5\u6cbf\u7528\uff0c\u4e0d\u8981\u6539\u5199\uff09**:
+{global_cn_text}
+
+\u53ea\u8f93\u51fa\u672c\u955c shot \u5dee\u5f02\uff1ascene_id\u3001subject_state\u3001action_timeline\u3001environment_delta(\u4ec5\u9759\u6001\u73af\u5883\u5dee\u5f02\uff0c\u7981\u6b62\u4eba\u7269\u52a8\u4f5c/\u60c5\u7eea/\u5728\u573a)\u3001camera_motion\u3001lighting_delta\u3001prop_state\u3001negative_prompt\u3001motion_strength\u3002\u53ea\u8f93\u51fa\u4e00\u4e2a JSON \u5bf9\u8c61\u3002"""
+            async with sem:
+                last = None
+                for attempt in (1, 2):
+                    try:
+                        return await self.llm.generate_structured(
+                            system_prompt=COMPACT_SYSTEM_PROMPT,
+                            user_prompt=user,
+                            output_schema=_CompactShotVisualPrompt,
+                            temperature=0.7,
+                            telemetry=telemetry,
+                            phase="script.visualize.delta",
+                        )
+                    except Exception as exc:
+                        last = exc
+                raise last
+
+        results = await asyncio.gather(*(one(scene) for scene in script.scenes))
+        results.sort(key=lambda s: s.scene_id)
+        return results
+
+    async def _run_parallel_visualize(self, script, *, prompt_overrides, creative_profile, telemetry, source_text, _repair_character_profiles):
+        """Plan B: phase-1 global+characters, then phase-2 per-scene deltas in parallel."""
+        manifest_text = self._format_manifest(script)
+        profile = creative_profile
+        profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
+        global_out = await self._generate_global_visual(script, manifest_text, profile, telemetry)
+        shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry)
+        output = _CompactVisualPromptOutput(
+            overall_style=global_out.overall_style,
+            color_palette=global_out.color_palette,
+            aspect_ratio=global_out.aspect_ratio or profile_ratio,
+            global_negative_prompt=global_out.global_negative_prompt,
+            global_character_descriptions=global_out.global_character_descriptions or {},
+            global_character_descriptions_cn=global_out.global_character_descriptions_cn or {},
+            shots=shots,
+        )
+        if _repair_character_profiles and self._registry_needs_profile_repair(
+            output.global_character_descriptions_cn, script
+        ):
+            repaired_en, repaired_cn = await self.reextract_visible_characters(
+                script, source_text=source_text
             )
             output.global_character_descriptions = repaired_en
             output.global_character_descriptions_cn = repaired_cn
@@ -1254,6 +1370,16 @@ class _CompactVisualPromptOutput(BaseModel):
         default="低清晰度，模糊，水印，文字，畸形五官，错误肢体，多余手指，动作抖动，道具变形"
     )
     shots: list[_CompactShotVisualPrompt] = Field(description="One compact delta record per scene")
+
+
+class _GlobalVisualOutput(BaseModel):
+    """Phase-1-only global visual result; no per-shot deltas."""
+    overall_style: str = ""
+    color_palette: str = ""
+    aspect_ratio: str = "9:16"
+    global_negative_prompt: str = ""
+    global_character_descriptions: dict[str, str] = Field(default_factory=dict)
+    global_character_descriptions_cn: dict[str, str] = Field(default_factory=dict)
 
 
 class _CharacterProfileEntry(BaseModel):

@@ -97,3 +97,170 @@ def test_sanitize_empty_when_all_action():
     from src.agents.visual_prompt_agent import _sanitize_environment
 
     assert _sanitize_environment("黑衣人站在入口。") == ""
+
+
+# ---------- Plan B: parallel two-phase visualize ----------
+def _scenes(n):
+    from src.schemas.script import Scene
+    return [
+        Scene(
+            scene_id=i,
+            duration_sec=3,
+            location="loc",
+            characters=["A"],
+            action_description="x",
+            camera_direction="wide",
+            emotion_tone="tense",
+        )
+        for i in range(1, n + 1)
+    ]
+
+
+def test_deepseek_many_scenes_routes_to_parallel(monkeypatch):
+    import asyncio
+
+    from src.schemas.script import ScriptBreakdown
+    from src.agents.visual_prompt_agent import VisualPromptAgent
+
+    class FakeLLM:
+        provider = "deepseek"
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(6)
+    )
+    agent = VisualPromptAgent()
+    agent.llm = FakeLLM()
+    sentinel = ("visual", "prompts")
+
+    async def fake(script, **kw):
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_parallel_visualize", fake)
+    result = asyncio.run(agent.run(script, creative_profile=None, telemetry={}, _repair_character_profiles=False))
+    assert result == sentinel
+
+
+def test_parallel_visualize_merges_global_and_scenes(monkeypatch):
+    import asyncio
+    import re
+
+    from src.schemas.script import ScriptBreakdown
+    import src.agents.visual_prompt_agent as vpa
+    from src.agents.visual_prompt_agent import VisualPromptAgent, _CompactShotVisualPrompt
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(6)
+    )
+
+    class FakeLLM:
+        provider = "deepseek"
+
+        def __init__(self):
+            self.calls = []
+
+        async def generate_structured(self, **kw):
+            self.calls.append(kw["output_schema"].__name__)
+            if kw["output_schema"].__name__ == "_GlobalVisualOutput":
+                return vpa._GlobalVisualOutput(
+                    overall_style="风格",
+                    color_palette="配色",
+                    aspect_ratio="9:16",
+                    global_negative_prompt="neg",
+                    global_character_descriptions={"c1": "en"},
+                    global_character_descriptions_cn={"c1": "女，25岁，高瘦，鹅蛋脸，黑发，米色风衣。"},
+                )
+            m = re.search(r"第\s*(\d+)\s*镜", kw["user_prompt"])
+            sid = int(m.group(1)) if m else 1
+            return _CompactShotVisualPrompt(
+                scene_id=sid,
+                subject_state=f"state {sid}",
+                action_timeline=f"0-5s action {sid}",
+                environment_delta=f"环境 {sid} 静态，墙面水痕",
+                camera_motion="中景",
+                lighting_delta="自然光",
+                negative_prompt="低清晰度，模糊",
+                motion_strength=0.5,
+            )
+
+    fake = FakeLLM()
+    agent = VisualPromptAgent()
+    agent.llm = fake
+    captured = {}
+
+    def fake_split(output, script, po, cp):
+        captured["output"] = output
+        return ("visual", "prompts")
+
+    agent._split_output = fake_split
+    asyncio.run(agent._run_parallel_visualize(
+        script, prompt_overrides=None, creative_profile=None, telemetry={},
+        source_text="", _repair_character_profiles=False,
+    ))
+    out = captured["output"]
+    assert out.overall_style == "风格"
+    assert out.global_character_descriptions_cn.get("c1")
+    assert len(out.shots) == 6
+    assert sorted(s.scene_id for s in out.shots) == list(range(1, 7))
+    delta_calls = [c for c in fake.calls if c == "_CompactShotVisualPrompt"]
+    global_calls = [c for c in fake.calls if c == "_GlobalVisualOutput"]
+    assert len(global_calls) == 1
+    assert len(delta_calls) == 6
+
+
+def test_parallel_scene_retries_once(monkeypatch):
+    import asyncio
+    import re
+
+    from src.schemas.script import ScriptBreakdown
+    import src.agents.visual_prompt_agent as vpa
+    from src.agents.visual_prompt_agent import VisualPromptAgent, _CompactShotVisualPrompt
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(6)
+    )
+
+    class FakeLLM:
+        provider = "deepseek"
+
+        def __init__(self):
+            self.tries = {}
+            self.calls = []
+
+        async def generate_structured(self, **kw):
+            self.calls.append(kw["output_schema"].__name__)
+            if kw["output_schema"].__name__ == "_GlobalVisualOutput":
+                return vpa._GlobalVisualOutput(
+                    overall_style="风格", color_palette="配色", aspect_ratio="9:16",
+                    global_negative_prompt="neg",
+                    global_character_descriptions_cn={"c1": "女，25岁，高瘦，鹅蛋脸，黑发，米色风衣。"},
+                )
+            m = re.search(r"第\s*(\d+)\s*镜", kw["user_prompt"])
+            sid = int(m.group(1)) if m else 1
+            self.tries[sid] = self.tries.get(sid, 0) + 1
+            if sid == 3 and self.tries[sid] == 1:
+                raise RuntimeError("transient")
+            return _CompactShotVisualPrompt(
+                scene_id=sid, subject_state=f"s {sid}", action_timeline=f"0-5s a {sid}",
+                environment_delta="", camera_motion="中景", lighting_delta="自然光",
+                negative_prompt="neg", motion_strength=0.5,
+            )
+
+    fake = FakeLLM()
+    agent = VisualPromptAgent()
+    agent.llm = fake
+    captured = {}
+
+    def fake_split(output, script, po, cp):
+        captured["output"] = output
+        return ("visual", "prompts")
+
+    agent._split_output = fake_split
+    asyncio.run(agent._run_parallel_visualize(
+        script, prompt_overrides=None, creative_profile=None, telemetry={},
+        source_text="", _repair_character_profiles=False,
+    ))
+    out = captured["output"]
+    assert len(out.shots) == 6
+    # scene 3 retried once
+    assert fake.tries.get(3) == 2
+    assert len([c for c in fake.calls if c == "_CompactShotVisualPrompt"]) == 7
