@@ -1,6 +1,7 @@
 """LLM client abstraction — supports Anthropic and OpenAI-compatible APIs."""
 
 import json
+import re
 import sys
 import asyncio
 from typing import Any, Type, TypeVar
@@ -24,6 +25,14 @@ from src.config import (
 )
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def _strip_json_fence(text: str) -> str:
+    """Remove markdown json fences so raw JSON can be validated."""
+    t = (text or "").strip()
+    t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    return t
 
 OPENAI_COMPATIBLE_BASE_URLS = {
     "deepseek": "https://api.deepseek.com/v1",
@@ -252,6 +261,7 @@ class LLMClient:
         temperature: float = 0.7,
         telemetry: dict[str, Any] | None = None,
         phase: str = "",
+        schema_defaults: dict[str, Any] | None = None,
     ) -> T:
         """Generate a structured output (Pydantic model) from the LLM."""
         self._ensure_client()
@@ -280,6 +290,7 @@ class LLMClient:
         else:
             result = await self._openai_structured(
                 system_prompt, user_prompt, output_schema, schema_name, schema_json, temperature, telemetry, phase,
+                schema_defaults,
             )
         if telemetry is not None:
             telemetry["output_chars"] = len(result.model_dump_json())
@@ -436,6 +447,7 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
         temperature: float,
         telemetry: dict[str, Any] | None = None,
         phase: str = "",
+        schema_defaults: dict[str, Any] | None = None,
     ) -> T:
         """Use OpenAI function-calling to get structured output.
 
@@ -446,7 +458,7 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
                 telemetry["fallback_used"] = True
                 telemetry["attempts"] += 1
             return await self._openai_structured_fallback(
-                system_prompt, user_prompt, output_schema, temperature, phase=phase, telemetry=telemetry
+                system_prompt, user_prompt, output_schema, temperature, phase=phase, telemetry=telemetry, schema_defaults=schema_defaults
             )
 
         max_retries = 2
@@ -519,7 +531,7 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
                 telemetry["fallback_used"] = True
                 telemetry["attempts"] += 1
             return await self._openai_structured_fallback(
-                system_prompt, user_prompt, output_schema, temperature, phase=phase, telemetry=telemetry
+                system_prompt, user_prompt, output_schema, temperature, phase=phase, telemetry=telemetry, schema_defaults=schema_defaults
             )
         except Exception as e:
             raise ValueError(
@@ -535,6 +547,7 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
         *,
         phase: str = "",
         telemetry: dict[str, Any] | None = None,
+        schema_defaults: dict[str, Any] | None = None,
     ) -> T:
         """Last-resort: request plain JSON output without function-calling."""
         import re
@@ -552,24 +565,37 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
         }
         text = await self._openai_chat_content(kwargs, phase=phase, telemetry=telemetry)
 
-        # Try to extract JSON from the response
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            try:
-                return output_schema.model_validate(json.loads(match.group()))
-            except Exception:
-                pass
-
-        # Try the whole text
+        # Fences are common with DeepSeek: strip them before any parse.
+        cleaned = _strip_json_fence(text)
+        candidates = []
         try:
-            return output_schema.model_validate(json.loads(text))
+            candidates.append(json.loads(cleaned))
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}", cleaned)
+            if match:
+                try:
+                    candidates.append(json.loads(match.group()))
+                except Exception:
+                    pass
+
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            if schema_defaults and isinstance(schema_defaults, dict):
+                for key, value in schema_defaults.items():
+                    obj.setdefault(key, value)
+            try:
+                return output_schema.model_validate(obj)
+            except Exception:
+                continue
+
+        # Fix and retry on the cleaned text
+        try:
+            fixed = self._fix_truncated_json(cleaned)
+            if fixed:
+                return output_schema.model_validate(json.loads(fixed))
         except Exception:
             pass
-
-        # Fix and retry
-        fixed = self._fix_truncated_json(match.group() if match else text)
-        if fixed:
-            return output_schema.model_validate(json.loads(fixed))
         raise ValueError("Fallback extraction failed")
 
     async def _openai_chat_content(

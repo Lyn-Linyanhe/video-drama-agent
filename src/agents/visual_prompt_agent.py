@@ -21,6 +21,34 @@ from src.services.timed_prompt_composer import apply_timed_prompt_structure
 from src.config import DEFAULT_API
 
 
+_ENV_ACTION_CUES = (
+    "站在", "出现", "走进", "走入", "踏入", "走近", "走来", "从阴影", "逆光站",
+    "脚步声", "推开", "推开门", "蹲", "冲进", "躲", "掏出", "放进", "攥",
+    "握", "转身", "指向", "抬起", "停下", "示意",
+    "向下走", "向前走", "往前走", "走出", "进入", "离开",
+    "怕", "担心", "紧张", "不安", "屏息", "颤抖", "发抖", "浸透", "被雨水",
+)
+
+
+def _sanitize_environment(env: str) -> str:
+    """去掉环境文本中的人物动作/在场/交互子句，保留静态环境事实。"""
+    if not env:
+        return ""
+    kept = []
+    removed = False
+    for clause in re.split(r"[。；;]", env):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if any(cue in clause for cue in _ENV_ACTION_CUES):
+            removed = True
+            continue
+        kept.append(clause)
+    if not removed:
+        return env
+    return "；".join(kept)
+
+
 def _current_prop_anchor(name: str, description: str) -> str:
     """Keep reusable prop identity without leaking future plot states into early shots."""
     text = re.sub(r"\s+", " ", str(description or "")).strip("。；; ")
@@ -479,6 +507,7 @@ COMPACT_SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提�
 - 角色外貌描述必须是可直接交给图片模型的完整稳定锚点，每个实际出镜角色写成约 80-180 个汉字，至少覆盖：性别与年龄段、身高或体型、脸型与肤色、眉眼鼻唇等面部特征、发型与发色、服装款式/主色/材质、配饰和一项可辨识标志。剧本没有明确的外貌字段时，可以依据人物身份、情绪和项目风格补充一套克制且稳定的设计，但不得使用“外貌以剧本为准”“未提供外貌”等占位语，也不得把动作、地点、道具或其他角色的特征写进来。每个镜头只描述实际出镜角色，绝不把仅配音角色写入画面。
 - 动作时间轴需按镜头时长清晰描述；负面约束使用中文短语。
 - 所有字段使用中文，保持同一地点的空间、陈设、时间天气和主光方向连续。
+- environment_delta 只能写本镜头静态/持续的环境事实（建筑结构、固定陈设、天气、时间、地形、空间关系、整体光线氛围）。严禁写入人物的动作、情绪、心理状态、对白、人物在场、道具交互或剧情结果。若无静态环境差异，environment_delta 必须留空字符串。
 """
 
 
@@ -569,7 +598,8 @@ class VisualPromptAgent:
 - 每个镜头的 character_appearance 只能包含该镜头 on_screen_character_ids 对应的角色；voice_only_speakers 仅可作为声音/对白上下文，绝不可写成画面主体、外貌锚点或参考图对象。
 - 每个镜头的环境必须遵循它绑定的 location asset；同一 location 的不同镜头保持建筑、陈设、时间天气和主光方向连续。"""
         user_prompt += """
-- 每个镜头必须包含绑定 prop_ids 对应道具。道具是画面资产而非背景泛称：写清它在画面中的位置、形态或材质、与人物的交互和镜头结束状态；未绑定道具不得凭空新增。"""
+- 每个镜头必须包含绑定 prop_ids 对应道具。道具是画面资产而非背景泛称：写清它在画面中的位置、形态或材质、与人物的交互和镜头结束状态；未绑定道具不得凭空新增。
+- environment_delta 只允许静态环境差异，禁止写入人物动作、情绪、在场或道具交互；没有静态差异时留空。"""
 
         output = await self.llm.generate_structured(
             system_prompt=COMPACT_SYSTEM_PROMPT,
@@ -578,6 +608,7 @@ class VisualPromptAgent:
             temperature=0.7,
             telemetry=telemetry,
             phase="script.visualize",
+            schema_defaults={"color_palette": ""},
         )
         if _repair_character_profiles and self._registry_needs_profile_repair(
             output.global_character_descriptions_cn,
@@ -686,7 +717,7 @@ class VisualPromptAgent:
         script.duration_sec = sum(int(scene.duration_sec or 0) for scene in script.scenes)
         return (
             VisualDesign(
-                overall_style=overall_style or "鍐欏疄",
+                overall_style=overall_style or "写实",
                 color_palette=color_palette,
                 aspect_ratio=aspect_ratio,
                 global_character_descriptions=global_en,
@@ -1066,9 +1097,11 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             f"【主体状态】{getattr(shot, 'subject_state', '') or scene.action_description}。",
             f"【动作时间轴】{getattr(shot, 'action_timeline', '') or scene.action_description}。",
             (
-                f"【环境】{location.canonical_name if location else scene.location}。"
-                f"{getattr(location, 'environment_description', '') or ''}。"
-                f"{getattr(shot, 'environment_delta', '')}"
+                "【环境】" + _sanitize_environment(
+                    f"{location.canonical_name if location else scene.location}。"
+                    f"{getattr(location, 'environment_description', '') or ''}。"
+                    f"{getattr(shot, 'environment_delta', '')}"
+                )
             ).strip(),
             f"【镜头语言】{getattr(shot, 'camera_motion', '') or getattr(shot, 'composition', '') or scene.camera_direction}。",
             f"【光线与色调】{getattr(shot, 'lighting_delta', '') or getattr(shot, 'lighting', '') or scene.emotion_tone}。",
@@ -1159,7 +1192,7 @@ class _ShotVisualPrompt(BaseModel):
     # Compact per-shot differences. The backend assembles the final provider prompt.
     subject_state: str = Field(default="", description="Visible subject state unique to this shot")
     action_timeline: str = Field(default="", description="Time-based action progression unique to this shot")
-    environment_delta: str = Field(default="", description="Environment details that differ in this shot")
+    environment_delta: str = Field(default="", description="仅静态/持续的环境差异（建筑、陈设、天气、地形、空间、整体光线）；禁止人物动作、情绪、在场、对白或道具交互；无则留空")
     camera_motion: str = Field(default="", description="Camera framing or movement unique to this shot")
     lighting_delta: str = Field(default="", description="Lighting details unique to this shot")
     prop_state: str = Field(default="", description="Bound prop position, material, or interaction state")
@@ -1197,7 +1230,7 @@ class _CompactShotVisualPrompt(BaseModel):
     scene_id: int = Field(description="Matches ScriptBreakdown.scenes[].scene_id")
     subject_state: str = Field(default="", description="Visible subject state unique to this shot")
     action_timeline: str = Field(default="", description="Time-based action progression unique to this shot")
-    environment_delta: str = Field(default="", description="Environment details that differ in this shot")
+    environment_delta: str = Field(default="", description="仅静态/持续的环境差异（建筑、陈设、天气、地形、空间、整体光线）；禁止人物动作、情绪、在场、对白或道具交互；无则留空")
     camera_motion: str = Field(default="", description="Camera framing or movement unique to this shot")
     lighting_delta: str = Field(default="", description="Lighting details unique to this shot")
     prop_state: str = Field(default="", description="Bound prop position, material, or interaction state")
