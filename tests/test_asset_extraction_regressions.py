@@ -466,3 +466,31 @@ def test_scene_prompt_layers_do_not_forward_transient_location_actions():
     assert "撑墙站起" not in layers["identity"]
     assert "众人消失在暗道后" not in layers["identity"]
     assert "中央长桌" in layers["identity"]
+
+
+def test_environment_cleaner_drops_gaze_and_psychology_clauses():
+    from src.utils import visual_asset_manifest as vam
+
+    scenes = [
+        Scene(
+            scene_id=1,
+            duration_sec=5,
+            location="老城区巷口",
+            characters=["林默"],
+            action_description="林默再抬眼望向空旷巷口，说话时视线仍偏向巷口。",
+            camera_direction="中景",
+            emotion_tone="克制",
+        )
+    ]
+    value = (
+        "再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；"
+        "沿石阶向下走；街角路灯亮着；墙面大片水痕"
+    )
+    cleaned = vam._clean_environment_description(value, scenes)
+
+    assert "望向" not in cleaned
+    assert "视线" not in cleaned
+    assert "怕它" not in cleaned
+    assert "沿石阶向下走" not in cleaned
+    assert "街角路灯亮着" in cleaned
+    assert "墙面大片水痕" in cleaned

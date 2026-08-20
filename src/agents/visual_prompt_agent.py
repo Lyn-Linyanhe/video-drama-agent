@@ -33,25 +33,27 @@ _ENV_ACTION_CUES = (
     "握", "转身", "指向", "抬起", "停下", "示意",
     "向下走", "向前走", "往前走", "走出", "进入", "离开",
     "怕", "担心", "紧张", "不安", "屏息", "颤抖", "发抖", "浸透", "被雨水",
+    "望向", "抬眼", "视线", "目光", "瞥向", "凝视", "盯着", "神色", "神情", "害怕", "心里",
 )
 
 
 def _sanitize_environment(env: str) -> str:
-    """去掉环境文本中的人物动作/在场/交互子句，保留静态环境事实。"""
+    """去掉环境文本中的人物动作/在场/交互/心理子句，保留静态环境事实并去重。"""
     if not env:
         return ""
-    kept = []
-    removed = False
-    for clause in re.split(r"[。；;]", env):
-        clause = clause.strip()
+    kept: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[。；;]+", env):
+        clause = raw.strip(" ，,、")
         if not clause:
             continue
         if any(cue in clause for cue in _ENV_ACTION_CUES):
-            removed = True
             continue
+        key = clause.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
         kept.append(clause)
-    if not removed:
-        return env
     return "；".join(kept)
 
 

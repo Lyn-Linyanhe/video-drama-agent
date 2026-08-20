@@ -1509,8 +1509,12 @@ def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
 
 
 def _has_entrance_cue(text: str) -> bool:
+    # Exit / chase scenes mention 走出/店门 without an entrance beat; never
+    # substitute the generic door-entry narrative for them.
+    if _contains(text, "追出", "追上", "塞进", "追出门", "追出店门"):
+        return False
     return (
-        _contains(text, "推门", "玻璃门", "门铃", "黑伞", "走出", "监控", "街对面")
+        _contains(text, "推门", "玻璃门", "门铃", "黑伞", "监控", "街对面")
         and not _contains(text, "把信给我", "交出信封", "不要交给你")
     )
 
@@ -1700,10 +1704,14 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
         umbrella_phrase = f"撑着{umbrella}" if umbrella else ""
         prop_anchor = _prop_anchor_label(event_text, props)
         surveillance = "，抬眼看门口监控，再用余光瞥向街对面" if _contains(event_text, "监控", "街对面") else ""
+        bell = "门铃轻响，" if _contains(event_text, "门铃", "玻璃门") else ""
+        hide_phrase = ""
+        if _contains(event_text, "藏到身后", "藏在身后", "往身后藏"):
+            hide_phrase = f"{companion}把{prop_anchor}藏到身后，"
         beats.append((
             "physical_action",
-            f"中近景/侧面固定，{venue}{door}被推开，门铃轻响，{actor}{umbrella_phrase}走出；"
-            f"{companion}把{prop_anchor}藏到身后，两人短暂对视，{actor}{surveillance}，"
+            f"中近景/侧面固定，{venue}{door}被推开，{bell}{actor}{umbrella_phrase}走出；"
+            f"{hide_phrase}两人短暂对视，{actor}{surveillance}，"
             f"人物站位、视线方向和{prop_anchor}位置清楚。",
         ))
         special_event = True

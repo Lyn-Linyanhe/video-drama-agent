@@ -90,7 +90,7 @@ def test_sanitize_keeps_clean_env():
     from src.agents.visual_prompt_agent import _sanitize_environment
 
     env = "旧钟楼地下通道；墙上大片水痕，灯管部分损坏，地面浅水。"
-    assert _sanitize_environment(env) == env
+    assert _sanitize_environment(env) == "旧钟楼地下通道；墙上大片水痕，灯管部分损坏，地面浅水"
 
 
 def test_sanitize_empty_when_all_action():
@@ -617,3 +617,79 @@ def test_parallel_fallback_keeps_prior_attempts_and_marks_fallback(monkeypatch):
     assert telemetry["fallback_used"] is True
     assert telemetry["attempts"] == 5
     assert telemetry["input_chars"] == 50
+
+
+def test_sanitize_drops_gaze_and_psychology_clauses():
+    from src.agents.visual_prompt_agent import _sanitize_environment
+
+    env = "再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；街角路灯亮着"
+    out = _sanitize_environment(env)
+    assert "望向" not in out
+    assert "视线" not in out
+    assert "怕它" not in out
+    assert "街角路灯亮着" in out
+
+
+def test_sanitize_dedupes_repeated_clauses():
+    from src.agents.visual_prompt_agent import _sanitize_environment
+
+    env = "雨棚边缘雨水成线滴落。雨棚边缘雨水成线滴落；门灯照亮湿润台阶。门灯照亮湿润台阶"
+    out = _sanitize_environment(env)
+    assert out.count("雨棚边缘雨水成线滴落") == 1
+    assert out.count("门灯照亮湿润台阶") == 1
+
+
+def test_assembled_prompt_env_is_clean_and_deduplicated():
+    from types import SimpleNamespace
+
+    from src.schemas.script import (
+        LocationAsset,
+        Scene,
+        ScriptBreakdown,
+        ShotVisualBinding,
+        VisualAssetManifest,
+    )
+    from src.agents.visual_prompt_agent import (
+        VisualPromptAgent,
+        _CompactShotVisualPrompt,
+    )
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=5, narration_style="n",
+        scenes=[Scene(
+            scene_id=1, duration_sec=5, location="老城区巷口咖啡店门外",
+            characters=["林默"], action_description="林默站在屋檐下看表。",
+            camera_direction="中景", emotion_tone="克制",
+        )],
+        asset_manifest=VisualAssetManifest(
+            locations=[LocationAsset(
+                location_id="loc_cafe", canonical_name="巷口咖啡店",
+                representative_scene_id=1, shot_ids=[1],
+                environment_description="街角路灯亮着；再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；街角路灯亮着",
+            )],
+            shot_bindings=[ShotVisualBinding(scene_id=1, location_id="loc_cafe")],
+        ),
+    )
+    shot = _CompactShotVisualPrompt(
+        scene_id=1,
+        subject_state="林默站在屋檐下看表",
+        action_timeline="0-5秒，林默站在屋檐下看表",
+        environment_delta="门灯照亮湿润台阶",
+        camera_motion="中景",
+        lighting_delta="冷青夜色",
+        negative_prompt="低清晰度，模糊",
+        motion_strength=0.5,
+    )
+    output = SimpleNamespace(
+        overall_style="写实", color_palette="冷色", aspect_ratio="9:16",
+        global_character_descriptions_cn={}, global_negative_prompt="", shots=[],
+    )
+    rendered = VisualPromptAgent._assemble_compact_shot_prompt(
+        script, script.scenes[0], shot, output,
+    )
+    env_line = next(line for line in rendered.splitlines() if line.startswith("【环境】"))
+    assert "望向" not in env_line
+    assert "视线" not in env_line
+    assert "怕它" not in env_line
+    assert env_line.count("路灯") == 1
+    assert env_line.count("门灯") == 1

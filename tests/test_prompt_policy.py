@@ -2384,3 +2384,67 @@ def test_lu_lin_phone_call_keeps_call_and_fire_seal_focus_without_visible_new_ca
     assert "水面上的暗红色火漆印章" in rendered
     assert "mystery_caller" not in rendered
     assert "短信提示音" not in rendered
+
+
+def test_exit_and_chase_scene_does_not_trigger_entrance_template():
+    script = ScriptBreakdown(
+        title="test",
+        genre="都市",
+        logline="test",
+        duration_sec=5,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=9,
+                duration_sec=5,
+                location="老城区巷口咖啡店门口",
+                characters=["林默", "阿岚"],
+                action_description="林默走出店门，阿岚追出来把一杯热拿铁塞进他手里。",
+                camera_direction="中近景/侧面固定",
+                emotion_tone="温和",
+            )
+        ],
+    )
+    shot = ShotPrompt(
+        scene_id=9,
+        prompt="林默走出店门，阿岚追出来把一杯热拿铁塞进他手里。",
+        duration_sec=5,
+    )
+
+    rendered = build_timed_shot_prompt(shot, script)
+
+    assert "门被推开" not in rendered
+    assert "门铃" not in rendered
+    assert "藏到身后" not in rendered
+
+
+def test_plain_exit_scene_does_not_trigger_entrance_template():
+    script = ScriptBreakdown(
+        title="test",
+        genre="都市",
+        logline="test",
+        duration_sec=5,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=5,
+                location="咖啡店门口",
+                characters=["林默"],
+                action_description="林默走出店门，在门口雨棚下停住，回头看向店内。",
+                camera_direction="中景",
+                emotion_tone="克制",
+            )
+        ],
+    )
+    shot = ShotPrompt(
+        scene_id=1,
+        prompt="林默走出店门，在门口雨棚下停住，回头看向店内。",
+        duration_sec=5,
+    )
+
+    rendered = build_timed_shot_prompt(shot, script)
+
+    assert "门被推开" not in rendered
+    assert "门铃" not in rendered
+    assert "藏到身后" not in rendered

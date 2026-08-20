@@ -118,6 +118,14 @@ DYNAMIC_ENVIRONMENT_CUES = {
     "停在", "停下", "拧开", "拧动", "旋开", "摸向", "触向", "探向", "指向", "伸手",
     "抓住", "碰到", "拿起", "取出", "撑墙", "撑着墙", "站起", "起身", "消失在",
     "融为一体", "作为背景", "雨声",
+    # Gaze / psychology clauses that repeatedly slip into location dressing.
+    # A clause naming a static fixture (e.g. 巷口) is still a character action
+    # when it also names looking/thinking; it must not become reusable set.
+    "望向", "抬眼", "视线", "目光", "瞥向", "盯着", "凝视", "神色", "神情",
+    "怕", "担心", "害怕", "心里",
+    # Directional movement ("沿石阶向下走", "朝前走") is a shot action even
+    # when it names a static fixture such as 石阶.
+    "向下走", "向上走", "向前走", "往前走", "向后走", "朝前走", "朝里走", "朝外走",
 }
 VOICE_ONLY_NAME_TERMS = {
     "旁白", "画外音", "心声", "内心", "电话", "录音", "广播", "播报", "短信提示音",
@@ -985,6 +993,7 @@ def _has_voice_or_action_cue(value: str) -> bool:
         "背靠", "站立", "站起", "靠墙", "瘫坐", "坐下", "躺着", "跪", "蜷缩", "斜靠", "倚",
         "抬手", "举手", "伸手", "挥手", "摆手", "抵住", "按住", "握住", "轻叩", "猛击", "敲门",
         "拍门", "拍打", "探头", "侧身", "俯身", "弯腰", "直起身", "打量", "扫视", "踮脚",
+        "望向", "抬眼", "瞥向", "凝视", "盯着", "神色", "神情",
     }
     if any(cue in text for cue in _ENVIRONMENT_DYNAMIC_CUES | person_action_cues):
         return True
