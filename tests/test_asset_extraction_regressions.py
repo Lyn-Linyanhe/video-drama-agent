@@ -496,3 +496,28 @@ def test_environment_cleaner_drops_gaze_and_psychology_clauses():
     assert "街角路灯亮着" in cleaned
     assert "雨棚边缘雨水成线滴落" in cleaned
     assert "墙面大片水痕" in cleaned
+
+
+
+def test_environment_cleaner_drops_looking_at_and_event_clauses():
+    from src.utils import visual_asset_manifest as vam
+
+    scenes = [
+        Scene(
+            scene_id=1,
+            duration_sec=5,
+            location="旧钟楼地下室",
+            characters=["林默"],
+            action_description="林默看着黑暗中的暗道。",
+            camera_direction="中景",
+            emotion_tone="紧张",
+        )
+    ]
+    value = "旧钟楼地下室；看着黑暗中的暗道；地下室的旧钟表被撞倒；玻璃门铃响；墙面大片水痕；中央一张长桌"
+    cleaned = vam._clean_environment_description(value, scenes)
+
+    assert "看着" not in cleaned
+    assert "撞倒" not in cleaned
+    assert "门铃响" not in cleaned
+    assert "墙面大片水痕" in cleaned
+    assert "中央一张长桌" in cleaned

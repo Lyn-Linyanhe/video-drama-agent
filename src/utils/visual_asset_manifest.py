@@ -123,6 +123,7 @@ DYNAMIC_ENVIRONMENT_CUES = {
     # A clause naming a static fixture (e.g. 巷口) is still a character action
     # when it also names looking/thinking; it must not become reusable set.
     "望向", "抬眼", "视线", "目光", "瞥向", "盯着", "凝视", "神色", "神情",
+    "看着", "张望", "遥望", "回头", "撞倒", "被撞倒", "门铃响", "铃响",
     "怕", "担心", "害怕", "心里", "紧张", "不安", "屏息", "颤抖", "浸透", "被雨水",
     # Directional movement ("沿石阶向下走", "朝前走") is a shot action even
     # when it names a static fixture such as 石阶.

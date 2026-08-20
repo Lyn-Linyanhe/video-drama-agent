@@ -696,3 +696,38 @@ def test_assembled_prompt_env_is_clean_and_deduplicated():
     assert "发梢" not in env_line
     assert env_line.count("路灯") == 1
     assert env_line.count("门灯") == 1
+
+
+# ---------- Phase 2: environment/event word list + compact prompt contracts ----------
+def test_sanitize_drops_looking_at_event_and_future_clauses():
+    from src.agents.visual_prompt_agent import _sanitize_environment
+
+    env = "旧钟楼地下通道；看着黑暗中的暗道；地下室的旧钟表被撞倒；玻璃门铃响；墙上大片水痕"
+    out = _sanitize_environment(env)
+    assert "看着" not in out
+    assert "撞倒" not in out
+    assert "门铃响" not in out
+    assert "旧钟楼地下通道" in out
+    assert "墙上大片水痕" in out
+
+
+def test_compact_prompt_requires_same_segment_camera_and_subject_action():
+    from src.agents.visual_prompt_agent import COMPACT_SYSTEM_PROMPT
+
+    sys_ = COMPACT_SYSTEM_PROMPT
+    assert "每个时间戳段落必须同时写出镜头运动与主体动作" in sys_
+    assert "一镜只推进一个主要动作" in sys_
+
+
+def test_compact_prompt_forbids_future_environment_state():
+    from src.agents.visual_prompt_agent import COMPACT_SYSTEM_PROMPT
+
+    assert "未来状态" in COMPACT_SYSTEM_PROMPT
+    assert "后续镜头的事件" in COMPACT_SYSTEM_PROMPT
+
+
+def test_compact_prompt_locks_character_anchor_verbatim_reuse_and_specific_negatives():
+    from src.agents.visual_prompt_agent import COMPACT_SYSTEM_PROMPT
+
+    assert "逐字复用同一组锚点" in COMPACT_SYSTEM_PROMPT
+    assert "具体错误品类" in COMPACT_SYSTEM_PROMPT
