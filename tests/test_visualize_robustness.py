@@ -264,3 +264,31 @@ def test_parallel_scene_retries_once(monkeypatch):
     # scene 3 retried once
     assert fake.tries.get(3) == 2
     assert len([c for c in fake.calls if c == "_CompactShotVisualPrompt"]) == 7
+
+
+def test_parallel_falls_back_to_single_shot(monkeypatch):
+    import asyncio
+
+    from src.schemas.script import ScriptBreakdown
+    from src.agents.visual_prompt_agent import VisualPromptAgent
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(6)
+    )
+    agent = VisualPromptAgent()
+
+    async def boom(*a, **k):
+        raise RuntimeError("phase1 down")
+
+    async def single(*a, **k):
+        return ("single-visual", "single-prompts")
+
+    monkeypatch.setattr(agent, "_generate_global_visual", boom)
+    monkeypatch.setattr(agent, "_run_single_shot", single)
+    telemetry = {}
+    result = asyncio.run(agent._run_parallel_visualize(
+        script, prompt_overrides=None, creative_profile=None, telemetry=telemetry,
+        source_text="", _repair_character_profiles=False,
+    ))
+    assert result == ("single-visual", "single-prompts")
+    assert telemetry.get("fallback_used") is True

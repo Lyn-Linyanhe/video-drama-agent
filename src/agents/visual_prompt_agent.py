@@ -549,7 +549,8 @@ class VisualPromptAgent:
         Returns:
             Tuple of (VisualDesign, GenerationPrompts).
         """
-        if getattr(self.llm, "provider", "") == "kimi" and len(script.scenes) > 1:
+        provider_now = getattr(self.llm, "provider", "")
+        if provider_now == "kimi" and len(script.scenes) > 1:
             return await self._run_stepwise(
                 script,
                 prompt_overrides=prompt_overrides,
@@ -559,7 +560,7 @@ class VisualPromptAgent:
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
             )
-        if getattr(self.llm, "provider", "") == "deepseek" and len(script.scenes) > 1:
+        if provider_now == "deepseek" and len(script.scenes) > 1:
             return await self._run_parallel_visualize(
                 script,
                 prompt_overrides=prompt_overrides,
@@ -568,7 +569,26 @@ class VisualPromptAgent:
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
             )
+        return await self._run_single_shot(
+            script,
+            prompt_overrides=prompt_overrides,
+            creative_profile=creative_profile,
+            telemetry=telemetry,
+            source_text=source_text,
+            _repair_character_profiles=_repair_character_profiles,
+        )
 
+    async def _run_single_shot(
+        self,
+        script: ScriptBreakdown,
+        *,
+        prompt_overrides: dict | None,
+        creative_profile=None,
+        telemetry: dict | None = None,
+        source_text: str = "",
+        _repair_character_profiles: bool = True,
+    ) -> tuple[VisualDesign, GenerationPrompts]:
+        """Generate the whole script in a single structured call (original path)."""
         scenes_text = self._format_scenes(script)
         manifest_text = self._format_manifest(script)
 
@@ -713,30 +733,42 @@ class VisualPromptAgent:
         return results
 
     async def _run_parallel_visualize(self, script, *, prompt_overrides, creative_profile, telemetry, source_text, _repair_character_profiles):
-        """Plan B: phase-1 global+characters, then phase-2 per-scene deltas in parallel."""
-        manifest_text = self._format_manifest(script)
-        profile = creative_profile
-        profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
-        global_out = await self._generate_global_visual(script, manifest_text, profile, telemetry)
-        shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry)
-        output = _CompactVisualPromptOutput(
-            overall_style=global_out.overall_style,
-            color_palette=global_out.color_palette,
-            aspect_ratio=global_out.aspect_ratio or profile_ratio,
-            global_negative_prompt=global_out.global_negative_prompt,
-            global_character_descriptions=global_out.global_character_descriptions or {},
-            global_character_descriptions_cn=global_out.global_character_descriptions_cn or {},
-            shots=shots,
-        )
-        if _repair_character_profiles and self._registry_needs_profile_repair(
-            output.global_character_descriptions_cn, script
-        ):
-            repaired_en, repaired_cn = await self.reextract_visible_characters(
-                script, source_text=source_text
+        """Plan B: two-phase parallel; falls back to single-shot on persistent failure."""
+        try:
+            manifest_text = self._format_manifest(script)
+            profile = creative_profile
+            profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
+            global_out = await self._generate_global_visual(script, manifest_text, profile, telemetry)
+            shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry)
+            output = _CompactVisualPromptOutput(
+                overall_style=global_out.overall_style,
+                color_palette=global_out.color_palette,
+                aspect_ratio=global_out.aspect_ratio or profile_ratio,
+                global_negative_prompt=global_out.global_negative_prompt,
+                global_character_descriptions=global_out.global_character_descriptions or {},
+                global_character_descriptions_cn=global_out.global_character_descriptions_cn or {},
+                shots=shots,
             )
-            output.global_character_descriptions = repaired_en
-            output.global_character_descriptions_cn = repaired_cn
-        return self._split_output(output, script, prompt_overrides, creative_profile)
+            if _repair_character_profiles and self._registry_needs_profile_repair(
+                output.global_character_descriptions_cn, script
+            ):
+                repaired_en, repaired_cn = await self.reextract_visible_characters(
+                    script, source_text=source_text
+                )
+                output.global_character_descriptions = repaired_en
+                output.global_character_descriptions_cn = repaired_cn
+            return self._split_output(output, script, prompt_overrides, creative_profile)
+        except Exception:
+            if telemetry is not None:
+                telemetry["fallback_used"] = True
+            return await self._run_single_shot(
+                script,
+                prompt_overrides=prompt_overrides,
+                creative_profile=creative_profile,
+                telemetry=telemetry,
+                source_text=source_text,
+                _repair_character_profiles=_repair_character_profiles,
+            )
 
     async def _run_stepwise(
         self,
