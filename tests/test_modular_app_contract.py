@@ -34,7 +34,12 @@ EXPECTED_PATHS = {
     "/api/projects/{project_id}/job-events",
     "/api/projects/{project_id}/script/draft",
     "/api/projects/{project_id}/script/draft/confirm",
+    "/api/projects/{project_id}/image-history/review",
+    "/api/projects/{project_id}/image-history/candidate/accept",
+    "/api/projects/{project_id}/image-history/candidate/reject",
     "/api/settings",
+    "/api/settings/visual-review-capabilities",
+    "/api/settings/test-visual-review",
     "/api/image-capabilities",
     "/api/video-capabilities",
     "/api/test/tts",
@@ -45,7 +50,8 @@ EXPECTED_PATHS = {
 def test_domain_routers_preserve_public_contract():
     paths = set(api_server.app.openapi()["paths"])
     assert EXPECTED_PATHS <= paths
-    assert len(paths) == 88
+    # Five visual-review endpoints were added to the public contract.
+    assert len(paths) == 93
     # The entrypoint only composes the FastAPI application.  Route internals
     # remain owned by their domain modules rather than becoming implicit API
     # server globals again.
@@ -74,7 +80,7 @@ def test_studio_frontend_resources_are_not_served_from_a_stale_browser_cache():
 
     page = client.get("/")
     assert page.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
-    assert "bootstrap.js?v=20260818-script-progress" in page.text
+    assert "bootstrap.js?v=20260820-asset-review-fallback-1" in page.text
 
     module = client.get("/static/js/pages/production-actions.js")
     assert module.headers["cache-control"] == "no-store, max-age=0, must-revalidate"

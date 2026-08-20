@@ -39,7 +39,7 @@ def test_asset_cards_use_explicit_empty_and_load_failure_states():
 def test_history_records_with_empty_paths_are_not_rendered_as_images():
     editor = Path("web/js/components/image-editor.js").read_text(encoding="utf-8")
 
-    assert "const usable = Boolean(record.path)" in editor
+    assert "isUsableHistoryRecord(record)" in editor
     assert "文件不可用" in editor
     assert "historyError" in editor
 

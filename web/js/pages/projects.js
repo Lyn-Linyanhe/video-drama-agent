@@ -13,6 +13,7 @@ const renderRoles = (...args) => globalThis.StudioActions.renderRoles(...args);
 const renderScenes = (...args) => globalThis.StudioActions.renderScenes(...args);
 const renderShots = (...args) => globalThis.StudioActions.renderShots(...args);
 const renderStructuredScript = (...args) => globalThis.StudioActions.renderStructuredScript(...args);
+const renderScriptWorkspace = (...args) => globalThis.StudioActions.renderScriptWorkspace(...args);
 const resetProjectSession = (...args) => globalThis.StudioActions.resetProjectSession(...args);
 const restoreProjectMedia = (...args) => globalThis.StudioActions.restoreProjectMedia(...args);
 const rolesFromVisualDesign = (...args) => globalThis.StudioActions.rolesFromVisualDesign(...args);
@@ -146,6 +147,7 @@ async function openProject(projectId) {
     startProjectJobPolling();
   } catch(e) {
     if (e.name === 'AbortError' || !isCurrentProjectSession(snapshot)) return;
+    console.error('项目加载失败:', e);
     document.getElementById('project-info').innerHTML = `<b>项目 ${projectId.slice(0,8)}</b><br>加载失败`;
     updateStatus('⚠️ 项目数据加载失败');
   } finally {

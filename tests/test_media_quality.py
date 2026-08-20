@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 from src.services import media_quality
 from src.services import asset_generation
 from src.services.media_quality import inspect_image, inspect_video, review_image_subjective
+from src.utils.asset_versions import ImageAssetVersions
 
 
 def test_image_quality_rejects_blank_and_accepts_detailed_image(tmp_path: Path):
@@ -278,6 +279,33 @@ def test_character_review_accepts_profile_alias_and_natural_style_background_lab
     assert report["passed"] is True
 
 
+def test_character_review_uses_complete_contract_when_provider_score_is_placeholder():
+    checks = [
+        {"item": "身份锁定", "passed": True, "evidence": "同一角色的脸型、发型和服装一致"},
+        {"item": "真人摄影风格", "passed": True, "evidence": "真实皮肤和服装材质"},
+        {"item": "正面半身视图", "passed": True, "evidence": "头部至胸部中段入画"},
+        {"item": "禁用元素", "passed": True, "evidence": "未见其他人物、道具或文字"},
+    ]
+
+    report = media_quality._parse_visual_review(
+        json.dumps({
+            "passed": True,
+            "score": 0,
+            "should_regenerate": False,
+            "contract_checks": checks,
+            "issues": [],
+        }, ensure_ascii=False),
+        require_contract_checks=True,
+        contract_kind="character",
+    )
+
+    assert report["status"] == "passed"
+    assert report["passed"] is True
+    assert report["should_regenerate"] is False
+    assert report["score"] == 1.0
+    assert report["score_anomaly"]["raw_score"] == 0
+
+
 def test_character_review_prompt_requires_fixed_contract_categories():
     prompt = media_quality.build_image_review_prompt("character", "left_profile", "同一角色的左侧面半身图")
 
@@ -367,6 +395,143 @@ def test_quality_report_string_false_never_allows_automatic_reference():
     assert media_quality.image_allows_automatic_reference(image) is False
 
 
+def test_visual_review_classifies_missing_evidence_with_a_stable_verdict():
+    report = media_quality._parse_visual_review(
+        '{"passed":true,"score":1,"should_regenerate":false,"contract_checks":[]}',
+        require_contract_checks=True,
+        contract_kind="character",
+    )
+
+    assert report["review_verdict"] == "hard_fail"
+    assert report["review_reason"]
+    assert report["review_evidence"]
+    assert report["should_regenerate"] is True
+
+
+def test_visual_review_classifies_low_score_without_evidence_as_warning():
+    report = media_quality._parse_visual_review(
+        '{"passed":false,"score":0.60,"should_regenerate":false,"issues":[]}',
+        require_contract_checks=False,
+        contract_kind="image",
+    )
+
+    assert report["review_verdict"] == "warning"
+    assert report["hard_fail"] is False
+    assert report["should_regenerate"] is True
+
+
+def test_candidate_accept_and_reject_preserve_active_version(tmp_path: Path):
+    versions = ImageAssetVersions(tmp_path)
+    def detailed(path: Path) -> Path:
+        image = Image.new("RGB", (96, 96), (40, 90, 140))
+        draw = ImageDraw.Draw(image)
+        for offset in range(0, 96, 8):
+            draw.line((0, offset, 95, 95 - offset), fill=(230, 220, 80), width=2)
+        image.save(path)
+        return path
+
+    source = detailed(tmp_path / "source.png")
+    active_source = detailed(tmp_path / "active.png")
+    active_path, _ = versions.replace_with_file(
+        "prop", "letter", "front", active_source, "active", "generated",
+        metadata={"quality_report": {"status": "passed", "review_verdict": "passed"}},
+    )
+    candidate_id, _ = versions.add_candidate_file(
+        "prop", "letter", "front", source, "candidate", "generated",
+        metadata={
+            "quality_report": {
+                "status": "failed",
+                "review_verdict": "hard_fail",
+                "review_reason": "主体身份与提示词不一致",
+            },
+        },
+    )
+    accepted_path, accepted_prompt, history = versions.accept_candidate(
+        "prop", "letter", "front", candidate_id, "active",
+    )
+
+    assert accepted_path == active_path
+    assert accepted_prompt == "candidate"
+    accepted = next(item for item in history if item["id"] == candidate_id)
+    assert accepted["active"] is True
+    assert accepted["quality_report"]["review_verdict"] == "hard_fail"
+    assert accepted["quality_report"]["review_reason"] == "主体身份与提示词不一致"
+
+    rejected_id, _ = versions.add_candidate_file(
+        "prop", "letter", "front", source, "rejected", "generated",
+        metadata={
+            "quality_report": {"status": "warning", "review_verdict": "warning"},
+        },
+    )
+    rejected_history = versions.reject_candidate("prop", "letter", "front", rejected_id)
+    rejected = next(item for item in rejected_history if item["id"] == rejected_id)
+    assert rejected["rejected"] is True
+    assert next(item for item in rejected_history if item["active"])["id"] == candidate_id
+
+
+def test_list_versions_repairs_duplicate_active_markers_after_project_move(tmp_path: Path):
+    versions = ImageAssetVersions(tmp_path)
+    source = tmp_path / "scene.png"
+    Image.new("RGB", (96, 96), (20, 80, 120)).save(source)
+    active_path, _ = versions.replace_with_file(
+        "scene", "loc_test", "scene_center", source, "scene", "generated",
+    )
+
+    manifest = json.loads(versions.manifest_path.read_text(encoding="utf-8"))
+    key = "scene:loc_test:scene_center"
+    manifest["versions"][key].append({
+        "id": "stale-machine-record",
+        "path": "C:/old-machine/video-drama-agent/output/scene_center.png",
+        "prompt": "scene",
+        "source": "legacy",
+        "created_at": "2026-01-01T00:00:00",
+        "active": True,
+    })
+    versions.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    history = versions.list_versions("scene", "loc_test", "scene_center", "scene")
+    active_records = [record for record in history if record.get("active")]
+    assert len(active_records) == 1
+    assert active_records[0]["path"] == str(active_path)
+
+
+def test_candidate_group_accept_switches_all_views_atomically(tmp_path: Path):
+    versions = ImageAssetVersions(tmp_path)
+
+    def detailed(path: Path, color: tuple[int, int, int]) -> Path:
+        image = Image.new("RGB", (96, 96), color)
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((8, 8, 88, 88), outline=(230, 220, 80), width=3)
+        image.save(path)
+        return path
+
+    group_id = "group-atomic"
+    for view, color in (("front", (40, 90, 140)), ("back", (90, 40, 140))):
+        versions.replace_with_file("prop", "box", view, detailed(tmp_path / f"active-{view}.png", color), "active", "generated")
+        verdict = "hard_fail" if view == "back" else "warning"
+        candidate_id, _ = versions.add_candidate_file(
+            "prop", "box", view, detailed(tmp_path / f"candidate-{view}.png", color), "candidate", "generated",
+            metadata={
+                "group_id": group_id,
+                "attempt_no": 1,
+                "quality_report": {
+                    "status": "failed" if verdict == "hard_fail" else "warning",
+                    "review_verdict": verdict,
+                },
+            },
+        )
+        if view == "front":
+            front_candidate = candidate_id
+
+    histories = versions.accept_candidate_group(
+        "prop", "box", group_id, {"front": "active", "back": "active"},
+    )
+
+    assert next(item for item in histories["front"] if item["active"])["id"] == front_candidate
+    assert all(next(item for item in history if item["active"])["id"] for history in histories.values())
+    assert next(item for item in histories["back"] if item["active"])["quality_report"]["review_verdict"] == "hard_fail"
+
+
 def test_character_review_prompt_contains_strict_back_and_profile_orientation_contracts():
     back = media_quality.build_image_review_prompt("character", "back_full", "同一角色的正后方全身图")
     profile = media_quality.build_image_review_prompt("character", "left_profile", "同一角色的严格左侧面半身图")
@@ -397,9 +562,27 @@ def test_official_dashscope_happyhorse_credential_enables_qwen_review(monkeypatc
     review = media_quality.resolve_review_config()
 
     assert review["provider"] == "qwen"
-    assert review["model"] == "qwen-vl-plus"
+    assert review["model"] == "qwen-vl-max"
     assert review["api_key"] == "official-key"
     assert review["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def test_visual_review_capabilities_expose_model_without_credentials(monkeypatch):
+    import src.config as config
+    from src.api.routes import settings as settings_routes
+
+    monkeypatch.setattr(config, "REVIEW_LLM_ENABLED", True)
+    monkeypatch.setattr(config, "REVIEW_LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(config, "REVIEW_LLM_MODEL", "qwen-vl-max")
+    monkeypatch.setattr(config, "REVIEW_LLM_API_KEY", "")
+    monkeypatch.setattr(config, "REVIEW_LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+
+    result = settings_routes.visual_review_capabilities()
+
+    assert result["provider"] == "qwen"
+    assert result["model"] == "qwen-vl-max"
+    assert result["configured"] is False
+    assert "api_key" not in result
 
 
 @pytest.mark.asyncio

@@ -212,6 +212,17 @@ video-drama-agent-master/
     └── settings_ui.json              # API 配置档案
 ```
 
+### 图片视觉审核规则
+
+图片生成完成后先做确定性的文件、尺寸和空白检查；已配置视觉模型时，再按角色、场景或道具的视图契约做一次结构化初筛。审核结果固定为：
+
+- `passed`：技术检查和视觉契约均通过，可自动成为活动版本。
+- `warning`：模型发现疑点但证据不足，不自动重试或替换；结果作为候选保留，由用户确认。
+- `hard_fail`：有明确的契约失败、文件损坏或高置信度违规，自动只重试一次；第二次仍失败时停止重试，两个版本都保留在历史记录中。
+- `unreviewed`：视觉模型未配置、不可用或被 Mock 跳过，只保留并标记为未审核，不自动绑定到后续镜头。
+
+组图会先逐张审核，只有整组通过或用户整体确认后才切换活动视图，避免新旧视图混用。上传图片默认只做技术检查，不产生隐性视觉模型费用；用户点击“视觉检查”后才调用审核模型。对应接口为 `POST /api/projects/{id}/image-history/review`、`POST /api/projects/{id}/image-history/candidate/accept` 和 `POST /api/projects/{id}/image-history/candidate/reject`。
+
 ---
 
 ## 数据流追踪

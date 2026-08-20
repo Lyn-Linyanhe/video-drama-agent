@@ -6,6 +6,7 @@ from src.agents.video_gen_agent import VideoGenerationAgent
 from src.schemas.character import CharacterImage, CharacterImageAssets
 from src.schemas.prompt import GenerationPrompts, ShotPrompt
 from src.schemas.scene_image import SceneImage, SceneImageAssets
+from src.services.media_quality import image_allows_automatic_reference
 
 
 def test_warning_or_stale_asset_never_allows_automatic_reference():
@@ -22,6 +23,25 @@ def test_warning_or_stale_asset_never_allows_automatic_reference():
 
     assert api_context._image_allows_automatic_reference(warning) is False
     assert api_context._image_allows_automatic_reference(stale_passed) is False
+
+
+def test_nested_visual_warning_cannot_be_hidden_by_legacy_passed_status():
+    legacy_group_record = SimpleNamespace(
+        quality_report={
+            "status": "passed",
+            "visual_review": {
+                "status": "warning",
+                "passed": False,
+                "should_regenerate": True,
+                "review_verdict": "warning",
+            },
+        },
+        is_stale=False,
+        needs_confirmation=False,
+    )
+
+    assert image_allows_automatic_reference(legacy_group_record) is False
+    assert api_context._image_allows_automatic_reference(legacy_group_record) is False
 
 
 def test_batch_reference_bundle_filters_unreviewed_character_and_scene(tmp_path):

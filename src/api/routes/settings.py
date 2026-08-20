@@ -16,6 +16,7 @@ SECRET_SETTING_FIELDS = (
     "happyhorse_api_key",
     "ark_api_key",
     "image_gen_key",
+    "review_llm_api_key",
 )
 
 # These keys belonged to the old, provider-agnostic audio settings form.  The
@@ -111,6 +112,11 @@ def _normalize_audio_profile(profile: dict) -> dict:
     normalized.setdefault("kimi_prompt_review_enabled", True)
     normalized.setdefault("kimi_prompt_review_model", "kimi-k2.6")
     normalized.setdefault("kimi_prompt_review_base_url", "https://api.moonshot.cn/v1")
+    normalized.setdefault("review_llm_enabled", True)
+    normalized.setdefault("review_llm_provider", "")
+    normalized.setdefault("review_llm_model", "qwen-vl-max")
+    normalized.setdefault("review_llm_api_key", "")
+    normalized.setdefault("review_llm_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     legacy_key = str(normalized.get("minimax_api_key") or "").strip()
     if not normalized.get("happyhorse_api_key") and legacy_key:
         normalized["happyhorse_api_key"] = legacy_key
@@ -199,6 +205,12 @@ class SettingsRequest(BaseModel):
     kimi_prompt_review_api_key: str = ""
     kimi_prompt_review_model: str = "kimi-k2.6"
     kimi_prompt_review_base_url: str = "https://api.moonshot.cn/v1"
+    # ── Dedicated visual review ──
+    review_llm_enabled: bool = True
+    review_llm_provider: str = ""
+    review_llm_model: str = "qwen-vl-max"
+    review_llm_api_key: str = ""
+    review_llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     # ── Audio ──
     # Legacy values stay parseable for imported profiles but are excluded from
     # every persisted profile. Both adapters use happyhorse_api_key/base_url.
@@ -251,6 +263,83 @@ class SettingsRequest(BaseModel):
 @router.get("/api/settings")
 async def list_settings():
     return _public_settings(_load_settings())
+
+
+def visual_review_capabilities() -> dict:
+    """Expose visual-review readiness without returning any credential."""
+    import src.config as config
+    from src.services.media_quality import resolve_review_config
+
+    review = resolve_review_config()
+    explicit_provider = str(getattr(config, "REVIEW_LLM_PROVIDER", "") or "").strip().lower()
+    legacy_inferred = not explicit_provider and review.get("provider") == "qwen"
+    base_url = str(review.get("base_url") or "").rstrip("/")
+    host = base_url.split("/", 3)[2] if "://" in base_url else base_url
+    enabled = bool(getattr(config, "REVIEW_LLM_ENABLED", True))
+    configured = bool(enabled and review.get("provider") in {"qwen", "openai"} and review.get("model") and review.get("api_key"))
+    return {
+        "enabled": enabled,
+        "configured": configured,
+        "provider": review.get("provider", ""),
+        "model": review.get("model", ""),
+        "endpoint_host": host,
+        "legacy_inferred": legacy_inferred,
+        "status": "ok" if configured else ("disabled" if not enabled else "missing_key"),
+    }
+
+
+@router.get("/api/settings/visual-review-capabilities")
+async def get_visual_review_capabilities():
+    return visual_review_capabilities()
+
+
+@router.post("/api/settings/test-visual-review")
+async def test_visual_review(req: "TestConnectionRequest"):
+    """Probe the configured vision chat endpoint without starting generation."""
+    import base64
+    import httpx
+    import src.config as config
+    from src.services.media_quality import resolve_review_config
+
+    configured = resolve_review_config()
+    provider = str(req.provider or configured.get("provider") or "").strip().lower()
+    model = str(req.model or configured.get("model") or "qwen-vl-max").strip()
+    key = str(req.key or configured.get("api_key") or "").strip()
+    base_url = str(req.base_url or configured.get("base_url") or "").strip().rstrip("/")
+    if provider not in {"qwen", "openai"}:
+        return {"success": False, "status": 0, "category": "disabled", "detail": "当前没有配置受支持的视觉模型供应商"}
+    if not key:
+        return {"success": False, "status": 0, "category": "missing_key", "provider": provider, "model": model, "detail": "请先配置视觉模型 API Key"}
+    if not base_url:
+        return {"success": False, "status": 0, "category": "endpoint", "provider": provider, "model": model, "detail": "请先配置视觉模型端点"}
+    # A small valid PNG larger than Qwen-VL's 10px minimum. This is a
+    # non-generation probe payload and is never persisted as an asset.
+    image_data = base64.b64encode(
+        bytes.fromhex("89504e470d0a1a0a0000000d4948445200000010000000100802000000909168360000002249444154789c636c68686020053091a49a61540371808948757030aa811840b20600c94c01a050c670ec0000000049454e44ae426082")
+    ).decode("ascii")
+    url = f"{base_url}/chat/completions"
+    body = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 8,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "只回复 OK，确认你能读取这张图片。"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+            ],
+        }],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=max(10, int(getattr(config, "REVIEW_LLM_TIMEOUT", 120) or 120))) as client:
+            response = await client.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+        result = _probe_result(response, url)
+        result.update({"provider": provider, "model": model})
+        return result
+    except Exception as exc:
+        result = _connection_failure(exc, url)
+        result.update({"provider": provider, "model": model})
+        return result
 
 @router.get("/api/settings/{profile_name}")
 async def get_setting(profile_name: str):
@@ -313,6 +402,11 @@ async def save_settings(req: SettingsRequest):
         kimi_prompt_review_key=profile["kimi_prompt_review_api_key"],
         kimi_prompt_review_model=profile["kimi_prompt_review_model"],
         kimi_prompt_review_base_url=profile["kimi_prompt_review_base_url"],
+        review_llm_enabled=profile["review_llm_enabled"],
+        review_llm_provider=profile["review_llm_provider"],
+        review_llm_model=profile["review_llm_model"],
+        review_llm_key=profile["review_llm_api_key"],
+        review_llm_base_url=profile["review_llm_base_url"],
     )
     _reload_env_and_config()
     return {
@@ -730,7 +824,9 @@ def _write_env(llm_provider="", llm_model="", llm_key="", llm_base="",
                minimax_male_voice="", minimax_female_voice="", llm_timeout="1800", llm_stream="true",
                kimi_prompt_review_enabled=True, kimi_prompt_review_key="",
                kimi_prompt_review_model="kimi-k2.6",
-               kimi_prompt_review_base_url="https://api.moonshot.cn/v1"):
+               kimi_prompt_review_base_url="https://api.moonshot.cn/v1",
+               review_llm_enabled=True, review_llm_provider="", review_llm_model="qwen-vl-max",
+               review_llm_key="", review_llm_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"):
     """写入 .env 文件。"""
     env_path = BASE_DIR / ".env"
     llm_model = _normalize_llm_model(llm_provider, llm_model)
@@ -753,6 +849,11 @@ def _write_env(llm_provider="", llm_model="", llm_key="", llm_base="",
         "KIMI_PROMPT_REVIEW_API_KEY": kimi_prompt_review_key,
         "KIMI_PROMPT_REVIEW_MODEL": kimi_prompt_review_model or "kimi-k2.6",
         "KIMI_PROMPT_REVIEW_BASE_URL": kimi_prompt_review_base_url or "https://api.moonshot.cn/v1",
+        "REVIEW_LLM_ENABLED": "true" if review_llm_enabled else "false",
+        "REVIEW_LLM_PROVIDER": review_llm_provider,
+        "REVIEW_LLM_MODEL": review_llm_model or "qwen-vl-max",
+        "REVIEW_LLM_API_KEY": review_llm_key,
+        "REVIEW_LLM_BASE_URL": review_llm_base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "DEFAULT_VIDEO_API": default_video_api,
         "KLING_API_KEY": kling_api_key,
         "KLING_ACCESS_KEY": kling_ak,
@@ -826,12 +927,12 @@ def _reload_env_and_config():
     cfg.LLM_STREAM = os.getenv("LLM_STREAM", "true").strip().lower() not in {"0", "false", "no", "off"}
     cfg.REVIEW_LLM_ENABLED = os.getenv("REVIEW_LLM_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
     cfg.REVIEW_LLM_PROVIDER = os.getenv("REVIEW_LLM_PROVIDER", "").strip().lower()
-    cfg.REVIEW_LLM_MODEL = os.getenv("REVIEW_LLM_MODEL", "qwen-vl-plus")
+    cfg.REVIEW_LLM_MODEL = os.getenv("REVIEW_LLM_MODEL", "qwen-vl-max")
     happyhorse_base_url = os.getenv("HAPPYHORSE_BASE_URL", "https://dashscope.aliyuncs.com").rstrip("/").lower()
     cfg.REVIEW_LLM_API_KEY = (
         os.getenv("REVIEW_LLM_API_KEY", "")
-        or os.getenv("DASHSCOPE_API_KEY", "")
-        or (os.getenv("HAPPYHORSE_API_KEY", "") if happyhorse_base_url in {"https://dashscope.aliyuncs.com", "http://dashscope.aliyuncs.com"} else "")
+        or (os.getenv("DASHSCOPE_API_KEY", "") if not cfg.REVIEW_LLM_PROVIDER else "")
+        or (os.getenv("HAPPYHORSE_API_KEY", "") if not cfg.REVIEW_LLM_PROVIDER and happyhorse_base_url in {"https://dashscope.aliyuncs.com", "http://dashscope.aliyuncs.com"} else "")
     )
     cfg.REVIEW_LLM_BASE_URL = os.getenv("REVIEW_LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     cfg.REVIEW_LLM_TIMEOUT = int(os.getenv("REVIEW_LLM_TIMEOUT", "120"))

@@ -25,6 +25,10 @@ function handleAssetCardImageError(image) {
   }
 }
 
+function assetErrorMarkup(error) {
+  return error ? `<div class="asset-card-error" role="status">${escapeHtml(error)}</div>` : '';
+}
+
 function renderRoles() {
   const container = document.getElementById('role-cards');
   if (!appState.roles.length) {
@@ -61,6 +65,7 @@ function renderRoles() {
       </div>
       <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.5">${escapeHtml(r.description?.slice(0,80) || '')}</div>
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span data-asset-status style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${status} · ${availableImgs.length}/4</span><button class="btn-secondary btn-sm" onclick="event.stopPropagation();StudioActions.generateAssetCard('character','${encodedId}',${Boolean(mainImg?.image_path)})">${busy ? '终止' : mainImg?.image_path ? '重新生成' : '生成'}</button></div>
+      ${assetErrorMarkup(error)}
     </div>`;
   }).join('');
 }
@@ -113,6 +118,7 @@ function renderScenes() {
       <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.5">${escapeHtml((s.description || '').slice(0,60))}</div>
       <div style="font-size:10px;color:#71717a;margin-top:5px">用于分镜 ${escapeHtml((s.shotIds || []).join('、') || '未绑定')}</div>
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px"><span data-asset-status style="font-size:10px;color:${error ? '#ef4444' : ready ? '#10b981' : '#f59e0b'}">${status} · ${availableImgs.length}/${groupCount}</span>${action}</div>
+      ${assetErrorMarkup(error)}
     </div>`;
   }).join('');
 }
@@ -120,6 +126,7 @@ function renderScenes() {
 const __moduleActions = {
   assetPreviewMarkup,
   handleAssetCardImageError,
+  assetErrorMarkup,
   renderRoles,
   renderScenes,
 };

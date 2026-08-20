@@ -31,6 +31,16 @@ def _safe_message(value: object) -> str:
 
 def classify_job_error(exc: BaseException) -> dict[str, Any]:
     message = _safe_message(getattr(exc, "detail", None) or exc)
+    quality_report = getattr(exc, "report", None)
+    quality_report = quality_report if isinstance(quality_report, dict) else {}
+    visual_report = quality_report.get("visual_review")
+    visual_report = visual_report if isinstance(visual_report, dict) else {}
+    review_reason = str(
+        quality_report.get("review_reason")
+        or visual_report.get("review_reason")
+        or visual_report.get("summary")
+        or ""
+    ).strip()
     lowered = message.lower()
     status = int(getattr(exc, "status_code", 0) or 0)
     if not status:
@@ -41,9 +51,13 @@ def classify_job_error(exc: BaseException) -> dict[str, Any]:
     code = "operation_failed"
     suggestion = "请查看任务详情后重试"
     retriable = True
-    if any(token in lowered for token in ("ark api key", "volcengine api key", "ark authorization")):
+    if quality_report:
+        category, code = "quality", "visual_review_failed"
+        message = _safe_message(f"视觉审核未通过：{review_reason}" if review_reason else "视觉审核未通过")
+        suggestion = "本次生成图已保留在历史版本中，可查看审核原因并调整提示词后重试"
+    elif any(token in lowered for token in ("ark api key", "volcengine api key", "ark authorization")):
         category, code, suggestion, retriable = "authentication", "authentication_failed", "Check the Seedance Ark API key and provider settings", False
-    if status in (401, 403) or any(token in lowered for token in ("unauthorized", "invalid api key", "认证", "api key 无效")):
+    elif status in (401, 403) or any(token in lowered for token in ("unauthorized", "invalid api key", "认证", "api key 无效")):
         category, code, suggestion, retriable = "authentication", "authentication_failed", "请检查 API 设置中的密钥和服务商", False
     elif status == 429 or "rate limit" in lowered or "限流" in lowered:
         category, code, suggestion = "rate_limit", "rate_limited", "请稍后重试或降低并发数量"
@@ -229,6 +243,8 @@ class JobManager:
             current = self.store.get_job_by_id(job_id)
             if current and current["state"] not in TERMINAL_JOB_STATES:
                 error = classify_job_error(exc)
+                quality_report = getattr(exc, "report", None)
+                quality_report = quality_report if isinstance(quality_report, dict) else {}
                 request = current.get("request") or {}
                 if not error.get("provider") and current.get("provider"):
                     error["provider"] = str(current["provider"])
@@ -240,7 +256,8 @@ class JobManager:
                 if request.get("phase") and not error.get("phase"):
                     error["phase"] = str(request["phase"])
                 self.store.transition(
-                    job_id, "failed", "failed", error["message"], error_json=error,
+                    job_id, "failed", "failed", error["message"],
+                    error_json=error, quality_json=quality_report,
                 )
         finally:
             self.running.pop(job_id, None)

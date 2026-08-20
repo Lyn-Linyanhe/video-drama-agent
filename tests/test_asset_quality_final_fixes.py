@@ -99,6 +99,195 @@ def test_upload_validates_before_replace_and_records_unreviewed(tmp_path, monkey
     assert active_path.read_bytes() == original_bytes
     assert api_context._load_project_state(project_id).prop_images.props[0].version_id == original_version
 
+
+def test_candidate_accept_and_reject_endpoints_update_only_the_requested_view(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    generated = client.post(f"/api/projects/{project_id}/assets/prop/old_key/generate", json={})
+    assert generated.status_code == 200
+    state, asset, versions, _ = api_context._resolve_image_asset(
+        project_id,
+        RegenerateImageRequest(asset_type="prop", asset_id="old_key", view_type="front"),
+        create_missing=True,
+    )
+    source = _detailed_png(tmp_path / "candidate.png")
+    candidate_id, _ = versions.add_candidate_file(
+        "prop", "old_key", "front", source, "warning candidate", "generated",
+        metadata={"quality_report": {"status": "warning", "review_verdict": "warning"}},
+    )
+
+    accepted = client.post(
+        f"/api/projects/{project_id}/image-history/candidate/accept",
+        json={"asset_type": "prop", "asset_id": "old_key", "view_type": "front", "version_id": candidate_id},
+    )
+
+    assert accepted.status_code == 200
+    active = next(item for item in accepted.json()["history"] if item.get("active"))
+    assert active["id"] == candidate_id
+
+    rejected_id, _ = versions.add_candidate_file(
+        "prop", "old_key", "front", source, "to reject", "generated",
+        metadata={"quality_report": {"status": "warning", "review_verdict": "warning"}},
+    )
+    rejected = client.post(
+        f"/api/projects/{project_id}/image-history/candidate/reject",
+        json={"asset_type": "prop", "asset_id": "old_key", "view_type": "front", "version_id": rejected_id},
+    )
+
+    assert rejected.status_code == 200
+    rejected_record = next(item for item in rejected.json()["history"] if item["id"] == rejected_id)
+    assert rejected_record["rejected"] is True
+    assert next(item for item in rejected.json()["history"] if item["active"])["id"] == candidate_id
+
+
+def test_image_history_lists_failed_candidates_without_an_active_asset(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    versions = ImageAssetVersions(api_context.project_store.get_project_dir(project_id))
+    source = _detailed_png(tmp_path / "failed-candidate.png")
+    candidate_id, _ = versions.add_candidate_file(
+        "prop",
+        "old_key",
+        "front",
+        source,
+        "failed master prompt",
+        "prop_master_attempt",
+        metadata={
+            "attempt_no": 2,
+            "review_decision": "failed_after_retry",
+            "quality_report": {
+                "status": "warning",
+                "review_verdict": "hard_fail",
+                "review_reason": "主体形态不符合道具设定",
+            },
+        },
+    )
+
+    response = client.get(
+        f"/api/projects/{project_id}/image-history",
+        params={"asset_type": "prop", "asset_id": "old_key", "view_type": "front"},
+    )
+
+    assert response.status_code == 200
+    candidate = next(item for item in response.json()["versions"] if item["id"] == candidate_id)
+    assert candidate["candidate"] is True
+    assert candidate["review_decision"] == "failed_after_retry"
+    Path(candidate["path"]).unlink()
+
+    missing_response = client.get(
+        f"/api/projects/{project_id}/image-history",
+        params={"asset_type": "prop", "asset_id": "old_key", "view_type": "front"},
+    )
+    missing_candidate = next(
+        item for item in missing_response.json()["versions"] if item["id"] == candidate_id
+    )
+    assert missing_candidate["file_available"] is False
+
+
+def test_scene_image_history_preserves_requested_state_id(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    state = api_context._load_project_state(project_id)
+    location_id = state.script.asset_manifest.locations[0].location_id
+    captured = {}
+
+    class FakeVersions:
+        def list_versions(self, *_args):
+            return []
+
+    def resolve(_project_id, request, create_missing=False):
+        captured["state_id"] = request.state_id
+        captured["create_missing"] = create_missing
+        return state, SimpleNamespace(image_prompt=""), FakeVersions(), tmp_path / "unused.png"
+
+    monkeypatch.setattr("src.api.routes.assets._resolve_image_asset", resolve)
+    response = client.get(
+        f"/api/projects/{project_id}/image-history",
+        params={
+            "asset_type": "scene",
+            "asset_id": location_id,
+            "view_type": "wide",
+            "state_id": "state_rain_night",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured == {"state_id": "state_rain_night", "create_missing": True}
+
+
+def test_explicit_hard_fail_review_allows_manual_candidate_acceptance(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    generated = client.post(f"/api/projects/{project_id}/assets/prop/old_key/generate", json={})
+    assert generated.status_code == 200
+    versions = ImageAssetVersions(api_context.project_store.get_project_dir(project_id))
+    source = _detailed_png(tmp_path / "hard-fail-candidate.png")
+    candidate_id, _ = versions.add_candidate_file(
+        "prop", "old_key", "front", source, "candidate", "generated",
+        metadata={"quality_report": {"status": "warning"}},
+    )
+
+    async def review(*_args, **_kwargs):
+        return {
+            "status": "failed",
+            "passed": False,
+            "hard_fail": True,
+            "evidence_confidence": "high",
+            "summary": "主体身份与提示词明确冲突",
+        }
+
+    monkeypatch.setattr("src.api.routes.assets.review_image_subjective", review)
+    reviewed = client.post(
+        f"/api/projects/{project_id}/image-history/review",
+        json={
+            "asset_type": "prop",
+            "asset_id": "old_key",
+            "view_type": "front",
+            "version_id": candidate_id,
+        },
+    )
+    assert reviewed.status_code == 200
+
+    accepted = client.post(
+        f"/api/projects/{project_id}/image-history/candidate/accept",
+        json={
+            "asset_type": "prop",
+            "asset_id": "old_key",
+            "view_type": "front",
+            "version_id": candidate_id,
+        },
+    )
+
+    assert accepted.status_code == 200
+    active = next(item for item in accepted.json()["history"] if item.get("active"))
+    assert active["id"] == candidate_id
+    assert active["quality_report"]["visual_review"]["hard_fail"] is True
+
+
+def test_uploaded_or_active_image_visual_review_is_explicit_and_does_not_replace_file(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    generated = client.post(f"/api/projects/{project_id}/assets/prop/old_key/generate", json={})
+    assert generated.status_code == 200
+    before = api_context._load_project_state(project_id).prop_images.props[0]
+    active_path = Path(before.image_path)
+    active_version = before.version_id
+
+    async def review(*_args, **_kwargs):
+        return {
+            "status": "passed",
+            "passed": True,
+            "review_verdict": "passed",
+            "review_reason": "主体和视图符合要求",
+            "review_evidence": [{"item": "identity", "passed": True, "evidence": "单一道具可见", "severity": "info"}],
+        }
+
+    monkeypatch.setattr("src.api.routes.assets.review_image_subjective", review)
+    response = client.post(
+        f"/api/projects/{project_id}/image-history/review",
+        json={"asset_type": "prop", "asset_id": "old_key", "view_type": "front"},
+    )
+
+    assert response.status_code == 200
+    assert Path(active_path).is_file()
+    assert api_context._load_project_state(project_id).prop_images.props[0].version_id == active_version
+    assert response.json()["review"]["review_verdict"] == "passed"
+
     upload_path = _detailed_png(tmp_path / "uploaded.png", (300, 300))
     uploaded = client.post(
         f"/api/projects/{project_id}/image-upload",

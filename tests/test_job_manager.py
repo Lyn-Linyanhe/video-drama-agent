@@ -5,6 +5,7 @@ import pytest
 
 from src.services.job_manager import JobManager, classify_job_error
 from src.services.job_store import JobStore
+from src.services.media_quality import MediaQualityFailure
 
 
 def test_job_store_recovers_incomplete_tasks_and_is_idempotent(tmp_path: Path):
@@ -128,6 +129,40 @@ def test_error_classification_is_actionable_and_redacts_credentials():
     redacted = classify_job_error(RuntimeError("Authorization: BearerValue API_KEY=sk-secretvalue123"))
     assert "BearerValue" not in redacted["message"]
     assert "sk-secretvalue123" not in redacted["message"]
+
+
+def test_visual_quality_failure_exposes_review_reason_and_quality_category():
+    failure = MediaQualityFailure(
+        "Image visual review requires regeneration",
+        {
+            "review_reason": "石阶方向与剧本要求相反",
+            "review_verdict": "hard_fail",
+        },
+    )
+
+    classified = classify_job_error(failure)
+
+    assert classified["category"] == "quality"
+    assert classified["code"] == "visual_review_failed"
+    assert classified["message"] == "视觉审核未通过：石阶方向与剧本要求相反"
+    assert "历史版本" in classified["suggestion"]
+
+
+@pytest.mark.asyncio
+async def test_manager_persists_visual_quality_report_on_failed_job(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.sqlite3", recover=False)
+    manager = JobManager(store)
+    report = {"review_reason": "场景方向错误", "review_verdict": "hard_fail"}
+
+    async def handler(_context, _payload):
+        raise MediaQualityFailure("Image visual review requires regeneration", report)
+
+    manager.register("asset.generate", handler)
+    job = manager.create_job("a" * 12, "asset.generate")
+    finished = await manager.wait("a" * 12, job["job_id"], timeout=2)
+
+    assert finished["state"] == "failed"
+    assert finished["quality"] == report
 
 
 def test_seedance_missing_ark_key_is_classified_as_authentication_error():

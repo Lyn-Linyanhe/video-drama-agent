@@ -19,9 +19,11 @@ from src.services.asset_generation import (
     required_asset_views as _required_asset_views,
 )
 from src.services.asset_prompt_composer import compose_asset_prompt
+from src.services.media_quality import MediaQualityFailure, review_decision, review_image_subjective
 from src.services.image_capabilities import normalize_policy, public_capabilities
 from src.services.prop_view_requirements import infer_prop_view_requirement, set_prop_view_requirement
 from src.services.scene_view_requirements import derive_scene_view_requirements, set_scene_view_requirements
+from src.utils.asset_versions import ImageAssetVersions, asset_commit_transaction
 
 router = APIRouter()
 
@@ -41,6 +43,10 @@ class PropReferenceViewsRequest(BaseModel):
     provider: str = Field(default="", max_length=32)
     model: str = Field(default="", max_length=80)
     resolution: str = Field(default="", max_length=16)
+
+
+class ImageHistoryReviewRequest(ImageAssetRequest):
+    version_id: str = Field(default="", max_length=64)
 
 
 def _allowed_asset_views(asset_type: str, required_views: tuple[str, ...]) -> tuple[str, ...]:
@@ -145,10 +151,25 @@ async def generate_props(req: StageRequest):
 
 @router.get("/api/projects/{project_id}/image-history")
 async def get_image_history(project_id: str, asset_type: str, asset_id: str, view_type: str, state_id: str = ""):
-    request = ImageAssetRequest(asset_type=asset_type, asset_id=asset_id, view_type=view_type, state_id=state_id)
+    state = _load_project_state(project_id)
+    canonical_id = _canonical_asset_identity(state, asset_type, asset_id)
+    required = _required_asset_views(state, asset_type)
+    if canonical_id not in required:
+        raise HTTPException(404, "Asset not found in the current project manifest")
+    if view_type not in _allowed_asset_views(asset_type, required[canonical_id]):
+        raise HTTPException(400, "Invalid asset view")
     try:
-        _, asset, versions, _ = _resolve_image_asset(project_id, request)
-        return {"versions": versions.list_versions(asset_type, asset_id, view_type, asset.image_prompt)}
+        request = ImageAssetRequest(
+            asset_type=asset_type,
+            asset_id=canonical_id,
+            view_type=view_type,
+            state_id=state_id,
+        )
+        _state, asset, versions, _active_path = _resolve_image_asset(
+            project_id, request, create_missing=True,
+        )
+        prompt = str(getattr(asset, "image_prompt", "") or "")
+        return {"versions": versions.list_versions(asset_type, canonical_id, view_type, prompt)}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -333,13 +354,18 @@ async def generate_prop_views(project_id: str, prop_id: str, req: PropReferenceV
     state = _load_project_state(project_id, require_visual=False)
     if not _confirmed_prop_master(state, prop_id):
         raise HTTPException(409, "Please confirm the prop front master before generating derived prop views")
-    return await _generate_prop_reference_views(
-        project_id,
-        prop_id,
-        views,
-        req.custom_instructions,
-        {"provider": req.provider, "model": req.model, "resolution": req.resolution},
-    )
+    try:
+        return await _generate_prop_reference_views(
+            project_id,
+            prop_id,
+            views,
+            req.custom_instructions,
+            {"provider": req.provider, "model": req.model, "resolution": req.resolution},
+        )
+    except MediaQualityFailure as exc:
+        # Technical failures still use the legacy HTTP error contract, while
+        # the failed provider outputs have already been archived as candidates.
+        raise HTTPException(502, str(exc)) from exc
 
 
 @router.get("/api/projects/{project_id}/scenes/{asset_id}/view-requirements")
@@ -507,6 +533,9 @@ async def upload_image(
             "status": "skipped",
             "reason": "uploaded images require explicit visual review",
         }
+        quality_report["review_verdict"] = "unreviewed"
+        quality_report["review_reason"] = "上传图片默认不调用视觉模型，请手动执行视觉检查"
+        quality_report["review_evidence"] = []
         try:
             active_path, history = versions.replace_with_file(
                 asset_type,
@@ -550,6 +579,132 @@ async def activate_image_history(project_id: str, req: ActivateImageVersionReque
             quality_report=quality_report,
         )
         return {"state_json": state_json, "history": history}
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/api/projects/{project_id}/image-history/review")
+async def review_image_history(project_id: str, req: ImageHistoryReviewRequest):
+    """Run an explicit visual review on an active or historical image only."""
+    try:
+        state, asset, versions, _ = _resolve_image_asset(project_id, req)
+        history = versions.list_versions(req.asset_type, req.asset_id, req.view_type, asset.image_prompt)
+        selected = next(
+            (item for item in history if item.get("id") == req.version_id),
+            None,
+        ) if req.version_id else next((item for item in history if item.get("active")), None)
+        if not selected:
+            raise ValueError("Image history version not found")
+        image_path = Path(str(selected.get("path") or ""))
+        if not image_path.is_file():
+            raise ValueError("Image history file is missing")
+        prompt = str(selected.get("prompt") or asset.image_prompt or "")
+        visual = await review_image_subjective(image_path, prompt, req.view_type, req.asset_type)
+        current_report = selected.get("quality_report") if isinstance(selected.get("quality_report"), dict) else {}
+        report = {**current_report, "visual_review": visual}
+        visual_status = str(visual.get("status") or "").strip().casefold()
+        verdict = review_decision(visual)
+        report["review_verdict"] = verdict
+        report["status"] = (
+            "passed" if verdict == "passed"
+            else "failed" if verdict == "hard_fail"
+            else "unreviewed" if visual_status in {"skipped", "unreviewed"}
+            else "warning"
+        )
+        history = versions.update_quality_report(
+            req.asset_type, req.asset_id, req.view_type, str(selected.get("id")), report,
+        )
+        if selected.get("active"):
+            state_json = _save_image_asset_state(
+                project_id, state, asset, image_path, prompt,
+                version_id=str(selected.get("id") or ""), quality_report=report,
+            )
+        else:
+            state_json = _state_to_json(state)
+        return {"state_json": state_json, "history": history, "review": visual, "version_id": selected.get("id")}
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/api/projects/{project_id}/image-history/candidate/accept")
+async def accept_image_candidate(project_id: str, req: ActivateImageVersionRequest):
+    """Accept a warning/unreviewed candidate as the active image version."""
+    try:
+        state, asset, versions, _ = _resolve_image_asset(project_id, req)
+        selected = versions.find_version(req.asset_type, req.asset_id, req.view_type, req.version_id)
+        group_id = str((selected or {}).get("group_id") or "")
+        if group_id:
+            with asset_commit_transaction(project_store.get_project_dir(project_id)):
+                group_histories = versions.accept_candidate_group(
+                    req.asset_type,
+                    req.asset_id,
+                    group_id,
+                )
+                current_history = group_histories.get(req.view_type, [])
+                for view_type, history in group_histories.items():
+                    active_version = next((item for item in history if item.get("active")), {})
+                    view_request = req.model_copy(update={"view_type": view_type})
+                    view_state, view_asset, _view_versions, _ = _resolve_image_asset(project_id, view_request)
+                    _save_image_asset_state(
+                        project_id,
+                        view_state,
+                        view_asset,
+                        versions.active_path(req.asset_type, req.asset_id, view_type),
+                        str(active_version.get("prompt") or view_asset.image_prompt or ""),
+                        version_id=str(active_version.get("id") or ""),
+                        quality_report=active_version.get("quality_report", {}),
+                    )
+                active_version = next((item for item in current_history if item.get("active")), {})
+                state_json = _state_to_json(_load_project_state(project_id))
+            return {
+                "state_json": state_json,
+                "history": current_history,
+                "histories": group_histories,
+                "accepted_version_id": active_version.get("id", req.version_id),
+                "group_id": group_id,
+            }
+        with asset_commit_transaction(project_store.get_project_dir(project_id)):
+            active_path, prompt, history = versions.accept_candidate(
+                req.asset_type,
+                req.asset_id,
+                req.view_type,
+                req.version_id,
+                asset.image_prompt,
+            )
+            active_version = next((item for item in history if item.get("active")), {})
+            quality_report = active_version.get("quality_report", {})
+            state_json = _save_image_asset_state(
+                project_id,
+                state,
+                asset,
+                active_path,
+                prompt,
+                version_id=str(active_version.get("id") or req.version_id),
+                quality_report=quality_report,
+            )
+        return {"state_json": state_json, "history": history, "accepted_version_id": req.version_id}
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/api/projects/{project_id}/image-history/candidate/reject")
+async def reject_image_candidate(project_id: str, req: ActivateImageVersionRequest):
+    """Reject a candidate while retaining its file and history record."""
+    try:
+        state, _asset, versions, _ = _resolve_image_asset(project_id, req)
+        history = versions.reject_candidate(
+            req.asset_type,
+            req.asset_id,
+            req.view_type,
+            req.version_id,
+        )
+        return {"state_json": _state_to_json(state), "history": history, "rejected_version_id": req.version_id}
     except HTTPException:
         raise
     except (OSError, ValueError) as exc:

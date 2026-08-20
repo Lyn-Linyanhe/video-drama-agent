@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 短剧创作平台</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<link rel="stylesheet" href="/static/css/base.css?v=20260814-image-editor-layout">
+<link rel="stylesheet" href="/static/css/base.css?v=20260819-visual-review">
 <link rel="stylesheet" href="/static/css/settings.css">
 <link rel="stylesheet" href="/static/css/assets.css">
 <link rel="stylesheet" href="/static/css/production.css?v=20260814-shot-editor-layout">
@@ -252,7 +252,7 @@
 
         <section class="settings-panel" data-settings-panel="image">
           <div class="settings-panel-head">
-            <div><span class="settings-kicker">VISUAL ASSETS</span><h4>图片生成</h4><p>用于角色、场景和道具参考图。当前真实生成支持可灵。</p></div>
+            <div><span class="settings-kicker">VISUAL ASSETS</span><h4>图片生成</h4><p>用于角色、场景和道具参考图。真实生成支持可灵与万相。</p></div>
             <span class="settings-capability optional">可选</span>
           </div>
           <div class="settings-mode-note" id="img-mode-note"></div>
@@ -262,6 +262,8 @@
             <div class="settings-field full" id="cfg-img-key-field"><label for="cfg-img-key">图片 API Key</label><div class="settings-secret"><input type="password" id="cfg-img-key" data-secret-field="image_gen_key" autocomplete="new-password" placeholder="留空可复用视频的可灵 API Key"><button type="button" onclick="StudioActions.togglePwd('cfg-img-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-img-key')">清除</button></div><small>单独填写时仅用于图片生成；留空时复用可灵视频 API Key。</small></div>
           </div>
           <div class="settings-test-row"><button class="btn-secondary btn-sm" onclick="StudioActions.testConnection('image')">测试连接</button><span id="cfg-image-test" class="settings-test-status" role="status"></span></div>
+          <div class="settings-service-row"><div><strong>图片视觉审核</strong><p id="cfg-visual-review-capability">正在读取审核模型配置...</p></div><div class="settings-test-row"><button class="btn-secondary btn-sm" onclick="StudioActions.testVisualReview()">测试视觉模型</button><span id="cfg-visual-review-test" class="settings-test-status" role="status"></span></div></div>
+          <details class="settings-advanced"><summary>视觉审核模型配置</summary><div class="settings-advanced-body two-columns"><div class="settings-field"><label for="cfg-review-provider">供应商</label><select id="cfg-review-provider"><option value="">自动继承官方百炼凭证</option><option value="qwen">通义千问视觉</option><option value="openai">OpenAI 视觉</option></select></div><div class="settings-field"><label for="cfg-review-model">模型</label><input id="cfg-review-model" value="qwen-vl-max"></div><div class="settings-field full"><label for="cfg-review-key">视觉模型 API Key</label><div class="settings-secret"><input type="password" id="cfg-review-key" data-secret-field="review_llm_api_key" autocomplete="new-password" placeholder="留空继承官方百炼凭证"><button type="button" onclick="StudioActions.togglePwd('cfg-review-key', this)">显示</button><button type="button" class="clear-secret" onclick="StudioActions.clearSavedSecret('cfg-review-key')">清除</button></div></div><div class="settings-field full"><label for="cfg-review-base">视觉模型 Base URL</label><input id="cfg-review-base" value="https://dashscope.aliyuncs.com/compatible-mode/v1"><small>只保存端点，不会显示或导出密钥；审核测试只发送一张小图片，不创建生成任务。</small></div><div class="settings-field full"><label style="display:flex;align-items:center;gap:8px"><input id="cfg-review-enabled" type="checkbox" checked> 启用图片视觉审核</label></div></div></details>
         </section>
 
         <section class="settings-panel" data-settings-panel="video">
@@ -492,6 +494,10 @@
           <div class="image-editor-history-title">历史版本 <span>点击缩略图切换当前版本</span></div>
           <div id="image-editor-history"></div>
         </div>
+        <section class="image-editor-quality-section" aria-live="polite">
+          <div class="image-editor-history-title">视觉审核</div>
+          <div id="image-editor-quality-report" class="image-editor-quality-report">尚未执行视觉审核</div>
+        </section>
       </div>
       <div class="image-editor-work-panel">
         <section class="image-editor-section image-editor-identity-section">
@@ -545,6 +551,7 @@
               <label id="image-editor-save-policy-row" class="image-editor-label image-editor-checkbox"><input id="image-editor-save-policy" type="checkbox"> 设为项目默认图片模型</label>
               <label id="image-editor-reference-row" class="image-editor-label" style="display:none">附加角色参考图（可选）<select id="image-editor-reference-versions" multiple size="4"></select></label>
               <button class="btn-secondary" type="button" onclick="document.getElementById('image-editor-upload').click()">上传替换图片</button>
+              <button class="btn-secondary" type="button" onclick="StudioActions.reviewCurrentImage()">视觉检查（调用模型）</button>
               <input id="image-editor-upload" type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="StudioActions.uploadEditedImage(this)">
               <div class="image-editor-help image-editor-advanced-note">补充要求会叠加到当前视图的系统提示词；镜头方向、构图尺寸和禁用项始终由系统固定。新图片会自动保存为历史版本。</div>
             </div>
@@ -602,6 +609,6 @@ document.addEventListener('DOMContentLoaded', function() {
   arkModelSelect.value = models.includes(previous) ? previous : models[0];
 });
 </script>
-<script type="module" src="/static/js/bootstrap.js?v=20260818-script-progress"></script>
+<script type="module" src="/static/js/bootstrap.js?v=20260820-asset-review-fallback-1"></script>
 </body>
 </html>

@@ -29,6 +29,14 @@ function activeProjectJobs(predicate = () => true) {
   return projectJobs.filter(job => ['queued','running','validating'].includes(job.state) && predicate(job));
 }
 
+function assetJobErrorMessage(job) {
+  const message = String(job?.error?.message || '').trim();
+  if (message === 'Image visual review requires regeneration') {
+    return '视觉审核未通过，失败图片已保留在历史版本中';
+  }
+  return message || '生成失败';
+}
+
 function syncJobsToAssetState() {
   appState.assetBusy = {};
   appState.assetErrors = {};
@@ -36,16 +44,17 @@ function syncJobsToAssetState() {
   orderedJobs.forEach(job => {
     const isSingleAssetJob = job.job_type === 'asset.generate';
     const isCharacterGroup = job.job_type === 'character.reference.group' && job.target_type === 'character';
+    const isCharacterEdit = job.job_type === 'character.reference.edit' && job.target_type === 'character';
     const isSceneGroup = job.job_type === 'scene.reference.group' && job.target_type === 'scene';
     const isSceneEdit = job.job_type === 'scene.reference.edit' && job.target_type === 'scene';
     const isPropGroup = job.job_type === 'prop.reference.group' && job.target_type === 'prop';
-    if (!isSingleAssetJob && !isCharacterGroup && !isSceneGroup && !isSceneEdit && !isPropGroup) return;
+    if (!isSingleAssetJob && !isCharacterGroup && !isCharacterEdit && !isSceneGroup && !isSceneEdit && !isPropGroup) return;
     const assetId = String(job.target_id || '').split(':')[0];
-    const assetType = isCharacterGroup ? 'character' : (isSceneGroup || isSceneEdit) ? 'scene' : isPropGroup ? 'prop' : job.target_type;
+    const assetType = (isCharacterGroup || isCharacterEdit) ? 'character' : (isSceneGroup || isSceneEdit) ? 'scene' : isPropGroup ? 'prop' : job.target_type;
     const stateSuffix = assetType === 'scene' && job.payload?.state_id ? `:${job.payload.state_id}` : '';
     const key = `${assetType}:${assetId}${stateSuffix}`;
     if (['queued','running','validating'].includes(job.state)) appState.assetBusy[key] = true;
-    if (job.state === 'failed' || job.state === 'interrupted') appState.assetErrors[key] = job.error?.message || '生成失败';
+    if (job.state === 'failed' || job.state === 'interrupted') appState.assetErrors[key] = assetJobErrorMessage(job);
     if (job.state === 'succeeded') delete appState.assetErrors[key];
   });
 }
@@ -175,6 +184,7 @@ function toggleProjectJobs(force) {
 const __moduleActions = {
   jobTargetLabel,
   activeProjectJobs,
+  assetJobErrorMessage,
   syncJobsToAssetState,
   renderProjectJobs,
   updateJobDrivenControls,

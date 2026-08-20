@@ -43,13 +43,20 @@ def image_allows_automatic_reference(image: Any) -> bool:
 
     report = getattr(image, "quality_report", None)
     report = report if isinstance(report, dict) else {}
+    visual = report.get("visual_review") if isinstance(report.get("visual_review"), dict) else {}
     status = str(report.get("status") or "").strip().casefold()
-    if _quality_flag(report.get("should_regenerate")):
+    visual_status = str(visual.get("status") or "").strip().casefold()
+    verdict = str(report.get("review_verdict") or visual.get("review_verdict") or "").strip().casefold()
+    if verdict and verdict != "passed":
+        return False
+    if _quality_flag(report.get("should_regenerate")) or _quality_flag(visual.get("should_regenerate")):
         return False
     if "passed" in report and not _quality_flag(report.get("passed")):
         return False
+    if "passed" in visual and not _quality_flag(visual.get("passed")):
+        return False
 
-    if status == "passed":
+    if status == "passed" and visual_status not in {"warning", "failed", "unreviewed", "skipped"}:
         # A report can explicitly revoke automatic use even when its aggregate
         # status was copied as passed by an older migration.
         if "automatic_reference_allowed" in report and not _quality_flag(report.get("automatic_reference_allowed")):
@@ -222,7 +229,7 @@ def resolve_review_config() -> dict[str, str]:
     if happyhorse_key and happyhorse_base_url in {"https://dashscope.aliyuncs.com", "http://dashscope.aliyuncs.com"}:
         return {
             "provider": "qwen",
-            "model": "qwen-vl-plus",
+            "model": "qwen-vl-max",
             "api_key": happyhorse_key,
             "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         }
@@ -463,6 +470,70 @@ def _coerce_review_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def review_decision(report: dict[str, Any] | None) -> str:
+    """Classify a visual review without turning uncertainty into regeneration.
+
+    ``hard_fail`` is intentionally stricter than ``should_regenerate``.  The
+    latter is retained for backwards-compatible reporting, while only an
+    explicit high-confidence failure is allowed to spend another generation
+    request.
+    """
+    payload = report if isinstance(report, dict) else {}
+    if str(payload.get("status") or "").strip().casefold() == "passed" and _coerce_review_bool(payload.get("passed"), True):
+        return "passed"
+    if _coerce_review_bool(payload.get("hard_fail")) and str(payload.get("evidence_confidence") or "high").casefold() != "low":
+        return "hard_fail"
+    return "uncertain"
+
+
+def classify_quality_report(report: dict[str, Any] | None, asset_type: str = "image") -> str:
+    """Return the stable user-facing quality verdict for a persisted report.
+
+    Older reports only contain ``status``/``passed``.  Keep those records
+    readable while ensuring a warning or unavailable review cannot silently be
+    treated as a passed visual check.
+    """
+    payload = report if isinstance(report, dict) else {}
+    visual = payload.get("visual_review") if isinstance(payload.get("visual_review"), dict) else payload
+    verdict = str(visual.get("review_verdict") or payload.get("review_verdict") or "").strip().casefold()
+    if verdict in {"passed", "warning", "hard_fail", "unreviewed"}:
+        return verdict
+    if str(payload.get("status") or "").strip().casefold() in {"unreviewed", "skipped"}:
+        return "unreviewed"
+    if str(visual.get("status") or "").strip().casefold() in {"unreviewed", "skipped"}:
+        return "unreviewed"
+    if str(payload.get("status") or "").strip().casefold() == "failed":
+        return "hard_fail"
+    if _quality_flag(visual.get("hard_fail")) and str(visual.get("evidence_confidence") or "high").casefold() != "low":
+        return "hard_fail"
+    if _quality_flag(visual.get("passed")) and not _quality_flag(visual.get("should_regenerate")):
+        return "passed"
+    return "warning"
+
+
+def should_retry_visual_review(report: dict[str, Any] | None) -> bool:
+    """Return True only for a bounded, evidence-backed hard failure."""
+    return review_decision(report) == "hard_fail"
+
+
+def build_review_retry_patch(report: dict[str, Any] | None, expected_prompt: str = "") -> str:
+    """Build a small deterministic patch instead of rewriting a full prompt."""
+    payload = report if isinstance(report, dict) else {}
+    if review_decision(payload) != "hard_fail":
+        return ""
+    text = " ".join(str(item) for item in payload.get("issues", []) if str(item).strip()).casefold()
+    patches: list[str] = []
+    if any(token in text for token in ("正脸", "露脸", "face visible", "front face")) and any(token in str(expected_prompt).casefold() for token in ("背面", "back", "rear")):
+        patches.append("严格背面视角，头部不得回头，禁止出现正脸、侧脸、三分之二背面或任何面部轮廓")
+    if any(token in text for token in ("脚", "裁切", "crop", "feet")) and any(token in str(expected_prompt).casefold() for token in ("全身", "full body", "full-body")):
+        patches.append("完整全身入画，从头顶到双脚鞋底全部可见，不得裁切脚部")
+    if any(token in text for token in ("人物", "人脸", "person", "people")) and any(token in str(expected_prompt).casefold() for token in ("空场景", "不得出现人物", "no people")):
+        patches.append("空场景中不得出现任何人物、人物倒影、人物影子或屏幕人物")
+    if any(token in text for token in ("缺少", "missing", "absent")):
+        patches.append("提示词中已经列出的主体和固定锚点必须清晰可见，不得省略")
+    return "审核修正补丁（仅强化当前视图，不改变身份与画风）：" + "；".join(dict.fromkeys(patches)) if patches else ""
+
+
 def _scene_contract_category(label: str) -> str:
     """Map model-authored labels to the six required scene evidence categories."""
     text = str(label or "").strip().casefold().replace(" ", "")
@@ -536,18 +607,31 @@ def _parse_visual_review(
     try:
         payload = json.loads(match.group(0) if match else text)
     except (json.JSONDecodeError, AttributeError):
+        evidence = [{
+            "item": "review_format",
+            "passed": False,
+            "evidence": text[:300] or "视觉审核没有返回可解析的 JSON",
+            "severity": "critical",
+        }]
         return {
             "status": "warning",
             "passed": False,
             "score": 0.5,
             "should_regenerate": True,
+            "hard_fail": False,
+            "evidence_confidence": "low",
+            "review_decision": "uncertain",
             "issues": [text[:300] or "视觉审核返回格式无效"],
             "summary": "视觉审核返回格式无效",
+            "review_verdict": "hard_fail",
+            "review_reason": "视觉审核返回格式无法解析，不能确认图片是否合格",
+            "review_evidence": evidence,
         }
 
     issues = [str(item)[:300] for item in payload.get("issues", []) if str(item).strip()]
     contract_checks: list[dict[str, Any]] = []
     contract_failed = False
+    failed_checks: list[dict[str, Any]] = []
     if require_contract_checks:
         raw_checks = payload.get("contract_checks")
         if not isinstance(raw_checks, list):
@@ -563,6 +647,7 @@ def _parse_visual_review(
                 "item": name,
                 "passed": _coerce_review_bool(item.get("passed", False)),
                 "evidence": evidence,
+                "severity": str(item.get("severity") or ("critical" if not _coerce_review_bool(item.get("passed", False)) else "info")),
             })
         category_mapper = (
             _prop_contract_category if contract_kind == "prop"
@@ -620,31 +705,102 @@ def _parse_visual_review(
             )
             missing_text = "、".join(labels[key] for key in order if key in missing_categories)
             issues.insert(0, f"{('场景' if contract_kind != 'prop' else '道具')}审核缺少逐项视觉证据（{contract_name}）：{missing_text}，不能判定为通过")
-        failed_checks = [item for item in contract_checks if not item["passed"]]
+            contract_checks.extend({
+                "item": labels[key],
+                "passed": False,
+                "evidence": "模型未提供该审核类别的可见图像证据",
+                "severity": "missing",
+            } for key in order if key in missing_categories)
+        failed_checks = [
+            item for item in contract_checks
+            if not item["passed"] and item.get("severity") != "missing"
+        ]
         if failed_checks:
             contract_failed = True
             issues = [
                 f"{item['item']}不符合：{item['evidence']}"[:300]
                 for item in failed_checks
             ] + issues
-    score = payload.get("score", payload.get("overall_score", 1.0 if not issues else 0.55))
+    raw_score = payload.get("score", payload.get("overall_score", 1.0 if not issues else 0.55))
+    score = raw_score
     try:
         score = max(0.0, min(1.0, float(score)))
     except (TypeError, ValueError):
         score = 1.0 if not issues else 0.55
     if contract_failed:
         score = min(score, 0.55)
+
+    # Some vision models occasionally emit a placeholder score (most often
+    # ``0``) while returning a complete, positive contract assessment.  The
+    # contract evidence is the authoritative signal for asset reviews: when
+    # every required category is present and passed, the model explicitly
+    # says passed, and it reports no issues/retry request, do not turn that
+    # malformed score into an unnecessary regeneration.  Keep the raw value
+    # for diagnostics while exposing a useful normalized score to callers.
+    contract_evidence_passed = bool(
+        require_contract_checks
+        and contract_checks
+        and not contract_failed
+        and not issues
+        and _coerce_review_bool(payload.get("passed"), default=False)
+        and not _coerce_review_bool(payload.get("should_regenerate"), default=False)
+    )
+    score_anomaly: dict[str, Any] | None = None
+    if contract_evidence_passed and score < 0.65:
+        score_anomaly = {
+            "raw_score": raw_score,
+            "reason": "完整视觉契约证据全部通过，但供应商返回了异常低分；已以契约证据为准",
+        }
+        score = 1.0
     should_regenerate = _coerce_review_bool(payload.get("should_regenerate", False)) or score < 0.65 or contract_failed
     passed = _coerce_review_bool(payload.get("passed", not issues and not should_regenerate), default=not issues and not should_regenerate) and not should_regenerate
-    return {
+    confidence = str(payload.get("evidence_confidence") or "").strip().casefold()
+    explicit_hard_fail = _coerce_review_bool(payload.get("hard_fail"))
+    # A failed contract with concrete image evidence is safe to retry even if
+    # older reviewer prompts did not emit the newer hard_fail field. Missing
+    # evidence, malformed output, and score-only failures remain uncertain.
+    evidence_backed_contract_failure = bool(contract_failed and failed_checks)
+    hard_fail = bool(
+        (explicit_hard_fail or evidence_backed_contract_failure)
+        and confidence != "low"
+        and bool(issues)
+    )
+    if not confidence:
+        confidence = "high" if hard_fail else "low"
+    decision = "passed" if passed else ("hard_fail" if hard_fail else "uncertain")
+    if passed:
+        verdict = "passed"
+    elif hard_fail or contract_failed:
+        verdict = "hard_fail"
+    else:
+        verdict = "warning"
+    evidence = list(contract_checks)
+    if not evidence:
+        evidence = [{
+            "item": "overall",
+            "passed": passed,
+            "evidence": "未发现明确视觉问题" if passed else (issues[0] if issues else f"视觉评分为 {score:.2f}"),
+            "severity": "info" if passed else "warning",
+        }]
+    result = {
         "status": "passed" if passed else "warning",
         "passed": passed,
         "score": score,
         "should_regenerate": should_regenerate,
+        "hard_fail": hard_fail,
+        "evidence_confidence": confidence,
+        "retry_scope": str(payload.get("retry_scope") or "view"),
+        "review_decision": decision,
         "issues": issues,
         "summary": str(payload.get("summary", "") or "")[:500],
         "contract_checks": contract_checks,
+        "review_verdict": verdict,
+        "review_reason": str(payload.get("summary") or (issues[0] if issues else ("审核通过" if passed else "视觉审核未能确认通过")))[:500],
+        "review_evidence": evidence,
     }
+    if score_anomaly:
+        result["score_anomaly"] = score_anomaly
+    return result
 
 
 async def _review_image_with_openai_compatible(
@@ -664,7 +820,7 @@ async def _review_image_with_openai_compatible(
     if provider == "qwen":
         api_key = review["api_key"]
         base_url = review["base_url"] or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        model = review["model"] or "qwen-vl-plus"
+        model = review["model"] or "qwen-vl-max"
     else:
         api_key = str(getattr(config, "REVIEW_LLM_API_KEY", "") or getattr(config, "OPENAI_API_KEY", "") or "")
         base_url = str(getattr(config, "REVIEW_LLM_BASE_URL", "") or getattr(config, "OPENAI_BASE_URL", "") or "")

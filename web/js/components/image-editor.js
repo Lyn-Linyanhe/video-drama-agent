@@ -54,6 +54,17 @@ function imageEditorHasCurrentImage() {
   return Boolean(imageEditorImageSource(entry));
 }
 
+function imageEditorGenerationError() {
+  if (!activeImageEditor) return '';
+  const baseKey = `${activeImageEditor.assetType}:${activeImageEditor.assetId}`;
+  if (activeImageEditor.assetType !== 'scene' || !activeImageEditor.stateId) {
+    return appState.assetErrors?.[baseKey] || '';
+  }
+  return appState.assetErrors?.[`${baseKey}:${activeImageEditor.stateId}`]
+    || appState.assetErrors?.[baseKey]
+    || '';
+}
+
 async function projectImagePolicyPayload() {
   const projectId = appState.projectId;
   if (!projectId) return {};
@@ -188,7 +199,7 @@ function openPropImageEditor(index) {
 
 async function openImageEditor(assetType, assetId, viewType, stateId = '') {
   if (!appState.projectId || !['character', 'scene', 'prop'].includes(assetType)) return;
-  activeImageEditor = { assetType, assetId: String(assetId), stateId: stateId || '', viewType, history: [] };
+  activeImageEditor = { assetType, assetId: String(assetId), stateId: stateId || '', viewType, history: [], previewRecord: null };
   document.getElementById('modal-image-editor').style.display = 'flex';
   renderImageEditor();
   loadImageGenerationPolicy().catch(console.error);
@@ -227,6 +238,16 @@ function imageEditorEntries() {
 
 function imageEditorImageSource(entry) {
   return typeof entry?.image_path === 'string' ? entry.image_path.trim() : '';
+}
+
+function shouldShowMissingMediaNotice(imageSource) {
+  return Boolean(imageSource && isMissingMediaPath(imageSource));
+}
+
+function isUsableHistoryRecord(record) {
+  return Boolean(record?.path)
+    && record.file_available !== false
+    && !shouldShowMissingMediaNotice(record.path);
 }
 
 function imageEditorEntry() {
@@ -341,9 +362,115 @@ function imageEditorPayload() {
 
 function setImageEditorView(viewType) {
   activeImageEditor.viewType = viewType;
+  activeImageEditor.previewRecord = null;
   activeImageEditor.history = [];
   renderImageEditor();
   loadImageHistory();
+}
+
+function qualityReportForEntry(entry) {
+  const report = entry?.quality_report;
+  return report && typeof report === 'object' ? report : {};
+}
+
+function qualityVerdict(report) {
+  const visual = report?.visual_review && typeof report.visual_review === 'object' ? report.visual_review : report;
+  if (report?.hard_fail === true || visual?.hard_fail === true) return 'hard_fail';
+  return String(report?.review_verdict || visual?.review_verdict || (report?.status === 'passed' ? 'passed' : report?.status === 'unreviewed' ? 'unreviewed' : '')).toLowerCase();
+}
+
+function renderQualityReport(report) {
+  const box = document.getElementById('image-editor-quality-report');
+  if (!box) return;
+  const payload = report && typeof report === 'object' ? report : {};
+  const visual = payload.visual_review && typeof payload.visual_review === 'object' ? payload.visual_review : payload;
+  const verdict = qualityVerdict(payload);
+  const labels = {passed: '通过', warning: '有待确认', hard_fail: '明确不通过', unreviewed: '未执行'};
+  const label = labels[verdict] || '未审核';
+  const evidence = Array.isArray(payload.review_evidence) ? payload.review_evidence : (Array.isArray(visual.contract_checks) ? visual.contract_checks : []);
+  const issues = Array.isArray(visual.issues) ? visual.issues : (Array.isArray(payload.issues) ? payload.issues : []);
+  if (!verdict && !evidence.length && !issues.length) {
+    box.textContent = '尚未执行视觉审核';
+    return;
+  }
+  const score = Number.isFinite(Number(visual.score ?? payload.score)) ? ` · 评分 ${Number(visual.score ?? payload.score).toFixed(2)}` : '';
+  const reason = String(payload.review_reason || visual.summary || '').trim();
+  const evidenceHtml = evidence.slice(0, 8).map(item => {
+    const passed = item.passed === true || String(item.passed).toLowerCase() === 'true';
+    return `<li class="${passed ? 'is-pass' : 'is-fail'}"><strong>${escapeHtml(item.item || '检查项')}</strong>：${escapeHtml(item.evidence || item.message || '无证据')}</li>`;
+  }).join('');
+  const issueHtml = issues.slice(0, 5).map(item => `<li>${escapeHtml(item)}</li>`).join('');
+  const autoSelected = payload.auto_selected_after_review === true;
+  const selectedAttempt = Number(payload.selected_attempt_no || 0);
+  const autoSelectionHtml = autoSelected
+    ? `<div class="image-editor-quality-reason">已在审核未通过后自动选用${selectedAttempt ? `第 ${selectedAttempt} 次尝试` : '当前结果'}；其他候选仍保留在历史版本中，可随时切换或重新生成。</div>`
+    : '';
+  box.innerHTML = `<div class="image-editor-quality-verdict verdict-${escapeHtml(verdict || 'unknown')}">${escapeHtml(label)}${escapeHtml(score)}</div>${autoSelectionHtml}${reason ? `<div class="image-editor-quality-reason">${escapeHtml(reason)}</div>` : ''}${evidenceHtml ? `<ul class="image-editor-quality-evidence">${evidenceHtml}</ul>` : ''}${issueHtml ? `<ul class="image-editor-quality-issues">${issueHtml}</ul>` : ''}`;
+}
+
+function previewImageHistory(versionId) {
+  if (!activeImageEditor) return;
+  const record = (activeImageEditor.history || []).find(item => item.id === versionId);
+  if (!record) return;
+  activeImageEditor.previewRecord = record;
+  renderImageEditor();
+}
+
+async function acceptImageCandidate(versionId) {
+  if (!activeImageEditor || !versionId) return;
+  const operation = imageEditorSessionSnapshot();
+  try {
+    const res = await fetch(`${API_BASE}/api/projects/${appState.projectId}/image-history/candidate/accept`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...imageEditorPayload(), version_id: versionId}),
+    });
+    if (!res.ok) throw new Error(await imageEditorResponseError(res, '接受候选版本失败'));
+    const result = await res.json();
+    if (!isCurrentImageEditor(operation)) return;
+    activeImageEditor.previewRecord = null;
+    applyImageMutation(result);
+  } catch (error) {
+    if (isCurrentImageEditor(operation)) alert(error.message || '接受候选版本失败');
+  }
+}
+
+async function rejectImageCandidate(versionId) {
+  if (!activeImageEditor || !versionId) return;
+  const operation = imageEditorSessionSnapshot();
+  try {
+    const res = await fetch(`${API_BASE}/api/projects/${appState.projectId}/image-history/candidate/reject`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...imageEditorPayload(), version_id: versionId}),
+    });
+    if (!res.ok) throw new Error(await imageEditorResponseError(res, '放弃候选版本失败'));
+    const result = await res.json();
+    if (!isCurrentImageEditor(operation)) return;
+    activeImageEditor.previewRecord = null;
+    activeImageEditor.history = result.history || [];
+    renderImageEditor();
+  } catch (error) {
+    if (isCurrentImageEditor(operation)) alert(error.message || '放弃候选版本失败');
+  }
+}
+
+async function reviewCurrentImage() {
+  if (!activeImageEditor) return;
+  const operation = imageEditorSessionSnapshot();
+  const versionId = activeImageEditor.previewRecord?.id || imageEditorEntry()?.version_id || '';
+  try {
+    const res = await fetch(`${API_BASE}/api/projects/${appState.projectId}/image-history/review`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...imageEditorPayload(), version_id: versionId}),
+    });
+    if (!res.ok) throw new Error(await imageEditorResponseError(res, '视觉检查失败'));
+    const result = await res.json();
+    if (!isCurrentImageEditor(operation)) return;
+    activeImageEditor.previewRecord = null;
+    activeImageEditor.history = result.history || [];
+    applyImageMutation(result);
+  } catch (error) {
+    if (isCurrentImageEditor(operation)) alert(error.message || '视觉检查失败');
+  }
 }
 
 async function loadCharacterPromptPreview() {
@@ -394,6 +521,8 @@ async function loadAssetPromptPreview() {
 function renderImageEditor() {
   if (!activeImageEditor) return;
   const entry = imageEditorEntry();
+  const previewRecord = activeImageEditor.previewRecord;
+  const displayEntry = previewRecord || entry;
   const assetLabel = activeImageEditor.assetType === 'character' ? '角色形象' : activeImageEditor.assetType === 'prop' ? '道具视图' : '场景图片';
   const assetDisplayName = activeImageEditor.assetType === 'prop'
     ? (appState.props.find(item => item.propId === activeImageEditor.assetId)?.name || activeImageEditor.assetId)
@@ -407,8 +536,8 @@ function renderImageEditor() {
   const previewImage = document.getElementById('image-editor-preview');
   const previewEmpty = document.getElementById('image-editor-empty-state');
   const previewStatus = document.getElementById('image-editor-preview-status');
-  const imageSource = imageEditorImageSource(entry);
-  const imageMissing = Boolean(imageSource && isMissingMediaPath(imageSource));
+  const imageSource = previewRecord?.path || imageEditorImageSource(entry);
+  const imageMissing = shouldShowMissingMediaNotice(imageSource);
   const imageExists = Boolean(imageSource);
   previewImage.onerror = () => {
     if (!activeImageEditor || !previewEmpty) return;
@@ -419,8 +548,7 @@ function renderImageEditor() {
     previewEmpty.querySelector('span').textContent = '可重新生成当前视图或选择历史版本';
     if (previewStatus) previewStatus.hidden = true;
   };
-  // A stale missing-media report must not hide a path that can still be loaded.
-  if (imageMissing && !imageExists) {
+  if (imageMissing) {
     previewImage.style.display = 'none';
     previewImage.hidden = true;
     previewImage.removeAttribute('src');
@@ -438,13 +566,21 @@ function renderImageEditor() {
     previewImage.hidden = false;
     if (previewEmpty) previewEmpty.hidden = true;
     previewStatus.hidden = true;
-    previewImage.src = imageSource ? mediaUrl(imageSource, entry.version_id) : '';
+    previewImage.src = imageSource ? mediaUrl(imageSource, displayEntry?.id || displayEntry?.version_id || '') : '';
+  }
+  const generationError = imageEditorGenerationError();
+  if (generationError && previewStatus) {
+    previewStatus.hidden = false;
+    previewStatus.classList.add('is-error');
+    previewStatus.textContent = `生成失败：${generationError}`;
+  } else if (previewStatus) {
+    previewStatus.classList.remove('is-error');
   }
   const systemPrompt = activeImageEditor.assetType === 'character'
-    ? (entry?.image_prompt || '将由系统根据角色设定和当前视图生成。')
+    ? (displayEntry?.image_prompt || displayEntry?.prompt || '将由系统根据角色设定和当前视图生成。')
     : activeImageEditor.assetType === 'prop'
-      ? (entry?.image_prompt || '正在加载道具当前视图系统提示词...')
-      : (entry?.image_prompt || draftImageEditorPrompt());
+      ? (displayEntry?.image_prompt || displayEntry?.prompt || '正在加载道具当前视图系统提示词...')
+      : (displayEntry?.image_prompt || displayEntry?.prompt || draftImageEditorPrompt());
   const systemPromptElement = document.getElementById('image-editor-system-prompt');
   if (systemPromptElement) systemPromptElement.value = systemPrompt;
   document.getElementById('image-editor-negative-prompt').value = '';
@@ -502,15 +638,31 @@ function renderImageEditor() {
   if (historySection) historySection.hidden = !history.length && !historyError;
   document.getElementById('image-editor-history').innerHTML = history.length
     ? history.map(record => {
-      const usable = Boolean(record.path);
+      const usable = isUsableHistoryRecord(record);
       const preview = usable
         ? `<img src="${mediaUrl(record.path)}" style="display:block;width:100%;height:74px;object-fit:cover;border-radius:3px" alt="">`
         : '<span class="media-missing-notice">文件不可用</span>';
-      return `<button class="btn-secondary" style="padding:4px;border-color:${record.active ? '#10b981' : '#27272a'}" onclick="StudioActions.activateImageHistory('${record.id}')" title="${escapeHtml(record.source || 'history')}">${preview}<span style="display:block;font-size:10px;margin-top:3px">${record.active ? '当前' : (record.source || 'history')}</span></button>`;
+      const decision = String(record.review_verdict || record.review_decision || record.quality_report?.review_verdict || record.quality_report?.review_decision || '').trim();
+      const decisionLabel = decision === 'hard_fail'
+        ? '硬失败候选'
+        : decision === 'failed_after_retry'
+          ? '重试失败候选'
+          : decision === 'uncertain'
+            ? '审核不确定'
+            : record.candidate
+              ? '候选版本'
+              : (record.source || '历史版本');
+      const attempt = record.attempt_no ? ` · 第${record.attempt_no}次` : '';
+      const label = record.active ? `当前版本${attempt}` : `${decisionLabel}${attempt}`;
+      const previewButton = `<button class="btn-secondary image-history-entry${record.candidate ? ' is-candidate' : ''}" style="padding:4px;border-color:${record.active ? '#10b981' : record.candidate ? '#f59e0b' : '#27272a'}" onclick="StudioActions.${record.candidate ? 'previewImageHistory' : 'activateImageHistory'}('${record.id}')" title="${escapeHtml([record.source || 'history', decision].filter(Boolean).join(' · '))}">${preview}<span style="display:block;font-size:10px;margin-top:3px">${escapeHtml(label)}</span></button>`;
+      return record.candidate
+        ? `<div class="image-history-candidate">${previewButton}<div class="image-history-candidate-actions"><button class="btn-secondary btn-sm" type="button" onclick="StudioActions.acceptImageCandidate('${record.id}')">接受</button><button class="btn-secondary btn-sm" type="button" onclick="StudioActions.rejectImageCandidate('${record.id}')">放弃</button></div></div>`
+        : previewButton;
     }).join('')
     : historyError
       ? `<div class="image-editor-history-error"><span>${escapeHtml(historyError)}</span><button class="btn-secondary btn-sm" type="button" onclick="StudioActions.loadImageHistory()">重试</button></div>`
       : '<div style="font-size:12px;color:#71717a">暂无历史版本</div>';
+  renderQualityReport(qualityReportForEntry(displayEntry));
   renderImagePolicyControls();
   updateJobDrivenControls();
 }
@@ -737,6 +889,8 @@ const __moduleActions = {
   imageEditorEntry,
   imageEditorViews,
   imageEditorImageSource,
+  shouldShowMissingMediaNotice,
+  isUsableHistoryRecord,
   hasChinesePrompt,
   characterIdentity,
   characterDescription,
@@ -754,6 +908,11 @@ const __moduleActions = {
   loadAssetPromptPreview,
   renderImageEditor,
   loadImageHistory,
+  renderQualityReport,
+  previewImageHistory,
+  acceptImageCandidate,
+  rejectImageCandidate,
+  reviewCurrentImage,
   applyImageMutation,
   requestImageRegeneration,
   generateCharacterMaster,

@@ -24,3 +24,9 @@ def test_api_health_check_runs_after_all_frontend_modules_are_loaded():
     assert "/api/health" in bootstrap
     assert "/api/health" not in shots
     assert "/api/health" not in script
+
+
+def test_project_open_resolves_script_workspace_renderer_through_studio_actions():
+    source = (ROOT / "web/js/pages/projects.js").read_text(encoding="utf-8")
+
+    assert "const renderScriptWorkspace = (...args) => globalThis.StudioActions.renderScriptWorkspace(...args);" in source

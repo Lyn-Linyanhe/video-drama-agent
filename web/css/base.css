@@ -143,6 +143,21 @@
   .image-editor-checkbox input { width: auto; }
   .image-editor-history-section { margin-top: 14px; }
   .image-editor-history-error { display:flex; align-items:center; justify-content:space-between; gap:8px; color:#fca5a5; font-size:11px; }
+  .image-editor-quality-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid #272c40; }
+  .image-editor-quality-report { margin-top: 8px; color: #adb4c4; font-size: 11px; line-height: 1.55; }
+  .image-editor-quality-verdict { font-weight: 650; color: #d9dee9; }
+  .image-editor-quality-verdict.verdict-passed { color: #6ee7b7; }
+  .image-editor-quality-verdict.verdict-warning { color: #fbbf24; }
+  .image-editor-quality-verdict.verdict-hard_fail { color: #fca5a5; }
+  .image-editor-quality-verdict.verdict-unreviewed { color: #c4b5fd; }
+  .image-editor-quality-reason { margin-top: 4px; color: #c5cad5; }
+  .image-editor-quality-evidence, .image-editor-quality-issues { margin: 6px 0 0 16px; padding: 0; }
+  .image-editor-quality-evidence li.is-pass { color: #a7f3d0; }
+  .image-editor-quality-evidence li.is-fail, .image-editor-quality-issues li { color: #fca5a5; }
+  .image-history-candidate { display: flex; flex: 0 0 110px; flex-direction: column; gap: 5px; }
+  .image-history-candidate .image-history-entry { flex: 0 0 auto !important; }
+  .image-history-candidate-actions { display: flex; gap: 4px; }
+  .image-history-candidate-actions .btn-sm { min-height: 26px; padding: 3px 6px; font-size: 10px; }
   .image-editor-work-panel textarea { resize:none !important; overflow:auto; min-height:0; }
   .image-editor-request { resize: vertical !important; }
   .image-editor-history-title { color:#a1a1aa; font-size:12px; }
@@ -420,6 +435,8 @@
   .asset-preview-empty span { color: #71717a; font-size: 10px; line-height: 1.45; }
   .asset-preview-empty.is-missing strong { color: #fbbf24; }
   .asset-preview-empty.is-error strong { color: #fca5a5; }
+  .asset-card-error { margin-top: 7px; padding: 7px 8px; border: 1px solid #7f1d1d; border-radius: 5px; background: #2a1216; color: #fca5a5; font-size: 10px; line-height: 1.45; word-break: break-word; }
+  #image-editor-preview-status.is-error { margin-top: 8px; padding: 8px 10px; border: 1px solid #7f1d1d; border-radius: 5px; background: #2a1216; color: #fca5a5; font-size: 11px; line-height: 1.5; }
   /* Spin */
   .spin {
     display: inline-block; width: 16px; height: 16px; border: 2px solid #3f3f5c;

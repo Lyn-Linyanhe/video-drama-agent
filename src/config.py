@@ -35,7 +35,7 @@ LLM_STREAM = os.getenv("LLM_STREAM", "true").strip().lower() not in {"0", "false
 # continue handling script parsing while a vision model audits generated clips.
 REVIEW_LLM_ENABLED = os.getenv("REVIEW_LLM_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 REVIEW_LLM_PROVIDER = os.getenv("REVIEW_LLM_PROVIDER", "").strip().lower()
-REVIEW_LLM_MODEL = os.getenv("REVIEW_LLM_MODEL", "qwen-vl-plus")
+REVIEW_LLM_MODEL = os.getenv("REVIEW_LLM_MODEL", "qwen-vl-max")
 _happyhorse_base_url = os.getenv("HAPPYHORSE_BASE_URL", "https://dashscope.aliyuncs.com").rstrip("/").lower()
 _happyhorse_is_official_dashscope = _happyhorse_base_url in {
     "https://dashscope.aliyuncs.com",
@@ -43,8 +43,8 @@ _happyhorse_is_official_dashscope = _happyhorse_base_url in {
 }
 REVIEW_LLM_API_KEY = (
     os.getenv("REVIEW_LLM_API_KEY", "")
-    or os.getenv("DASHSCOPE_API_KEY", "")
-    or (os.getenv("HAPPYHORSE_API_KEY", "") if _happyhorse_is_official_dashscope else "")
+    or (os.getenv("DASHSCOPE_API_KEY", "") if not REVIEW_LLM_PROVIDER else "")
+    or (os.getenv("HAPPYHORSE_API_KEY", "") if not REVIEW_LLM_PROVIDER and _happyhorse_is_official_dashscope else "")
 )
 REVIEW_LLM_BASE_URL = os.getenv("REVIEW_LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 REVIEW_LLM_TIMEOUT = int(os.getenv("REVIEW_LLM_TIMEOUT", "120"))

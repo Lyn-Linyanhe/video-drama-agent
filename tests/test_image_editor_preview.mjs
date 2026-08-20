@@ -17,7 +17,7 @@ assert.equal(
 assert.equal(__moduleActions.imageEditorImageSource({}), '', 'entries without an image path stay empty');
 assert.match(
   await (await import('node:fs/promises')).readFile(new URL('../web/js/components/image-editor.js', import.meta.url), 'utf8'),
-  /const usable = Boolean\(record\.path\);/,
+  /const usable = isUsableHistoryRecord\(record\);/,
   'history thumbnails must also try persisted paths before showing a missing notice',
 );
 

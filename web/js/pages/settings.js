@@ -15,6 +15,7 @@ const SETTINGS_DEFAULTS = {
   llm_provider: 'deepseek', llm_model: 'deepseek-v4-flash', llm_key: '', llm_base_url: '',
   llm_timeout: '1800', llm_stream: 'true', llm_temperature: '0.25', llm_top_p: '0.9',
   kimi_prompt_review_enabled: true, kimi_prompt_review_api_key: '', kimi_prompt_review_model: 'kimi-k2.6', kimi_prompt_review_base_url: 'https://api.moonshot.cn/v1',
+  review_llm_enabled: true, review_llm_provider: '', review_llm_model: 'qwen-vl-max', review_llm_api_key: '', review_llm_base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   tts_provider: 'edge', tts_key: '', tts_base_url: '', tts_model: '',
   minimax_api_key: '', minimax_model: 'MiniMax/speech-2.8-turbo', minimax_timeout: '45', minimax_default_male_voice: '', minimax_default_female_voice: '',
   dashscope_tts_provider: 'qwen3', qwen_tts_model: 'qwen3-tts-flash', qwen_timeout: '45', qwen_default_male_voice: 'Ethan', qwen_default_female_voice: 'Cherry', edge_tts_fallback: true,
@@ -34,6 +35,45 @@ let activeSettingsProfile = '';
 let currentSettingsProfile = {...SETTINGS_DEFAULTS};
 let settingsSecretConfigured = {};
 const clearedSecretFields = new Set();
+
+async function loadVisualReviewCapabilities() {
+  const target = document.getElementById('cfg-visual-review-capability');
+  if (!target) return;
+  try {
+    const data = await settingsJson(await fetch(`${API_BASE}/api/settings/visual-review-capabilities`));
+    const provider = data.provider || '未配置';
+    const model = data.model || '未配置';
+    const endpoint = data.endpoint_host ? ` · ${data.endpoint_host}` : '';
+    target.textContent = data.configured
+      ? `${provider} / ${model}${endpoint}${data.legacy_inferred ? ' · 继承百炼视频凭证' : ''}`
+      : (data.status === 'disabled' ? '已关闭' : `${provider} / ${model} · 未配置 API Key`);
+  } catch (error) {
+    target.textContent = `无法读取：${error.message}`;
+  }
+}
+
+async function testVisualReview() {
+  const statusEl = document.getElementById('cfg-visual-review-test');
+  if (!statusEl) return;
+  statusEl.className = 'settings-test-status testing';
+  statusEl.textContent = '正在检查...';
+  try {
+    const result = await settingsJson(await fetch(`${API_BASE}/api/settings/test-visual-review`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+        provider: document.getElementById('cfg-review-provider')?.value || '',
+        model: document.getElementById('cfg-review-model')?.value || '',
+        key: document.getElementById('cfg-review-key')?.value || '',
+        base_url: document.getElementById('cfg-review-base')?.value || '',
+      }),
+    }));
+    statusEl.className = `settings-test-status ${result.success ? 'success' : 'error'}`;
+    statusEl.textContent = result.detail || (result.success ? '视觉模型连接正常' : '视觉模型连接失败');
+    loadVisualReviewCapabilities();
+  } catch (error) {
+    statusEl.className = 'settings-test-status error';
+    statusEl.textContent = error.message || '视觉模型连接失败';
+  }
+}
 
 function showSettingsSection(section) {
   document.querySelectorAll('[data-settings-panel]').forEach(panel => panel.classList.toggle('active', panel.dataset.settingsPanel === section));
@@ -145,6 +185,11 @@ function collectSettings(profileName) {
     kimi_prompt_review_api_key: document.getElementById('cfg-kimi-review-key').value,
     kimi_prompt_review_model: document.getElementById('cfg-kimi-review-model').value,
     kimi_prompt_review_base_url: document.getElementById('cfg-kimi-review-base').value,
+    review_llm_enabled: document.getElementById('cfg-review-enabled').checked,
+    review_llm_provider: document.getElementById('cfg-review-provider').value,
+    review_llm_model: document.getElementById('cfg-review-model').value,
+    review_llm_api_key: document.getElementById('cfg-review-key').value,
+    review_llm_base_url: document.getElementById('cfg-review-base').value,
     default_video_api: document.getElementById('cfg-video-api').value,
     kling_api_key: document.getElementById('cfg-kling-api-key').value,
     kling_access_key: document.getElementById('cfg-kling-access-key').value,
@@ -196,6 +241,11 @@ function populateSettings(p) {
   if (currentSettingsProfile.kimi_prompt_review_model && ![...kimiReviewModel.options].some(option => option.value === currentSettingsProfile.kimi_prompt_review_model)) kimiReviewModel.add(new Option(currentSettingsProfile.kimi_prompt_review_model, currentSettingsProfile.kimi_prompt_review_model));
   set('cfg-kimi-review-model', currentSettingsProfile.kimi_prompt_review_model || 'kimi-k2.6');
   set('cfg-kimi-review-base', currentSettingsProfile.kimi_prompt_review_base_url || 'https://api.moonshot.cn/v1');
+  set('cfg-review-provider', currentSettingsProfile.review_llm_provider || '');
+  set('cfg-review-model', currentSettingsProfile.review_llm_model || 'qwen-vl-max');
+  set('cfg-review-base', currentSettingsProfile.review_llm_base_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1');
+  const reviewEnabled = document.getElementById('cfg-review-enabled');
+  if (reviewEnabled) reviewEnabled.checked = currentSettingsProfile.review_llm_enabled !== false;
   set('cfg-video-api', ['mock','happyhorse','seedance','seedence'].includes(currentSettingsProfile.default_video_api) ? (currentSettingsProfile.default_video_api === 'seedence' ? 'seedance' : currentSettingsProfile.default_video_api) : 'mock');
   set('cfg-video-model', currentSettingsProfile.kling_model);
   set('cfg-video-mode', currentSettingsProfile.kling_mode);
@@ -302,6 +352,7 @@ async function deleteApiProfile() {
 }
 
 async function loadProfileList(preferredName='', loadActive=true) {
+  loadVisualReviewCapabilities();
   try {
     const data = await settingsJson(await fetch(`${API_BASE}/api/settings`));
     settingsProfiles = data.profiles || {};
@@ -405,6 +456,8 @@ const __moduleActions = {
   exportProfile,
   importProfile,
   testConnection,
+  loadVisualReviewCapabilities,
+  testVisualReview,
 };
 Object.assign(globalThis.StudioActions, __moduleActions);
 Object.defineProperties(globalThis, {

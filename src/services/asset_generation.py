@@ -16,7 +16,14 @@ from src.api.context import (
     _save_image_asset_state,
     image_gen_agent,
 )
-from src.services.media_quality import MediaQualityFailure, inspect_image, review_image_subjective
+from src.services.media_quality import (
+    MediaQualityFailure,
+    build_review_retry_patch,
+    inspect_image,
+    review_decision,
+    review_image_subjective,
+    should_retry_visual_review,
+)
 from src.services.asset_prompt_composer import (
     PROP_PROMPT_TEMPLATE_VERSION,
     SCENE_PROMPT_TEMPLATE_VERSION,
@@ -71,6 +78,155 @@ def _group_result_diagnostic(result: Any, expected: int = 0) -> str:
     return f" [{', '.join(parts)}]" if parts else ""
 
 
+async def _validate_group_images(
+    image_specs: list[tuple[str, Any, str, str]],
+    provider: str,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Validate every returned view without aborting at the first failure."""
+    reports: dict[str, dict] = {}
+    failures: dict[str, dict] = {}
+    for view_type, image, prompt, asset_type in image_specs:
+        try:
+            reports[view_type] = await _validate_generated_image(
+                image, prompt, asset_type, view_type, provider,
+            )
+        except MediaQualityFailure as exc:
+            report = dict(exc.report or {})
+            reports[view_type] = report
+            failures[view_type] = report
+    return reports, failures
+
+
+def _review_report_is_hard_fail(report: dict[str, Any]) -> bool:
+    visual = report.get("visual_review") if isinstance(report, dict) else None
+    return should_retry_visual_review(visual if isinstance(visual, dict) else report)
+
+
+def _review_candidate_rank(report: dict[str, Any] | None, attempt_no: int) -> tuple[int, float, int]:
+    """Rank comparable attempts without pretending the review score is absolute."""
+    payload = report if isinstance(report, dict) else {}
+    visual = payload.get("visual_review") if isinstance(payload.get("visual_review"), dict) else payload
+    decision = review_decision(visual)
+    tier = {"passed": 3, "uncertain": 2, "hard_fail": 1}.get(decision, 0)
+    try:
+        score = float(visual.get("score", payload.get("score", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return tier, score, int(attempt_no or 0)
+
+
+def _auto_selected_quality(
+    report: dict[str, Any] | None,
+    attempt_no: int,
+    *,
+    retry_exhausted: bool = True,
+) -> dict[str, Any]:
+    """Keep the original review evidence while exposing an automatic fallback.
+
+    A group with several bad-but-usable views does not spend several extra
+    provider calls.  Its selected first attempt remains a hard-fail review,
+    while a view that consumed its one permitted retry is labelled accordingly.
+    """
+    payload = report if isinstance(report, dict) else {}
+    visual = payload.get("visual_review") if isinstance(payload.get("visual_review"), dict) else payload
+    return {
+        **payload,
+        "review_decision": "failed_after_retry" if retry_exhausted else review_decision(visual),
+        "auto_selected_after_review": True,
+        "selected_attempt_no": int(attempt_no or 0),
+    }
+
+
+def _persist_group_candidates(
+    project_id: str,
+    asset_type: str,
+    asset_id: str,
+    state_id: str,
+    images: dict[str, Any],
+    prompts: dict[str, str],
+    reports: dict[str, dict],
+    group_id: str,
+    master_version_id: str,
+    policy: dict[str, Any],
+    attempt_no: int = 1,
+) -> dict[str, list[dict]]:
+    """Persist every returned group view as a non-active candidate."""
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset
+
+    histories: dict[str, list[dict]] = {}
+    with _asset_transaction(project_id):
+        for view_type, image in images.items():
+            if not getattr(image, "local_path", None) or not Path(image.local_path).is_file():
+                continue
+            request = RegenerateImageRequest(
+                asset_type=asset_type,
+                asset_id=asset_id,
+                view_type=view_type,
+                state_id=state_id,
+            )
+            _, _, versions, _ = _resolve_image_asset(project_id, request, create_missing=True)
+            _, history = versions.add_candidate_file(
+                asset_type,
+                asset_id,
+                view_type,
+                Path(image.local_path),
+                prompts.get(view_type, ""),
+                "reference_group_attempt",
+                metadata={
+                    "attempt_no": attempt_no,
+                    "source_attempt_no": attempt_no,
+                    "original_prompt": prompts.get(view_type, ""),
+                    "group_id": group_id,
+                    "master_version_id": master_version_id,
+                    "state_id": state_id,
+                    "provider": policy.get("provider", ""),
+                    "model": policy.get("model", ""),
+                    "resolution": policy.get("resolution", ""),
+                    "review_decision": (reports.get(view_type) or {}).get("review_decision", "uncertain"),
+                    "quality_report": reports.get(view_type, {}),
+                },
+            )
+            histories[view_type] = history
+    return histories
+
+
+def _group_repair_reference_paths(
+    master_path: str,
+    failed_view: str,
+    ordered_views: tuple[str, ...],
+    image_paths: dict[str, str],
+    max_neighbors: int = 1,
+) -> list[str]:
+    """Return the canonical master followed by nearest valid group neighbors.
+
+    The master is the identity anchor and must always be first.  A single
+    neighboring view is enough to clarify the target camera transition; using
+    every returned view makes image-edit models mix view contracts and can
+    reduce consistency.  Failed, missing, and duplicate paths are excluded.
+    """
+    references: list[str] = []
+    if master_path and Path(master_path).is_file():
+        references.append(master_path)
+    if max_neighbors <= 0 or not ordered_views:
+        return references
+    try:
+        failed_index = ordered_views.index(failed_view)
+    except ValueError:
+        failed_index = len(ordered_views)
+    candidates: list[tuple[int, int, str]] = []
+    for index, view_type in enumerate(ordered_views):
+        if view_type == failed_view or view_type not in image_paths:
+            continue
+        path = str(image_paths.get(view_type) or "")
+        if not path or not Path(path).is_file() or path in references:
+            continue
+        candidates.append((abs(index - failed_index), index, path))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    for _, _, path in candidates[:max_neighbors]:
+        references.append(path)
+    return references
+
+
 async def _validate_generated_image(
     image: Any,
     prompt: str,
@@ -93,6 +249,9 @@ async def _validate_generated_image(
     if provider == "mock":
         report["visual_review"] = {"status": "skipped", "reason": "mock placeholder image"}
         report["status"] = "unreviewed"
+        report["review_verdict"] = "unreviewed"
+        report["review_reason"] = "Mock 图片未调用视觉模型"
+        report["review_evidence"] = []
         report["automatic_reference_allowed"] = True
         return report
     visual_review = await review_image_subjective(
@@ -104,10 +263,28 @@ async def _validate_generated_image(
     report["visual_review"] = visual_review
     if visual_review.get("status") == "skipped":
         report["status"] = "unreviewed"
+        report["review_verdict"] = "unreviewed"
+        report["review_reason"] = str(visual_review.get("reason") or "视觉模型未执行")[:500]
+        report["review_evidence"] = []
+        report["review_decision"] = "uncertain"
+        report["automatic_reference_allowed"] = False
+    elif visual_review.get("status") == "passed":
+        report["status"] = "passed"
+        report["review_verdict"] = "passed"
+        report["review_reason"] = str(visual_review.get("review_reason") or visual_review.get("summary") or "视觉审核通过")[:500]
+        report["review_evidence"] = visual_review.get("review_evidence") or visual_review.get("contract_checks") or []
+        report["review_decision"] = "passed"
+        report["automatic_reference_allowed"] = True
     elif visual_review.get("status") == "warning":
-        report["status"] = "warning"
+        decision = review_decision(visual_review)
+        report["status"] = "warning" if decision != "passed" else "passed"
+        report["review_verdict"] = str(visual_review.get("review_verdict") or ("passed" if decision == "passed" else "warning"))
+        report["review_reason"] = str(visual_review.get("review_reason") or visual_review.get("summary") or "视觉审核需要人工确认")[:500]
+        report["review_evidence"] = visual_review.get("review_evidence") or visual_review.get("contract_checks") or []
         report["warnings"] = visual_review.get("issues", [])
-        if visual_review.get("should_regenerate"):
+        report["review_decision"] = decision
+        report["automatic_reference_allowed"] = decision == "passed"
+        if should_retry_visual_review(visual_review):
             raise MediaQualityFailure("Image visual review requires regeneration", report)
     return report
 
@@ -292,7 +469,76 @@ async def generate_scene_master(
     if not result.success or not result.local_path:
         raise HTTPException(502, result.error_message or "万相场景中心母版生成失败")
 
-    quality = await _validate_generated_image(result, prompt, "scene", "scene_center", policy["provider"])
+    attempt_no = 1
+    retry_patch = ""
+    retry_of_version_id = ""
+    try:
+        quality = await _validate_generated_image(result, prompt, "scene", "scene_center", policy["provider"])
+    except MediaQualityFailure as first_failure:
+        review = (first_failure.report or {}).get("visual_review") or {}
+        # Keep technical failures and uncertain visual calls as candidates, but
+        # only spend a second provider request for an evidence-backed hard fail.
+        if not should_retry_visual_review(review):
+            versions.add_candidate_file(
+                "scene", asset_id, "scene_center", Path(result.local_path), prompt,
+                "scene_master_attempt",
+                metadata={"attempt_no": 1, "review_decision": review_decision(review), "quality_report": first_failure.report},
+            )
+            raise
+        retry_of_version_id, _ = versions.add_candidate_file(
+            "scene", asset_id, "scene_center", Path(result.local_path), prompt,
+            "scene_master_attempt",
+            metadata={"attempt_no": 1, "review_decision": "hard_fail", "quality_report": first_failure.report},
+        )
+        retry_patch = build_review_retry_patch(review, prompt)
+        retry_prompt = "\n".join(item for item in (prompt, retry_patch) if item)
+        retry_provider_prompt = retry_prompt
+        if policy["provider"] == "wan":
+            retry_provider_prompt = f"{retry_prompt}\n避免出现：{prompt_layers['negative_prompt']}"
+        retry_seed = resolve_generation_seed(
+            project_id, "scene", f"{asset_id}:{resolved_state_id}", "scene_center",
+            SCENE_PROMPT_TEMPLATE_VERSION, user_regenerate=True,
+        )
+        retry_result = await client_for_policy(policy).generate_image(
+            prompt=retry_provider_prompt,
+            negative_prompt=provider_negative_prompt,
+            width=asset.width,
+            height=asset.height,
+            seed=retry_seed,
+        )
+        if not retry_result.success or not retry_result.local_path:
+            raise HTTPException(502, retry_result.error_message or "万相场景中心母版重试失败")
+        try:
+            quality = await _validate_generated_image(
+                retry_result, retry_prompt, "scene", "scene_center", policy["provider"],
+            )
+        except MediaQualityFailure as second_failure:
+            versions.add_candidate_file(
+                "scene", asset_id, "scene_center", Path(retry_result.local_path), retry_prompt,
+                "scene_master_attempt",
+                metadata={
+                    "attempt_no": 2,
+                    "retry_of_version_id": retry_of_version_id,
+                    "review_decision": "failed_after_retry",
+                    "retry_prompt_patch": retry_patch,
+                    "quality_report": second_failure.report,
+                },
+            )
+            if _review_candidate_rank(first_failure.report, 1) > _review_candidate_rank(second_failure.report, 2):
+                quality = _auto_selected_quality(first_failure.report, 1)
+            else:
+                result = retry_result
+                prompt = retry_prompt
+                provider_prompt = retry_provider_prompt
+                seed = retry_seed
+                attempt_no = 2
+                quality = _auto_selected_quality(second_failure.report, 2)
+        else:
+            result = retry_result
+            prompt = retry_prompt
+            provider_prompt = retry_provider_prompt
+            seed = retry_seed
+            attempt_no = 2
 
     def commit() -> dict:
         latest, updated, updated_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
@@ -309,6 +555,10 @@ async def generate_scene_master(
                 "model": policy["model"],
                 "resolution": policy["resolution"],
                 "generation_mode": "master",
+                "attempt_no": attempt_no,
+                "original_prompt": _scene_master_prompt(state, asset_id, custom_instructions, resolved_state_id),
+                "retry_prompt_patch": retry_patch,
+                "retry_of_version_id": retry_of_version_id,
                 "state_id": resolved_state_id,
                 "is_master": True,
                 "needs_confirmation": True,
@@ -474,7 +724,73 @@ async def generate_prop_master(
     if not result.success or not result.local_path:
         raise HTTPException(502, result.error_message or "Prop master generation failed")
 
-    quality = await _validate_generated_image(result, prompt, "prop", "front", policy["provider"])
+    attempt_no = 1
+    retry_patch = ""
+    retry_of_version_id = ""
+    original_prompt = prompt
+    try:
+        quality = await _validate_generated_image(result, prompt, "prop", "front", policy["provider"])
+    except MediaQualityFailure as first_failure:
+        review = (first_failure.report or {}).get("visual_review") or {}
+        if not should_retry_visual_review(review):
+            versions.add_candidate_file(
+                "prop", prop_id, "front", Path(result.local_path), prompt,
+                "prop_master_attempt",
+                metadata={"attempt_no": 1, "review_decision": review_decision(review), "quality_report": first_failure.report},
+            )
+            raise
+        retry_of_version_id, _ = versions.add_candidate_file(
+            "prop", prop_id, "front", Path(result.local_path), prompt,
+            "prop_master_attempt",
+            metadata={"attempt_no": 1, "review_decision": "hard_fail", "quality_report": first_failure.report},
+        )
+        retry_patch = build_review_retry_patch(review, prompt)
+        retry_prompt = "\n".join(item for item in (prompt, retry_patch) if item)
+        retry_provider_prompt = retry_prompt
+        if policy["provider"] == "wan":
+            retry_provider_prompt = f"{retry_prompt}\n避免出现：{composition.get('effective_negative_prompt', composition.get('negative_prompt', ''))}"
+        retry_seed = resolve_generation_seed(
+            project_id, "prop", prop_id, "front", composition["prompt_template_version"],
+            user_regenerate=True,
+        )
+        retry_result = await client_for_policy(policy).generate_image(
+            prompt=retry_provider_prompt,
+            negative_prompt=composition.get("provider_negative_prompt", "") if policy["provider"] != "wan" else "",
+            width=asset.width,
+            height=asset.height,
+            seed=retry_seed,
+        )
+        if not retry_result.success or not retry_result.local_path:
+            raise HTTPException(502, retry_result.error_message or "道具母版重试失败")
+        try:
+            quality = await _validate_generated_image(
+                retry_result, retry_prompt, "prop", "front", policy["provider"],
+            )
+        except MediaQualityFailure as second_failure:
+            versions.add_candidate_file(
+                "prop", prop_id, "front", Path(retry_result.local_path), retry_prompt,
+                "prop_master_attempt",
+                metadata={
+                    "attempt_no": 2,
+                    "retry_of_version_id": retry_of_version_id,
+                    "review_decision": "failed_after_retry",
+                    "retry_prompt_patch": retry_patch,
+                    "quality_report": second_failure.report,
+                },
+            )
+            if _review_candidate_rank(first_failure.report, 1) > _review_candidate_rank(second_failure.report, 2):
+                quality = _auto_selected_quality(first_failure.report, 1)
+            else:
+                result = retry_result
+                prompt = retry_prompt
+                composition["provider_prompt"] = retry_provider_prompt
+                attempt_no = 2
+                quality = _auto_selected_quality(second_failure.report, 2)
+        else:
+            result = retry_result
+            prompt = retry_prompt
+            composition["provider_prompt"] = retry_provider_prompt
+            attempt_no = 2
 
     def commit() -> dict:
         latest, updated, updated_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
@@ -500,6 +816,10 @@ async def generate_prop_master(
                 "negative_prompt_mode": composition.get("negative_prompt_mode", ""),
                 "requirement_signature": composition.get("requirement_signature", ""),
                 "quality_report": quality,
+                "attempt_no": attempt_no,
+                "original_prompt": original_prompt,
+                "retry_prompt_patch": retry_patch,
+                "retry_of_version_id": retry_of_version_id,
                 "style_mode": composition.get("style_mode", ""),
                 "style_diagnostics": composition.get("style_diagnostics", {}),
             },
@@ -695,18 +1015,127 @@ async def generate_prop_reference_views(
     ]
     if missing:
         raise HTTPException(502, "Wan prop reference result file is missing; no partial views were activated")
-    try:
-        quality_reports = []
-        for view_type, image in zip(requested, produced):
-            review_prompt = (
-                f"{prompt}\nVIEW-SPECIFIC CONTRACT: {view_type}\n"
-                f"{_prop_view_label(view_type)}: inspect only this returned view, not the other views."
+    produced_by_view = dict(zip(requested, produced))
+    view_prompts = {
+        view_type: f"{prompt}\nVIEW-SPECIFIC CONTRACT: {view_type}\n{_prop_view_label(view_type)}"
+        for view_type in requested
+    }
+    review_prompts = {
+        view_type: f"{view_prompts[view_type]}: inspect only this returned view, not the other views."
+        for view_type in requested
+    }
+    original_view_prompts = dict(view_prompts)
+    attempt_by_view = {view_type: 1 for view_type in requested}
+    retry_patch_by_view: dict[str, str] = {}
+    retry_of_version_by_view: dict[str, str] = {}
+    repair_reference_ids_by_view: dict[str, list[str]] = {}
+    auto_selected_views: list[str] = []
+    retry_performed = False
+    quality_reports, failures = await _validate_group_images(
+        [(view_type, produced_by_view[view_type], review_prompts[view_type], "prop") for view_type in requested],
+        policy["provider"],
+    )
+    if failures:
+        attempt_group_id = group_id or uuid.uuid4().hex
+        candidate_histories = _persist_group_candidates(
+            project_id, "prop", prop_id, "", produced_by_view, view_prompts,
+            quality_reports, attempt_group_id, master.version_id, policy,
+        )
+        opaque_failures = [
+            report for report in failures.values()
+            if report.get("status") == "failed" or not isinstance(report.get("visual_review"), dict)
+        ]
+        if opaque_failures:
+            raise MediaQualityFailure("Image group quality validation failed", opaque_failures[0])
+        hard_failures = [view for view, report in failures.items() if _review_report_is_hard_fail(report)]
+        if len(failures) != 1 or len(hard_failures) != 1:
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "generated": [], "histories": candidate_histories,
+                "candidate_histories": candidate_histories, "generation_mode": generation_mode,
+                "group_id": group_id, "view_count": len(requested),
+                "master_version_id": master.version_id, "reference_version_ids": [master.version_id],
+                "requirement_signature": _prop_reference_signature(prop_id, requested),
+                "policy": policy, "quality_reports": quality_reports,
+                "review_decision": "uncertain" if not hard_failures else "failed_after_retry",
+                "retry_performed": False,
+            }
+        failed_view = hard_failures[0]
+        candidate_paths = {view_type: image.local_path for view_type, image in produced_by_view.items()}
+        candidate_paths["front"] = master.image_path
+        references = _group_repair_reference_paths(
+            master.image_path, failed_view, ("front", *requested), candidate_paths,
+        )
+        retry_patch = build_review_retry_patch(failures[failed_view], view_prompts[failed_view])
+        retry_prompt = "\n".join(item for item in (view_prompts[failed_view], retry_patch) if item)
+        repaired = await client.edit_image(retry_prompt, references, policy["resolution"])
+        if not repaired.success or not repaired.local_path:
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "generated": [], "histories": candidate_histories,
+                "candidate_histories": candidate_histories, "generation_mode": generation_mode,
+                "group_id": group_id, "view_count": len(requested),
+                "master_version_id": master.version_id, "reference_version_ids": [master.version_id],
+                "requirement_signature": _prop_reference_signature(prop_id, requested),
+                "policy": policy, "quality_reports": quality_reports,
+                "review_decision": "failed_after_retry", "retry_performed": True,
+                "retry_error": repaired.error_message or "道具视图修复失败",
+            }
+        retry_performed = True
+        first_image = produced_by_view[failed_view]
+        first_prompt = view_prompts[failed_view]
+        first_report = quality_reports[failed_view]
+        try:
+            repaired_report = await _validate_generated_image(
+                repaired, retry_prompt, "prop", failed_view, policy["provider"],
             )
-            quality_reports.append(
-                await _validate_generated_image(image, review_prompt, "prop", view_type, policy["provider"])
+        except MediaQualityFailure as second_failure:
+            second_report = dict(second_failure.report or {})
+            retry_histories = _persist_group_candidates(
+                project_id, "prop", prop_id, "", {failed_view: repaired},
+                {failed_view: retry_prompt},
+                {failed_view: second_report},
+                attempt_group_id, master.version_id, policy, attempt_no=2,
             )
-    except MediaQualityFailure as exc:
-        raise HTTPException(502, str(exc)) from exc
+            candidate_histories.update(retry_histories)
+            if _review_candidate_rank(first_report, 1) > _review_candidate_rank(second_report, 2):
+                produced_by_view[failed_view] = first_image
+                quality_reports[failed_view] = _auto_selected_quality(first_report, 1)
+                view_prompts[failed_view] = first_prompt
+                attempt_by_view[failed_view] = 1
+            else:
+                produced_by_view[failed_view] = repaired
+                quality_reports[failed_view] = _auto_selected_quality(second_report, 2)
+                view_prompts[failed_view] = retry_prompt
+                attempt_by_view[failed_view] = 2
+            auto_selected_views.append(failed_view)
+        else:
+            produced_by_view[failed_view] = repaired
+            quality_reports[failed_view] = repaired_report
+            view_prompts[failed_view] = retry_prompt
+            attempt_by_view[failed_view] = 2
+        retry_patch_by_view[failed_view] = retry_patch
+        first_candidate_id = next(
+            (
+                str(record.get("id") or "")
+                for record in candidate_histories.get(failed_view, [])
+                if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
+            ),
+        )
+        retry_of_version_by_view[failed_view] = first_candidate_id
+        neighbor_path = next((path for path in references if path != master.image_path), "")
+        neighbor_view = next(
+            (candidate_view for candidate_view, path in candidate_paths.items() if path == neighbor_path),
+            "",
+        )
+        neighbor_id = next(
+            (
+                str(record.get("id") or "")
+                for record in candidate_histories.get(neighbor_view, [])
+                if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
+            ),
+        )
+        repair_reference_ids_by_view[failed_view] = [master.version_id, *([neighbor_id] if neighbor_id else [])]
     signature = _prop_reference_signature(prop_id, requested)
 
     async def commit() -> dict:
@@ -720,15 +1149,17 @@ async def generate_prop_reference_views(
             raise HTTPException(409, "Prop master changed while the reference views were generating")
         histories = {}
         generated = []
-        for view_type, image in zip(requested, produced):
+        for view_type in requested:
+            image = produced_by_view[view_type]
             req = RegenerateImageRequest(asset_type="prop", asset_id=prop_id, view_type=view_type)
             latest, asset, versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
+            view_prompt = view_prompts[view_type]
             active_path, history = versions.replace_with_file(
                 "prop",
                 prop_id,
                 view_type,
                 Path(image.local_path),
-                prompt,
+                view_prompt,
                 generation_mode,
                 metadata={
                     **_style_snapshot_metadata(latest),
@@ -738,21 +1169,27 @@ async def generate_prop_reference_views(
                     "generation_mode": generation_mode,
                     "group_id": group_id,
                     "master_version_id": master.version_id,
-                    "reference_version_ids": [master.version_id],
+                    "reference_version_ids": repair_reference_ids_by_view.get(view_type, [master.version_id]),
                     "derived_from_version_id": master.version_id,
                     "requirement_signature": signature,
                     "provider_prompt": prompt,
+                    "display_prompt": view_prompt,
+                    "original_prompt": original_view_prompts.get(view_type, view_prompt),
+                    "attempt_no": attempt_by_view.get(view_type, 1),
+                    "source_attempt_no": 1,
+                    "retry_prompt_patch": retry_patch_by_view.get(view_type, ""),
+                    "retry_of_version_id": retry_of_version_by_view.get(view_type, ""),
                     "provider_negative_prompt": "",
                     "negative_prompt_mode": "merged",
                     "prompt_template_version": PROP_PROMPT_TEMPLATE_VERSION,
-                    "quality_report": quality_reports[requested.index(view_type)],
+                    "quality_report": quality_reports[view_type],
                 },
             )
             version_id = next((entry["id"] for entry in history if entry.get("active")), "")
             asset.is_master = False
             asset.needs_confirmation = False
             asset.master_version_id = master.version_id
-            asset.reference_version_ids = [master.version_id]
+            asset.reference_version_ids = repair_reference_ids_by_view.get(view_type, [master.version_id])
             asset.derived_from_version_id = master.version_id
             asset.generation_mode = generation_mode
             asset.model = policy["model"]
@@ -764,12 +1201,12 @@ async def generate_prop_reference_views(
                 latest,
                 asset,
                 active_path,
-                prompt,
+                view_prompt,
                 image,
                 custom_instructions=custom_instructions,
                 prompt_template_version=PROP_PROMPT_TEMPLATE_VERSION,
                 version_id=version_id,
-                quality_report=quality_reports[requested.index(view_type)],
+                quality_report=quality_reports[view_type],
             )
             histories[view_type] = history
             generated.append({
@@ -792,7 +1229,11 @@ async def generate_prop_reference_views(
             "reference_version_ids": [master.version_id],
             "requirement_signature": signature,
             "policy": policy,
-            "quality_reports": dict(zip(requested, quality_reports)),
+            "quality_reports": quality_reports,
+            "candidate_histories": histories,
+            "auto_selected_after_review": bool(auto_selected_views),
+            "auto_selected_views": auto_selected_views,
+            "retry_performed": retry_performed,
         }
 
     if project_lock is not None:
@@ -1113,22 +1554,158 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
             f"万相场景组图仅返回 {len(result.images)} 张，未激活部分结果，请重新生成整组"
             f"{_group_result_diagnostic(result, count)}",
         )
-    try:
-        quality_reports = {}
-        for view_type, image in zip(views, result.images):
-            view_layer = build_scene_prompt_layers(
-                state, asset_id, resolved_state_id, view_type, custom_instructions,
-            )
-            review_prompt = (
-                f"{prompt}\nVIEW-SPECIFIC CONTRACT: {view_type}\n"
-                f"{view_layer['view']}\nReview this returned image only against this view contract."
-            )
-            quality_reports[view_type] = await _validate_generated_image(
-                image, review_prompt, "scene", view_type, policy["provider"],
-            )
-    except MediaQualityFailure as exc:
-        raise HTTPException(502, str(exc)) from exc
     group_id = uuid.uuid4().hex
+    group_images = dict(zip(views, result.images))
+    view_prompts = {}
+    for view_type in views:
+        view_layer = build_scene_prompt_layers(
+            state, asset_id, resolved_state_id, view_type, custom_instructions,
+        )
+        view_prompts[view_type] = (
+            f"{prompt}\nVIEW-SPECIFIC CONTRACT: {view_type}\n"
+            f"{view_layer['view']}"
+        )
+    review_prompts = {
+        view_type: f"{view_prompts[view_type]}\nReview this returned image only against this view contract."
+        for view_type in views
+    }
+    original_view_prompts = dict(view_prompts)
+    attempt_by_view = {view_type: 1 for view_type in views}
+    retry_patch_by_view: dict[str, str] = {}
+    retry_of_version_by_view: dict[str, str] = {}
+    repair_reference_ids_by_view: dict[str, list[str]] = {}
+    auto_selected_views: list[str] = []
+    retry_performed = False
+    quality_reports, failures = await _validate_group_images(
+        [(view_type, group_images[view_type], review_prompts[view_type], "scene") for view_type in views],
+        policy["provider"],
+    )
+    if failures:
+        candidate_histories = _persist_group_candidates(
+            project_id,
+            "scene",
+            asset_id,
+            resolved_state_id,
+            group_images,
+            view_prompts,
+            quality_reports,
+            group_id,
+            master.version_id,
+            policy,
+        )
+        opaque_failures = [
+            report for report in failures.values()
+            if report.get("status") == "failed" or not isinstance(report.get("visual_review"), dict)
+        ]
+        if opaque_failures:
+            raise MediaQualityFailure("Image group quality validation failed", opaque_failures[0])
+        hard_failures = [view for view, report in failures.items() if _review_report_is_hard_fail(report)]
+        if len(failures) != 1 or len(hard_failures) != 1:
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "group_id": group_id,
+                "view_count": count,
+                "histories": candidate_histories,
+                "candidate_histories": candidate_histories,
+                "policy": policy,
+                "quality_reports": quality_reports,
+                "master_version_id": master.version_id,
+                "state_id": resolved_state_id,
+                "generated": [],
+                "review_decision": "uncertain" if not hard_failures else "failed_after_retry",
+                "retry_performed": False,
+            }
+        failed_view = hard_failures[0]
+        candidate_paths = {view_type: image.local_path for view_type, image in group_images.items()}
+        candidate_paths["scene_center"] = master.image_path
+        references = _group_repair_reference_paths(
+            master.image_path, failed_view, ("scene_center", *views), candidate_paths,
+        )
+        retry_patch = build_review_retry_patch(failures[failed_view], view_prompts[failed_view])
+        retry_prompt = "\n".join(item for item in (view_prompts[failed_view], retry_patch) if item)
+        repaired = await client_for_policy(policy).edit_image(
+            retry_prompt,
+            references,
+            policy["resolution"],
+        )
+        if not repaired.success or not repaired.local_path:
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "group_id": group_id,
+                "view_count": count,
+                "histories": candidate_histories,
+                "candidate_histories": candidate_histories,
+                "policy": policy,
+                "quality_reports": quality_reports,
+                "master_version_id": master.version_id,
+                "state_id": resolved_state_id,
+                "generated": [],
+                "review_decision": "failed_after_retry",
+                "retry_performed": True,
+                "retry_error": repaired.error_message or "场景视图修复失败",
+            }
+        retry_performed = True
+        first_image = group_images[failed_view]
+        first_prompt = view_prompts[failed_view]
+        first_report = quality_reports[failed_view]
+        try:
+            repaired_report = await _validate_generated_image(
+                repaired, retry_prompt, "scene", failed_view, policy["provider"],
+            )
+        except MediaQualityFailure as second_failure:
+            second_report = dict(second_failure.report or {})
+            repaired_histories = _persist_group_candidates(
+                project_id,
+                "scene",
+                asset_id,
+                resolved_state_id,
+                {failed_view: repaired},
+                {failed_view: retry_prompt},
+                {failed_view: second_report},
+                group_id,
+                master.version_id,
+                policy,
+                attempt_no=2,
+            )
+            candidate_histories.update(repaired_histories)
+            if _review_candidate_rank(first_report, 1) > _review_candidate_rank(second_report, 2):
+                group_images[failed_view] = first_image
+                quality_reports[failed_view] = _auto_selected_quality(first_report, 1)
+                view_prompts[failed_view] = first_prompt
+                attempt_by_view[failed_view] = 1
+            else:
+                group_images[failed_view] = repaired
+                quality_reports[failed_view] = _auto_selected_quality(second_report, 2)
+                view_prompts[failed_view] = retry_prompt
+                attempt_by_view[failed_view] = 2
+            auto_selected_views.append(failed_view)
+        else:
+            group_images[failed_view] = repaired
+            quality_reports[failed_view] = repaired_report
+            view_prompts[failed_view] = retry_prompt
+            attempt_by_view[failed_view] = 2
+        retry_patch_by_view[failed_view] = retry_patch
+        first_candidate_id = next(
+            (
+                str(record.get("id") or "")
+                for record in candidate_histories.get(failed_view, [])
+                if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
+            ),
+        )
+        retry_of_version_by_view[failed_view] = first_candidate_id
+        neighbor_path = next((path for path in references if path != master.image_path), "")
+        neighbor_view = next(
+            (candidate_view for candidate_view, path in candidate_paths.items() if path == neighbor_path),
+            "",
+        )
+        neighbor_id = next(
+            (
+                str(record.get("id") or "")
+                for record in candidate_histories.get(neighbor_view, [])
+                if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
+            ),
+        )
+        repair_reference_ids_by_view[failed_view] = [master.version_id, *([neighbor_id] if neighbor_id else [])]
 
     async def commit():
         with _asset_transaction(project_id):
@@ -1145,20 +1722,15 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
         ):
             raise HTTPException(409, "Scene master changed while the group was generating")
         histories = {}
-        for view_type, image in zip(views, result.images):
+        for view_type in views:
+            image = group_images[view_type]
             request = RegenerateImageRequest(asset_type="scene", asset_id=asset_id, view_type=view_type, state_id=resolved_state_id)
             latest, asset, versions, _ = _resolve_image_asset(project_id, request, create_missing=True)
             # Wan receives one shared group prompt for a coherent sequence,
             # while the asset editor/history must retain the selected view's
             # own camera constraint instead of displaying the same text for
             # every group result.
-            view_prompt = build_scene_prompt_layers(
-                latest,
-                asset_id,
-                resolved_state_id,
-                view_type,
-                custom_instructions,
-            )["effective_prompt"]
+            view_prompt = view_prompts[view_type]
             active_path, history = versions.replace_with_file(
                 "scene", asset_id, view_type, Path(image.local_path), view_prompt, "reference_group",
                 metadata={
@@ -1171,9 +1743,14 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
                     "group_view_count": count,
                     "state_id": resolved_state_id,
                     "master_version_id": master.version_id,
-                    "reference_version_ids": [master.version_id],
+                    "reference_version_ids": repair_reference_ids_by_view.get(view_type, [master.version_id]),
                     "provider_prompt": prompt,
                     "display_prompt": view_prompt,
+                    "original_prompt": original_view_prompts.get(view_type, view_prompt),
+                    "attempt_no": attempt_by_view.get(view_type, 1),
+                    "source_attempt_no": 1,
+                    "retry_prompt_patch": retry_patch_by_view.get(view_type, ""),
+                    "retry_of_version_id": retry_of_version_by_view.get(view_type, ""),
                     "negative_prompt_mode": "merged",
                     "quality_report": quality_reports[view_type],
                 },
@@ -1184,7 +1761,7 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
             asset.is_master = False
             asset.needs_confirmation = False
             asset.master_version_id = master.version_id
-            asset.reference_version_ids = [master.version_id]
+            asset.reference_version_ids = repair_reference_ids_by_view.get(view_type, [master.version_id])
             asset.derived_from_version_id = master.version_id
             asset.model, asset.resolution = policy["model"], policy["resolution"]
             asset.is_stale = False
@@ -1223,6 +1800,10 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
                 }
                 for view_type, history in histories.items()
             ],
+            "candidate_histories": histories,
+            "auto_selected_after_review": bool(auto_selected_views),
+            "auto_selected_views": auto_selected_views,
+            "retry_performed": retry_performed,
         }
     if project_lock is not None:
         async with project_lock:
@@ -1259,6 +1840,7 @@ async def edit_scene_reference_view(
 
     req = RegenerateImageRequest(asset_type="scene", asset_id=asset_id, view_type=view_type, state_id=resolved_state_id)
     state, asset, versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
+    source_group_id = str(getattr(asset, "group_id", "") or "")
     layers = build_scene_prompt_layers(state, asset_id, resolved_state_id, view_type, prompt)
     # Wan's edit endpoint accepts one text message and no separate negative
     # field. Merge the canonical negative/style constraints so an anime scene
@@ -1295,12 +1877,60 @@ async def edit_scene_reference_view(
     if asset.image_path and Path(asset.image_path).is_file() and asset.image_path not in references:
         references.append(asset.image_path)
 
-    result = await client_for_policy(policy).edit_image(edit_prompt, references, policy["resolution"])
+    client = client_for_policy(policy)
+    result = await client.edit_image(edit_prompt, references, policy["resolution"])
     if not result.success or not result.local_path:
         raise HTTPException(502, result.error_message or "Wan scene reference edit failed")
-    quality_report = await _validate_generated_image(
-        result, edit_prompt, "scene", view_type, policy["provider"],
-    )
+    attempt_no = 1
+    retry_patch = ""
+    retry_of_version_id = ""
+    original_edit_prompt = edit_prompt
+    try:
+        quality_report = await _validate_generated_image(
+            result, edit_prompt, "scene", view_type, policy["provider"],
+        )
+    except MediaQualityFailure as first_failure:
+        review = (first_failure.report or {}).get("visual_review") or {}
+        if not should_retry_visual_review(review):
+            versions.add_candidate_file(
+                "scene", asset_id, view_type, Path(result.local_path), edit_prompt,
+                "reference_edit_attempt",
+                metadata={"attempt_no": 1, "review_decision": review_decision(review), "group_id": source_group_id, "master_version_id": master.version_id, "reference_version_ids": [master.version_id, *(reference_version_ids or [])], "quality_report": first_failure.report},
+            )
+            raise
+        retry_of_version_id, _ = versions.add_candidate_file(
+            "scene", asset_id, view_type, Path(result.local_path), edit_prompt,
+            "reference_edit_attempt",
+            metadata={"attempt_no": 1, "review_decision": "hard_fail", "group_id": source_group_id, "master_version_id": master.version_id, "reference_version_ids": [master.version_id, *(reference_version_ids or [])], "quality_report": first_failure.report},
+        )
+        retry_patch = build_review_retry_patch(review, edit_prompt)
+        retry_prompt = "\n".join(item for item in (edit_prompt, retry_patch) if item)
+        retry_result = await client.edit_image(retry_prompt, references, policy["resolution"])
+        if not retry_result.success or not retry_result.local_path:
+            raise HTTPException(502, retry_result.error_message or "Wan scene reference edit retry failed")
+        try:
+            quality_report = await _validate_generated_image(
+                retry_result, retry_prompt, "scene", view_type, policy["provider"],
+            )
+        except MediaQualityFailure as second_failure:
+            versions.add_candidate_file(
+                "scene", asset_id, view_type, Path(retry_result.local_path), retry_prompt,
+                "reference_edit_attempt",
+                metadata={
+                    "attempt_no": 2,
+                    "retry_of_version_id": retry_of_version_id,
+                    "group_id": source_group_id,
+                    "master_version_id": master.version_id,
+                    "reference_version_ids": [master.version_id, *(reference_version_ids or [])],
+                    "review_decision": "failed_after_retry",
+                    "retry_prompt_patch": retry_patch,
+                    "quality_report": second_failure.report,
+                },
+            )
+            raise
+        result = retry_result
+        edit_prompt = retry_prompt
+        attempt_no = 2
 
     async def commit() -> dict:
         latest, updated, updated_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
@@ -1320,10 +1950,15 @@ async def edit_scene_reference_view(
                 "model": policy["model"],
                 "resolution": policy["resolution"],
                 "generation_mode": "reference_edit",
+                "group_id": source_group_id,
                 "state_id": resolved_state_id,
                 "master_version_id": master.version_id,
                 "reference_version_ids": [master.version_id, *(reference_version_ids or [])],
                 "derived_from_version_id": master.version_id,
+                "attempt_no": attempt_no,
+                "original_prompt": original_edit_prompt,
+                "retry_prompt_patch": retry_patch,
+                "retry_of_version_id": retry_of_version_id,
                 "quality_report": quality_report,
             },
         )
@@ -1335,6 +1970,7 @@ async def edit_scene_reference_view(
         updated.reference_version_ids = [master.version_id, *(reference_version_ids or [])]
         updated.derived_from_version_id = master.version_id
         updated.generation_mode = "reference_edit"
+        updated.group_id = source_group_id
         updated.model = policy["model"]
         updated.resolution = policy["resolution"]
         updated.is_stale = False
@@ -1385,6 +2021,8 @@ async def regenerate_image_asset(
     project_lock: asyncio.Lock | None = None,
 ) -> dict:
     """Generate and version one asset while retaining server-owned constraints."""
+    from src.api.context import _state_to_json
+
     state, asset, versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
     base_policy = state.image_generation_policy or {
         "provider": image_gen_agent.api_client.provider_name,
@@ -1477,31 +2115,127 @@ async def regenerate_image_asset(
         )
         if prop is None:
             raise HTTPException(404, "Prop asset not found in the visual manifest")
-        result = await client.generate_image(
-            prompt=composition["provider_prompt"],
+    async def generate_once(provider_prompt: str, seed: int):
+        return await client.generate_image(
+            prompt=provider_prompt,
             negative_prompt=provider_negative_prompt,
             width=asset.width,
             height=asset.height,
-            seed=generation_seed,
+            seed=seed,
         )
-    else:
-        result = await client.generate_image(
-            prompt=composition["provider_prompt"],
-            negative_prompt=provider_negative_prompt,
-            width=asset.width,
-            height=asset.height,
-            seed=generation_seed,
-        )
+
+    attempt_no = 1
+    retry_of_version_id = ""
+    retry_patch = ""
+    provider_prompt = composition["provider_prompt"]
+    result = await generate_once(provider_prompt, generation_seed)
     if not result.success or not result.local_path:
         raise HTTPException(502, result.error_message or "Image generation failed")
+    first_result = result
+    selected_prompt = prompt
+    selected_provider_prompt = provider_prompt
 
     quality = inspect_image(result.local_path, asset.width, asset.height, policy["provider"] == "mock")
     if quality_check:
-        quality = await _validate_generated_image(
-            result, prompt, req.asset_type, req.view_type, policy["provider"], asset.width, asset.height,
-        )
+        try:
+            quality = await _validate_generated_image(
+                result, prompt, req.asset_type, req.view_type, policy["provider"], asset.width, asset.height,
+            )
+        except MediaQualityFailure as first_failure:
+            review = (first_failure.report or {}).get("visual_review") or {}
+            if not should_retry_visual_review(review):
+                raise
+            retry_patch = build_review_retry_patch(review, prompt)
+            # Archive the first provider result before spending a second
+            # request.  It is never made active by this operation.
+            retry_of_version_id, _ = versions.add_candidate_file(
+                req.asset_type,
+                req.asset_id,
+                req.view_type,
+                Path(result.local_path),
+                prompt,
+                "generated_attempt",
+                metadata={
+                    "attempt_no": 1,
+                    "review_decision": "hard_fail",
+                    "quality_report": first_failure.report,
+                },
+            )
+            attempt_no = 2
+            retry_seed = resolve_generation_seed(
+                project_id,
+                req.asset_type,
+                req.asset_id,
+                req.view_type,
+                template_version,
+                user_regenerate=True,
+            )
+            retry_provider_prompt = "\n".join(item for item in (provider_prompt, retry_patch) if item)
+            result = await generate_once(retry_provider_prompt, retry_seed)
+            if not result.success or not result.local_path:
+                # The first attempt is already persisted; expose it through
+                # history rather than turning the whole operation into a
+                # destructive failure.
+                quality = {
+                    **first_failure.report,
+                    "status": "warning",
+                    "review_decision": "failed_after_retry",
+                    "attempt_no": 2,
+                    "retry_patch": retry_patch,
+                    "retry_error": result.error_message or "Image generation failed",
+                }
+                history = versions.list_versions(req.asset_type, req.asset_id, req.view_type, prompt)
+                return {"state_json": _state_to_json(state), "history": history, "quality": quality}
+            retry_prompt = "\n".join(item for item in (prompt, retry_patch) if item)
+            try:
+                quality = await _validate_generated_image(
+                    result,
+                    retry_prompt,
+                    req.asset_type,
+                    req.view_type,
+                    policy["provider"],
+                    asset.width,
+                    asset.height,
+                )
+            except MediaQualityFailure as second_failure:
+                candidate_id, history = versions.add_candidate_file(
+                    req.asset_type,
+                    req.asset_id,
+                    req.view_type,
+                    Path(result.local_path),
+                    retry_prompt,
+                    "generated_attempt",
+                    metadata={
+                        "attempt_no": 2,
+                        "retry_of_version_id": retry_of_version_id,
+                        "review_decision": "failed_after_retry",
+                        "retry_prompt_patch": retry_patch,
+                        "quality_report": second_failure.report,
+                    },
+                )
+                if _review_candidate_rank(first_failure.report, 1) > _review_candidate_rank(second_failure.report, 2):
+                    result = first_result
+                    attempt_no = 1
+                    selected_prompt = prompt
+                    selected_provider_prompt = provider_prompt
+                    selected_report = first_failure.report
+                else:
+                    attempt_no = 2
+                    selected_prompt = retry_prompt
+                    selected_provider_prompt = retry_provider_prompt
+                    selected_report = second_failure.report
+                quality = {
+                    **_auto_selected_quality(selected_report, attempt_no),
+                    "candidate_version_id": candidate_id,
+                    "retry_of_version_id": retry_of_version_id,
+                }
+            else:
+                selected_prompt = retry_prompt
+                selected_provider_prompt = retry_provider_prompt
 
     from src.services.generation_hooks import get_generation_hooks
+
+    saved_prompt = selected_prompt
 
     get_generation_hooks().check_cancelled()
     def commit_result() -> dict:
@@ -1510,7 +2244,7 @@ async def regenerate_image_asset(
             commit_state, commit_asset, commit_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
             commit_asset.width, commit_asset.height = asset.width, asset.height
         active_path, history = commit_versions.replace_with_file(
-            req.asset_type, req.asset_id, req.view_type, Path(result.local_path), prompt, "generated",
+            req.asset_type, req.asset_id, req.view_type, Path(result.local_path), saved_prompt, "generated",
             metadata={
                 **_style_snapshot_metadata(commit_state),
                 "provider": policy["provider"],
@@ -1519,7 +2253,12 @@ async def regenerate_image_asset(
                 "generation_mode": "single",
                 "effective_negative_prompt": composition.get("effective_negative_prompt", ""),
                 "quality_report": quality,
-                "provider_prompt": composition.get("provider_prompt", ""),
+                "attempt_no": attempt_no,
+                "original_prompt": prompt,
+                "effective_prompt": saved_prompt,
+                "retry_prompt_patch": retry_patch,
+                "retry_of_version_id": retry_of_version_id,
+                "provider_prompt": selected_provider_prompt,
                 "provider_negative_prompt": composition.get("provider_negative_prompt", ""),
                 "negative_prompt_mode": composition.get("negative_prompt_mode", ""),
                 "requirement_signature": composition.get("requirement_signature", ""),
@@ -1536,7 +2275,7 @@ async def regenerate_image_asset(
             commit_asset.generation_mode = "legacy_sheet" if req.view_type == "standard_views" else "single"
             commit_asset.requirement_signature = composition.get("requirement_signature", "")
         state_json = _save_image_asset_state(
-            project_id, commit_state, commit_asset, active_path, prompt, result,
+            project_id, commit_state, commit_asset, active_path, saved_prompt, result,
             custom_instructions=custom_instructions,
             prompt_template_version=template_version,
             version_id=version_id,
@@ -1672,10 +2411,14 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
         raise HTTPException(502, group_result.error_message or "万相角色组图生成失败")
     group_views = ("front_half", "front_full", "left_profile", "back_full")
     derived_views = group_views[1:]
+    echoed_master_image = None
     if len(group_result.images) == len(group_views):
-        # Keep compatibility with gateways that return every requested view.
-        generated_views = group_views
-        group_images = dict(zip(group_views, group_result.images))
+        # Some gateways echo the supplied master as the first output.  The
+        # master is already locked and remains the only canonical identity
+        # anchor; never replace it with the echoed image.
+        generated_views = derived_views
+        echoed_master_image = group_result.images[0]
+        group_images = dict(zip(derived_views, group_result.images[1:]))
     elif (
         len(group_result.images) == len(derived_views)
         and (group_result.metadata or {}).get("sequence_reference_counted")
@@ -1691,23 +2434,139 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
             f"万相角色组图仅返回 {len(group_result.images)} 张，未激活部分结果，请重新生成整组"
             f"{_group_result_diagnostic(group_result, len(derived_views))}",
         )
-    try:
-        from src.agents.image_gen_agent import character_view_spec
+    from src.agents.image_gen_agent import character_view_spec
 
-        quality_reports = {}
-        for view_type in generated_views:
-            image = group_images[view_type]
-            view_instruction = character_view_spec(view_type)[3]
-            review_prompt = (
-                f"{group_prompt}\nVIEW-SPECIFIC CONTRACT: {view_type}\n"
-                f"{view_instruction}\nReview this returned image only against this view contract."
-            )
-            quality_reports[view_type] = await _validate_generated_image(
-                image, review_prompt, "character", view_type, policy["provider"],
-            )
-    except MediaQualityFailure as exc:
-        raise HTTPException(502, str(exc)) from exc
     group_id = uuid.uuid4().hex
+    validation_views = ("front_half", *generated_views) if echoed_master_image is not None else generated_views
+    validation_images = dict(group_images)
+    if echoed_master_image is not None:
+        validation_images["front_half"] = echoed_master_image
+    view_prompts = {
+        view_type: (
+            f"{group_prompt}\nVIEW-SPECIFIC CONTRACT: {view_type}\n"
+            f"{character_view_spec(view_type)[3]}"
+        )
+        for view_type in validation_views
+    }
+    original_view_prompts = dict(view_prompts)
+    attempt_by_view = {view_type: 1 for view_type in generated_views}
+    retry_patch_by_view: dict[str, str] = {}
+    retry_of_version_by_view: dict[str, str] = {}
+    repair_reference_ids_by_view: dict[str, list[str]] = {}
+    auto_selected_views: list[str] = []
+    retry_performed = False
+    review_prompts = {
+        view_type: f"{view_prompts[view_type]}\nReview this returned image only against this view contract."
+        for view_type in validation_views
+    }
+    all_quality_reports, all_failures = await _validate_group_images(
+        [(view_type, validation_images[view_type], review_prompts[view_type], "character") for view_type in validation_views],
+        policy["provider"],
+    )
+    # The echoed master is diagnostic only.  Its review cannot invalidate or
+    # replace the previously confirmed master, and it is never repaired as a
+    # derived view.  Only returned derived views participate in activation.
+    quality_reports = {view_type: all_quality_reports[view_type] for view_type in generated_views if view_type in all_quality_reports}
+    failures = {view_type: all_failures[view_type] for view_type in generated_views if view_type in all_failures}
+    if failures:
+        candidate_histories = _persist_group_candidates(
+            project_id,
+            "character",
+            asset_id,
+            "",
+            group_images,
+            view_prompts,
+            quality_reports,
+            group_id,
+            master_id,
+            policy,
+        )
+        opaque_failures = [
+            report for report in failures.values()
+            if report.get("status") == "failed" or not isinstance(report.get("visual_review"), dict)
+        ]
+        if opaque_failures:
+            raise MediaQualityFailure("Image group quality validation failed", opaque_failures[0])
+        hard_failures = [view for view, report in failures.items() if _review_report_is_hard_fail(report)]
+        if len(failures) != 1 or len(hard_failures) != 1:
+            # One group can contain more than one review failure.  Retrying
+            # every view would multiply cost, so keep the usable group and let
+            # the user switch/re-generate individual historical views later.
+            for failed_view in hard_failures:
+                quality_reports[failed_view] = _auto_selected_quality(
+                    quality_reports[failed_view], 1, retry_exhausted=False,
+                )
+            auto_selected_views.extend(hard_failures)
+        else:
+            failed_view = hard_failures[0]
+            first_image = group_images[failed_view]
+            first_prompt = view_prompts[failed_view]
+            first_report = quality_reports[failed_view]
+            candidate_paths = {view_type: image.local_path for view_type, image in group_images.items()}
+            candidate_paths["front_half"] = master.image_path
+            references = _group_repair_reference_paths(
+                master.image_path, failed_view, group_views, candidate_paths,
+            )
+            retry_patch = build_review_retry_patch(failures[failed_view], first_prompt)
+            retry_prompt = "\n".join(item for item in (first_prompt, retry_patch) if item)
+            repaired = await client_for_policy(policy).edit_image(
+                retry_prompt,
+                references,
+                policy["resolution"],
+            )
+            retry_performed = True
+            if not repaired.success or not repaired.local_path:
+                quality_reports[failed_view] = _auto_selected_quality(first_report, 1)
+                auto_selected_views.append(failed_view)
+            else:
+                try:
+                    repaired_report = await _validate_generated_image(
+                        repaired, retry_prompt, "character", failed_view, policy["provider"],
+                    )
+                except MediaQualityFailure as second_failure:
+                    second_report = dict(second_failure.report or {})
+                    repaired_histories = _persist_group_candidates(
+                        project_id, "character", asset_id, "", {failed_view: repaired},
+                        {failed_view: retry_prompt}, {failed_view: second_report},
+                        group_id, master_id, policy, attempt_no=2,
+                    )
+                    candidate_histories.update(repaired_histories)
+                    if _review_candidate_rank(first_report, 1) > _review_candidate_rank(second_report, 2):
+                        selected_image, selected_prompt, selected_report, selected_attempt = first_image, first_prompt, first_report, 1
+                    else:
+                        selected_image, selected_prompt, selected_report, selected_attempt = repaired, retry_prompt, second_report, 2
+                    group_images[failed_view] = selected_image
+                    view_prompts[failed_view] = selected_prompt
+                    quality_reports[failed_view] = _auto_selected_quality(selected_report, selected_attempt)
+                    attempt_by_view[failed_view] = selected_attempt
+                    auto_selected_views.append(failed_view)
+                else:
+                    group_images[failed_view] = repaired
+                    quality_reports[failed_view] = repaired_report
+                    view_prompts[failed_view] = retry_prompt
+                    attempt_by_view[failed_view] = 2
+                retry_patch_by_view[failed_view] = retry_patch
+                first_candidate_id = next(
+                    (
+                        str(record.get("id") or "")
+                        for record in candidate_histories.get(failed_view, [])
+                        if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
+                    ),
+                )
+                retry_of_version_by_view[failed_view] = first_candidate_id
+                neighbor_path = next((path for path in references if path != master.image_path), "")
+                neighbor_view = next(
+                    (view_type for view_type, path in candidate_paths.items() if path == neighbor_path),
+                    "",
+                )
+                neighbor_id = next(
+                    (
+                        str(record.get("id") or "")
+                        for record in candidate_histories.get(neighbor_view, [])
+                        if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
+                    ),
+                )
+                repair_reference_ids_by_view[failed_view] = [master_id, *([neighbor_id] if neighbor_id else [])]
     async def commit():
         with _asset_transaction(project_id):
             return await commit_group()
@@ -1727,14 +2586,14 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
             image = group_images[view_type]
             req = RegenerateImageRequest(asset_type="character", asset_id=asset_id, view_type=view_type)
             latest, asset, item_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
-            prompt = group_prompt
+            prompt = view_prompts[view_type]
             active_path, history = item_versions.replace_with_file(
                 "character", asset_id, view_type, Path(image.local_path), prompt, "reference_group",
-            metadata={**_style_snapshot_metadata(latest), "provider": policy["provider"], "model": policy["model"], "resolution": policy["resolution"], "generation_mode": "reference_group", "group_id": group_id, "master_version_id": master_id, "reference_version_ids": [master_id], "style_mode": character_style_mode(art_style), "provider_prompt": group_prompt, "negative_prompt_mode": "merged", "quality_report": quality_reports[view_type]},
+            metadata={**_style_snapshot_metadata(latest), "provider": policy["provider"], "model": policy["model"], "resolution": policy["resolution"], "generation_mode": "reference_group", "group_id": group_id, "master_version_id": master_id, "reference_version_ids": repair_reference_ids_by_view.get(view_type, [master_id]), "style_mode": character_style_mode(art_style), "provider_prompt": group_prompt, "display_prompt": prompt, "original_prompt": original_view_prompts.get(view_type, prompt), "attempt_no": attempt_by_view.get(view_type, 1), "source_attempt_no": 1, "retry_prompt_patch": retry_patch_by_view.get(view_type, ""), "retry_of_version_id": retry_of_version_by_view.get(view_type, ""), "negative_prompt_mode": "merged", "quality_report": quality_reports[view_type]},
             )
             version_id = next((entry["id"] for entry in history if entry.get("active")), "")
             asset.model, asset.resolution, asset.generation_mode = policy["model"], policy["resolution"], "reference_group"
-            asset.group_id, asset.master_version_id, asset.reference_version_ids = group_id, master_id, [master_id]
+            asset.group_id, asset.master_version_id, asset.reference_version_ids = group_id, master_id, repair_reference_ids_by_view.get(view_type, [master_id])
             _save_image_asset_state(project_id, latest, asset, active_path, prompt, image, custom_instructions, CHARACTER_PROMPT_TEMPLATE_VERSION, version_id, quality_reports[view_type])
             histories[view_type] = history
         # Associate the locked master with the same logical group without
@@ -1747,7 +2606,18 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
         if latest.character_images:
             latest.character_images.reference_masters[asset_id] = master_id
         _save_project_state(latest)
-        return {"state_json": _state_to_json(latest), "group_id": group_id, "master_version_id": master_id, "histories": histories, "policy": policy, "quality_reports": quality_reports}
+        return {
+            "state_json": _state_to_json(latest),
+            "group_id": group_id,
+            "master_version_id": master_id,
+            "histories": histories,
+            "candidate_histories": histories,
+            "policy": policy,
+            "quality_reports": quality_reports,
+            "auto_selected_after_review": bool(auto_selected_views),
+            "auto_selected_views": auto_selected_views,
+            "retry_performed": retry_performed,
+        }
     if project_lock is not None:
         async with project_lock:
             return await commit()
@@ -1759,6 +2629,7 @@ async def edit_character_reference(project_id: str, req, project_lock: asyncio.L
     from src.agents.image_gen_agent import CHARACTER_PROMPT_TEMPLATE_VERSION
 
     state, asset, versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
+    source_group_id = str(getattr(asset, "group_id", "") or "")
     policy = normalize_policy(state.image_generation_policy, {"provider": req.provider, "model": req.model, "resolution": req.resolution}, mode="reference_edit")
     if policy["provider"] != "wan":
         raise HTTPException(409, "角色参考修订仅支持万相 2.7")
@@ -1802,17 +2673,79 @@ async def edit_character_reference(project_id: str, req, project_lock: asyncio.L
     result = await client.edit_image(prompt, references, policy["resolution"])
     if not result.success or not result.local_path:
         raise HTTPException(502, result.error_message or "万相参考修订失败")
-    quality_report = await _validate_generated_image(
-        result, prompt, "character", req.view_type, policy["provider"],
-    )
+    attempt_no = 1
+    retry_patch = ""
+    retry_of_version_id = ""
+    original_prompt = prompt
+    try:
+        quality_report = await _validate_generated_image(
+            result, prompt, "character", req.view_type, policy["provider"],
+        )
+    except MediaQualityFailure as first_failure:
+        review = (first_failure.report or {}).get("visual_review") or {}
+        if not should_retry_visual_review(review):
+            versions.add_candidate_file(
+                "character", req.asset_id, req.view_type, Path(result.local_path), prompt,
+                "reference_edit_attempt",
+                metadata={
+                    "attempt_no": 1,
+                    "review_decision": review_decision(review),
+                    "group_id": source_group_id,
+                    "master_version_id": master_id,
+                    "reference_version_ids": [master_id, *req.reference_version_ids],
+                    "quality_report": first_failure.report,
+                },
+            )
+            raise
+        retry_of_version_id, _ = versions.add_candidate_file(
+            "character", req.asset_id, req.view_type, Path(result.local_path), prompt,
+            "reference_edit_attempt",
+            metadata={
+                "attempt_no": 1,
+                "review_decision": "hard_fail",
+                "group_id": source_group_id,
+                "master_version_id": master_id,
+                "reference_version_ids": [master_id, *req.reference_version_ids],
+                "quality_report": first_failure.report,
+            },
+        )
+        retry_patch = build_review_retry_patch(review, prompt)
+        retry_prompt = "\n".join(item for item in (prompt, retry_patch) if item)
+        retry_result = await client.edit_image(retry_prompt, references, policy["resolution"])
+        if not retry_result.success or not retry_result.local_path:
+            raise HTTPException(502, retry_result.error_message or "万相参考修订重试失败")
+        try:
+            quality_report = await _validate_generated_image(
+                retry_result, retry_prompt, "character", req.view_type, policy["provider"],
+            )
+        except MediaQualityFailure as second_failure:
+            versions.add_candidate_file(
+                "character", req.asset_id, req.view_type, Path(retry_result.local_path), retry_prompt,
+                "reference_edit_attempt",
+                metadata={
+                    "attempt_no": 2,
+                    "retry_of_version_id": retry_of_version_id,
+                    "group_id": source_group_id,
+                    "master_version_id": master_id,
+                    "reference_version_ids": [master_id, *req.reference_version_ids],
+                    "review_decision": "failed_after_retry",
+                    "retry_prompt_patch": retry_patch,
+                    "quality_report": second_failure.report,
+                },
+            )
+            raise
+        result = retry_result
+        prompt = retry_prompt
+        attempt_no = 2
     async def commit():
         latest, updated, updated_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
         active_path, history = updated_versions.replace_with_file(
             "character", req.asset_id, req.view_type, Path(result.local_path), prompt, "reference_edit",
-            metadata={**_style_snapshot_metadata(latest), "provider": policy["provider"], "model": policy["model"], "resolution": policy["resolution"], "generation_mode": "reference_edit", "master_version_id": master_id, "reference_version_ids": [master_id, *req.reference_version_ids], "quality_report": quality_report},
+            metadata={**_style_snapshot_metadata(latest), "provider": policy["provider"], "model": policy["model"], "resolution": policy["resolution"], "generation_mode": "reference_edit", "group_id": source_group_id, "master_version_id": master_id, "reference_version_ids": [master_id, *req.reference_version_ids], "attempt_no": attempt_no, "original_prompt": original_prompt, "retry_prompt_patch": retry_patch, "retry_of_version_id": retry_of_version_id, "quality_report": quality_report},
         )
         version_id = next((entry["id"] for entry in history if entry.get("active")), "")
         updated.model, updated.resolution, updated.generation_mode = policy["model"], policy["resolution"], "reference_edit"
+        updated.group_id = source_group_id
         updated.master_version_id, updated.reference_version_ids = master_id, [master_id, *req.reference_version_ids]
         state_json = _save_image_asset_state(project_id, latest, updated, active_path, prompt, result, req.prompt, CHARACTER_PROMPT_TEMPLATE_VERSION, version_id, quality_report)
         return {"state_json": state_json, "history": history, "policy": policy, "master_version_id": master_id, "quality_report": quality_report}

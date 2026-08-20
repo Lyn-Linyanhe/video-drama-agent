@@ -78,7 +78,7 @@ def test_cached_style_catalog_rehydrates_a_reset_project_session():
 
 def test_studio_uses_current_module_cache_version():
     html = (ROOT / "studio.html").read_text(encoding="utf-8")
-    assert "20260818-script-progress" in html
+    assert "20260820-asset-review-fallback-1" in html
 
 
 def test_project_restore_reads_saved_style_and_resets_session():
