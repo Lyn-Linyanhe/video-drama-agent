@@ -754,7 +754,12 @@ class VisualPromptAgent:
                         last = exc
                 raise last
 
-        results = await asyncio.gather(*(one(scene) for scene in script.scenes))
+        results = await asyncio.gather(
+            *(one(scene) for scene in script.scenes), return_exceptions=True
+        )
+        failures = [r for r in results if isinstance(r, Exception)]
+        if failures:
+            raise failures[0]
         results.sort(key=lambda r: r[0].scene_id)
         if telemetry is not None:
             for _shot, metric in results:

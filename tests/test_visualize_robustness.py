@@ -355,3 +355,51 @@ def test_parallel_visualize_aggregates_telemetry():
     # 1 phase1 + 6 phase2 calls, each contributing attempts=1, input=100
     assert telemetry.get("attempts") == 7
     assert telemetry.get("input_chars") == 700
+
+
+def test_parallel_scene_persistent_failure_falls_back(monkeypatch):
+    import asyncio
+    import re
+
+    from src.schemas.script import ScriptBreakdown
+    import src.agents.visual_prompt_agent as vpa
+    from src.agents.visual_prompt_agent import VisualPromptAgent, _CompactShotVisualPrompt
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(6)
+    )
+
+    class FakeLLM:
+        provider = "deepseek"
+
+        async def generate_structured(self, **kw):
+            if kw["output_schema"].__name__ == "_GlobalVisualOutput":
+                return vpa._GlobalVisualOutput(
+                    overall_style="s", color_palette="c", aspect_ratio="9:16",
+                    global_negative_prompt="n",
+                    global_character_descriptions_cn={"c1": "女，25岁，鹅蛋脸，黑发。"},
+                )
+            m = re.search(r"第\s*(\d+)\s*镜", kw["user_prompt"])
+            sid = int(m.group(1)) if m else 1
+            if sid == 3:
+                raise RuntimeError("persistent delta fail")
+            return _CompactShotVisualPrompt(
+                scene_id=sid, subject_state=f"s{sid}", action_timeline=f"0-5s a{sid}",
+                environment_delta="", camera_motion="中景", lighting_delta="自然光",
+                negative_prompt="neg", motion_strength=0.5,
+            )
+
+    agent = VisualPromptAgent()
+    agent.llm = FakeLLM()
+
+    async def single(*a, **k):
+        return ("single-visual", "single-prompts")
+
+    monkeypatch.setattr(agent, "_run_single_shot", single)
+    telemetry = {}
+    result = asyncio.run(agent._run_parallel_visualize(
+        script, prompt_overrides=None, creative_profile=None, telemetry=telemetry,
+        source_text="", _repair_character_profiles=False,
+    ))
+    assert result == ("single-visual", "single-prompts")
+    assert telemetry.get("fallback_used") is True
