@@ -254,3 +254,53 @@ def test_openai_client_disables_sdk_retries(monkeypatch):
 
     assert captured["max_retries"] == 0
     assert captured["timeout"] == 120
+
+
+def test_reasoning_effort_kwargs_deepseek_enabled(monkeypatch):
+    from src.utils import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "max")
+    assert llm_mod._reasoning_effort_kwargs("deepseek") == {"reasoning_effort": "max"}
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "high")
+    assert llm_mod._reasoning_effort_kwargs("deepseek") == {"reasoning_effort": "high"}
+
+
+def test_reasoning_effort_kwargs_disabled_or_other_provider(monkeypatch):
+    from src.utils import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "off")
+    assert llm_mod._reasoning_effort_kwargs("deepseek") == {}
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "high")
+    assert llm_mod._reasoning_effort_kwargs("kimi") == {}
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "")
+    assert llm_mod._reasoning_effort_kwargs("deepseek") == {}
+
+
+@pytest.mark.asyncio
+async def test_generate_text_sends_reasoning_effort_for_deepseek(monkeypatch):
+    from src.utils import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "high")
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "deepseek"
+    client.model = "deepseek-v4-flash"
+    client._openai = None
+    captured = {}
+
+    class FakeCreate:
+        async def __call__(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    class FakeCompletions:
+        def __init__(self):
+            self.create = FakeCreate()
+
+    class FakeOpenAI:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr(client, "_openai", FakeOpenAI())
+    out = await client.generate_text("sys", "user", temperature=0)
+    assert out == "ok"
+    assert captured.get("reasoning_effort") == "high"

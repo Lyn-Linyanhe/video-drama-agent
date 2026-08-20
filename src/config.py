@@ -30,6 +30,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # For custom endpoints
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "1800"))
 LLM_STREAM = os.getenv("LLM_STREAM", "true").strip().lower() not in {"0", "false", "no", "off"}
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "max").strip().lower()  # deepseek: low/medium/high/max; 空/off 关闭
 
 # Post-generation video review. Kept separate from the main LLM so Kimi can
 # continue handling script parsing while a vision model audits generated clips.

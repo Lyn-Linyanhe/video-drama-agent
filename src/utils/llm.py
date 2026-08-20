@@ -22,6 +22,7 @@ from src.config import (
     OPENAI_BASE_URL,
     LLM_TIMEOUT,
     LLM_STREAM,
+    LLM_REASONING_EFFORT,
 )
 
 T = TypeVar("T", bound=BaseModel)
@@ -33,6 +34,18 @@ def _strip_json_fence(text: str) -> str:
     t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
     t = re.sub(r"\s*```$", "", t)
     return t
+
+def _reasoning_effort_kwargs(provider: str) -> dict[str, Any]:
+    """Return OpenAI-style reasoning_effort when enabled for DeepSeek.
+
+    The relay/DeepSeek endpoint accepts low/medium/high; leaving it unset keeps
+    legacy behavior for other providers or when LLM_REASONING_EFFORT is off.
+    """
+    value = str(LLM_REASONING_EFFORT or "").strip().casefold()
+    if provider != "deepseek" or value in {"", "off", "none", "no", "0", "false"}:
+        return {}
+    return {"reasoning_effort": value}
+
 
 OPENAI_COMPATIBLE_BASE_URLS = {
     "deepseek": "https://api.deepseek.com/v1",
@@ -198,6 +211,7 @@ class LLMClient:
                 break
             request_kwargs = dict(kwargs)
             request_kwargs.setdefault("timeout", timeout_sec)
+            request_kwargs.update(_reasoning_effort_kwargs(self.provider))
             if telemetry is not None:
                 telemetry["transport_attempts"] = int(telemetry.get("transport_attempts", 0)) + 1
             try:
@@ -617,6 +631,7 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
             chunks: list[str] = []
             request_kwargs = dict(kwargs)
             request_kwargs.update(stream=True, timeout=timeout_sec)
+            request_kwargs.update(_reasoning_effort_kwargs(self.provider))
             if telemetry is not None:
                 telemetry["transport_attempts"] = int(telemetry.get("transport_attempts", 0)) + 1
             try:
