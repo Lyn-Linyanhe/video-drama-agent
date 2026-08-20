@@ -1271,3 +1271,44 @@ def test_scene_reference_edit_warning_keeps_active_version(tmp_path, monkeypatch
     assert result.get("candidate_version_id")
     history = result.get("history") or []
     assert any(item.get("candidate") and item.get("attempt_no") == 1 for item in history)
+
+
+def test_scene_reference_group_warning_keeps_whole_group_as_candidates(tmp_path, monkeypatch):
+    _enable_wan(monkeypatch)
+    _, project_id, location_id = _prepare_scene_project(tmp_path, monkeypatch)
+    from src.services.scene_view_requirements import set_scene_view_requirements
+
+    state = api_context._load_project_state(project_id)
+    set_scene_view_requirements(state, location_id, "", ["scene_left_45", "scene_right_45", "scene_reverse"])
+    api_context._save_project_state(state)
+    fake = FakeWanClient(tmp_path, count=3)
+    monkeypatch.setattr(asset_generation, "client_for_policy", lambda _policy: fake)
+    master = asyncio.run(asset_generation.generate_scene_master(project_id, location_id))
+    asyncio.run(asset_generation.confirm_scene_master(project_id, location_id, master["version_id"]))
+
+    async def warn(image, prompt, asset_type, view_type, provider, *args):
+        if view_type == "scene_left_45":
+            return {
+                "status": "warning", "passed": False, "review_verdict": "warning",
+                "review_decision": "uncertain", "automatic_reference_allowed": False,
+                "visual_review": {"status": "warning", "passed": False, "issues": ["证据不足"]},
+            }
+        return {
+            "status": "passed", "passed": True, "review_decision": "passed",
+            "review_verdict": "passed", "visual_review": {"status": "passed"},
+        }
+
+    monkeypatch.setattr(asset_generation, "_validate_generated_image", warn)
+    result = asyncio.run(asset_generation.generate_scene_reference_group(project_id, location_id))
+
+    assert result["generated"] == []
+    assert set(result["candidate_histories"].keys()) == {"scene_left_45", "scene_right_45", "scene_reverse"}
+    for view in result["candidate_histories"]:
+        assert any(item.get("candidate") for item in result["candidate_histories"][view])
+    state_after = api_context._load_project_state(project_id)
+    left = next(
+        (item for item in state_after.scene_images.scenes
+         if item.location_id == location_id and item.view_type == "scene_left_45"),
+        None,
+    )
+    assert left is None or not left.image_path

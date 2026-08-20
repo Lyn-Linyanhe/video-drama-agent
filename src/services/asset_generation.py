@@ -1016,7 +1016,7 @@ async def generate_prop_reference_views(
     The active prop views are not changed until the provider returns exactly the
     requested set and every returned local file is present.
     """
-    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _state_to_json, _save_project_state, _state_to_json
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _save_project_state, _state_to_json
 
     requested = tuple(dict.fromkeys(view for view in views if view in PROP_DERIVED_VIEWS))
     if not requested:
@@ -1187,14 +1187,20 @@ async def generate_prop_reference_views(
         repair_reference_ids_by_view[failed_view] = [master.version_id, *([neighbor_id] if neighbor_id else [])]
     blocked_views = [view for view in requested if not _quality_allows_activation(quality_reports.get(view))]
     if blocked_views:
-        for view in blocked_views:
-            if not candidate_histories.get(view):
-                candidate_histories.update(_persist_group_candidates(
-                    project_id, "prop", prop_id, "", {view: produced_by_view[view]},
-                    {view: view_prompts[view]}, {view: quality_reports[view]},
-                    attempt_group_id, master.version_id, policy,
-                    attempt_no=attempt_by_view.get(view, 1),
-                ))
+        if not candidate_histories:
+            candidate_histories = _persist_group_candidates(
+                project_id, "prop", prop_id, "", produced_by_view, view_prompts,
+                quality_reports, attempt_group_id, master.version_id, policy,
+            )
+        else:
+            for view in blocked_views:
+                if not candidate_histories.get(view):
+                    candidate_histories.update(_persist_group_candidates(
+                        project_id, "prop", prop_id, "", {view: produced_by_view[view]},
+                        {view: view_prompts[view]}, {view: quality_reports[view]},
+                        attempt_group_id, master.version_id, policy,
+                        attempt_no=attempt_by_view.get(view, 1),
+                    ))
         return {
             "state_json": _state_to_json(_load_project_state(project_id)),
             "generated": [], "histories": candidate_histories,
@@ -1585,7 +1591,7 @@ async def generate_asset_views(
 
 async def generate_scene_reference_group(project_id: str, asset_id: str, custom_instructions: str = "", override: dict | None = None, project_lock: asyncio.Lock | None = None, state_id: str = "") -> dict:
     """Atomically save a coherent Wan scene-reference group; never activate partial results."""
-    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _state_to_json, _save_project_state, _state_to_json
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _save_project_state, _state_to_json
     from src.services.asset_prompt_composer import build_scene_group_prompt, build_scene_prompt_layers
     from src.services.scene_view_requirements import derive_scene_view_requirements
 
@@ -1781,14 +1787,23 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
         repair_reference_ids_by_view[failed_view] = [master.version_id, *([neighbor_id] if neighbor_id else [])]
     blocked_views = [view for view in views if not _quality_allows_activation(quality_reports.get(view))]
     if blocked_views:
-        for view in blocked_views:
-            if not candidate_histories.get(view):
-                candidate_histories.update(_persist_group_candidates(
-                    project_id, "scene", asset_id, resolved_state_id,
-                    {view: group_images[view]}, {view: view_prompts[view]}, {view: quality_reports[view]},
-                    group_id, master.version_id, policy,
-                    attempt_no=attempt_by_view.get(view, 1),
-                ))
+        if not candidate_histories:
+            # Pure warning group (no raised failures): persist every returned
+            # view so the user can accept the coherent group later.
+            candidate_histories = _persist_group_candidates(
+                project_id, "scene", asset_id, resolved_state_id,
+                group_images, view_prompts, quality_reports,
+                group_id, master.version_id, policy,
+            )
+        else:
+            for view in blocked_views:
+                if not candidate_histories.get(view):
+                    candidate_histories.update(_persist_group_candidates(
+                        project_id, "scene", asset_id, resolved_state_id,
+                        {view: group_images[view]}, {view: view_prompts[view]}, {view: quality_reports[view]},
+                        group_id, master.version_id, policy,
+                        attempt_no=attempt_by_view.get(view, 1),
+                    ))
         return {
             "state_json": _state_to_json(_load_project_state(project_id)),
             "group_id": group_id,
@@ -2751,14 +2766,20 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
                 repair_reference_ids_by_view[failed_view] = [master_id, *([neighbor_id] if neighbor_id else [])]
     blocked_views = [view for view in generated_views if not _quality_allows_activation(quality_reports.get(view))]
     if blocked_views:
-        for view in blocked_views:
-            if not candidate_histories.get(view):
-                candidate_histories.update(_persist_group_candidates(
-                    project_id, "character", asset_id, "", {view: group_images[view]},
-                    {view: view_prompts[view]}, {view: quality_reports[view]},
-                    group_id, master_id, policy,
-                    attempt_no=attempt_by_view.get(view, 1),
-                ))
+        if not candidate_histories:
+            candidate_histories = _persist_group_candidates(
+                project_id, "character", asset_id, "", group_images, view_prompts,
+                quality_reports, group_id, master_id, policy,
+            )
+        else:
+            for view in blocked_views:
+                if not candidate_histories.get(view):
+                    candidate_histories.update(_persist_group_candidates(
+                        project_id, "character", asset_id, "", {view: group_images[view]},
+                        {view: view_prompts[view]}, {view: quality_reports[view]},
+                        group_id, master_id, policy,
+                        attempt_no=attempt_by_view.get(view, 1),
+                    ))
         return {
             "state_json": _state_to_json(_load_project_state(project_id)),
             "group_id": group_id,
