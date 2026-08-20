@@ -1,10 +1,11 @@
 """Script Agent — breaks user story input into a structured shooting script."""
 
 import json
+import re
 
 from pydantic import BaseModel, Field
 
-from src.schemas.script import Scene, ScriptBreakdown
+from src.schemas.script import DialogueLine, Scene, ScriptBreakdown
 from src.schemas.project import CreativeProfile
 from src.utils.llm import get_llm_client
 from src.utils.visual_asset_manifest import (
@@ -85,6 +86,18 @@ SYSTEM_PROMPT = """你是一个专业的短剧编剧。你的任务是将用户�
 - continuity_reason 简短说明是否需要把上一镜末帧作为本镜首帧参考"""
 
 
+SCENE_PARSE_RULES = """
+## 解析三原则：对白、动作、环境三类语义块严格分离
+1. **先切场，再分块**：时间、物理地点、人物组或剧情节拍发生变化时必须拆成新场景；一个场景只能有一个物理地点，禁止用“→”“->”“；”在同一 location 里串接多个地点。角色走出、追出、进入另一个地点时，拆成新场景或在 action_description 中交代，location 保持本场唯一的稳定物理地点身份。
+2. **对白与动作分离**：
+   - dialogue 只收录角色真正说出口的原话，每句只写台词文本；不要在台词里加“（微笑）（轻声）（示意别出声）”等括号舞台指示，这些指示写进 action_description。
+   - 沉默省略号、旁白、系统提示、录音/VO/电话内容、心理活动不是实体台词，不得放入 dialogue；需要时作为 voice_only 说话人或写进 action_description。
+   - 台词必须出现在 dialogue 中：不得只写在 action_description 里，也不得在动作描述中重复整句台词；动作描述需要交代说话时只写“角色说出这句台词”，台词本体放 dialogue。
+   - 说话人使用统一规范名；录音/VO/电话统一用“（录音）”“（电话）”等后缀，不要同一角色混用“录音-苏远山”“苏远山（VO）”“神秘人（电话那头）”等不一致称呼。
+3. **地点与环境分离**：location 只写稳定物理地点身份和室内/室外边界；环境描述只写固定建筑、空间结构、陈设、天气、时间、光线等静态事实；人物动作、情绪、心理、对白和瞬时状态不得写入 location 或环境描述。
+"""
+
+
 class _CompactPropCandidate(BaseModel):
     """Small optional contract for novel props in compact script responses."""
 
@@ -110,6 +123,70 @@ class _ScriptOnlyBreakdown(BaseModel):
         default_factory=list,
         description="Optional novel physical props that pass the two-shot and narrative-evidence rule",
     )
+
+
+# ── Deterministic scene-semantics repair (dialogue/action separation) ───────
+
+_PAREN_STAGE_DIRECTION_RE = re.compile(r"^[（(【\[]([^）)】\]]{1,80})[）)】\]]\s*[,，、:：]?\s*")
+_TRAILING_PAREN_STAGE_DIRECTION_RE = re.compile(r"\s*[（(【\[]([^）)】\]]{1,80})[）)】\]]\s*$")
+_SILENCE_ONLY_RE = re.compile(r"^[\s，,。.…·~～!！?？\-—:：]*$")
+
+_SPEECH_VERB_TERMS = (
+    "低声道", "喊道", "问道", "答道", "开口", "提醒", "警告", "解释", "承认",
+    "坦白", "反驳", "说", "道", "喊", "问", "答",
+)
+_SPEECH_VOICE_PHRASES = (
+    "声音发颤", "声音颤抖", "声音低沉", "语气发颤", "语气冰冷", "语气低沉",
+    "语气平静", "语气", "低声", "冷冷", "轻声", "笑着", "颤抖着", "大声",
+    "提高声音", "缓缓", "沉声", "急切", "平静",
+)
+
+
+def _extract_quoted_speech(action: str, known_names: list[str]) -> list[tuple[str, str, int, int]]:
+    """Extract named-speaker quoted lines from action text.
+
+    Returns (speaker, line, start, end) tuples. Only explicit utterances by a
+    known character (name + speech verb / voice phrase + quote, or
+    name + 的声音 + 响起 + quote) are extracted; negated speech (没有回答) and
+    quoted objects (信件/录音内容) are skipped.
+    """
+    names = sorted(
+        {str(name).strip() for name in known_names if str(name).strip()},
+        key=len,
+        reverse=True,
+    )
+    if not names:
+        return []
+    name_pattern = "|".join(re.escape(name) for name in names)
+    voice_pattern = "|".join(re.escape(term) for term in _SPEECH_VOICE_PHRASES)
+    verb_pattern = "|".join(re.escape(term) for term in _SPEECH_VERB_TERMS)
+    quote = r"[“「『\"'](?P<line>[^”」』\"']{1,120})[”」』\"']"
+    patterns = [
+        re.compile(
+            rf"(?P<name>{name_pattern})(?:的声音)?"
+            rf"(?:[，,]?(?:{voice_pattern})?(?:{verb_pattern})|(?:{voice_pattern}))"
+            rf"[:：]?\s*{quote}",
+            re.S,
+        ),
+        re.compile(
+            rf"(?P<name>{name_pattern})(?:的声音)(?:在[^，。；:：]{{0,24}})?响起[:：]?\s*{quote}",
+            re.S,
+        ),
+    ]
+    found: list[tuple[str, str, int, int]] = []
+    seen: set[tuple[str, str]] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(action):
+            speaker = match.group("name").strip()
+            line = match.group("line").strip()
+            if (speaker, line) in seen or len(line) < 2:
+                continue
+            prefix = action[max(0, match.start() - 6):match.start()]
+            if re.search(r"(没有|没|未|不曾|不是)[^，。；]{0,4}$", prefix):
+                continue
+            seen.add((speaker, line))
+            found.append((speaker, line, match.start(), match.end()))
+    return found
 
 
 class ScriptAgent:
@@ -192,6 +269,7 @@ class ScriptAgent:
             f"\n项目视觉约束：艺术风格为{profile.art_style}，最终视频画幅为{profile.video_ratio}。"
             "不改动剧情，但所有镜头语言和构图必须符合该约束。"
         )
+        user_prompt += "\n\n" + SCENE_PARSE_RULES
         return await self._generate_validated(
             user_prompt, temperature=0.2, telemetry=telemetry, phase="script.analyze",
         )
@@ -327,6 +405,7 @@ class ScriptAgent:
 后端会根据 scenes 本地生成视觉资产清单；你只需要保证每个场景的地点、角色、动作、镜头、对白和连续性字段完整。
 scene_id 必须从 1 连续递增，scenes 控制在 5-20 个容量范围内；必须保留输入剧本的全部有效节拍，不得为满足数量合并或删减镜头。
 location 只写稳定的物理地点身份和室内/室外边界，不得包含人物动作、操作结果、镜头机位或瞬时状态；人物走向、停下、开门、拿取、站起、离开和消失等全部写入 action_description。"""
+        prompt += "\n\n" + SCENE_PARSE_RULES
         prompt += """
 可选输出 critical_props：仅列出剧本中实际可见、至少在两个分镜出现或被使用、并直接承担线索/证据/身份/交接/动作连续性的实体道具。普通物品、家具、背景陈设、短信/录音内容和只出现一次的物品不要列出。每项必须给出规范名称、可见外观、critical_reason、critical_evidence、shot_ids；不要为了凑数量添加道具。"""
         last_error: ValueError | None = None
@@ -355,6 +434,9 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
                 scenes=compact.scenes,
                 asset_manifest=None,
             )
+            # Deterministic dialogue/action repair keeps the compact contract
+            # clean before the local manifest builder reads the scenes.
+            ScriptAgent._repair_scene_semantics(script)
             # Preserve the compact candidate list only long enough for the
             # deterministic manifest builder; it is never stored as a second
             # source of truth in the project state.
@@ -388,7 +470,91 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
         raise last_error or ValueError("Kimi 紧凑剧本解析失败")
 
     @staticmethod
+    def _repair_scene_semantics(script: ScriptBreakdown) -> ScriptBreakdown:
+        """Deterministic dialogue/action separation repair (no LLM call).
+
+        - Strips parenthetical stage directions from dialogue lines and moves
+          them into action_description; drops pure-silence/empty dialogue entries.
+        - Extracts named-speaker quoted lines that only live in action_description
+          into dialogue so TTS/subtitles never lose them, and removes the quoted
+          duplicate from the action text.
+        """
+        for scene in script.scenes:
+            action = str(scene.action_description or "")
+            known_names = [str(name or "").strip() for name in (scene.characters or [])]
+            known_names += [str(line.character or "").strip() for line in (scene.dialogue or [])]
+            matches = _extract_quoted_speech(action, known_names)
+            existing = {
+                (str(line.character or "").strip(), str(line.line or "").strip())
+                for line in scene.dialogue
+            }
+            added: list[DialogueLine] = []
+            for speaker, line, start, end in sorted(matches, key=lambda m: m[2], reverse=True):
+                segment = action[start:end]
+                if "的声音" in segment and "响起" in segment:
+                    replacement = f"{speaker}的声音响起"
+                else:
+                    replacement = f"{speaker}说出这句台词"
+                action = action[:start] + replacement + action[end:]
+                if (speaker, line) not in existing:
+                    existing.add((speaker, line))
+                    added.append(DialogueLine(character=speaker, line=line))
+            if added:
+                scene.dialogue = list(scene.dialogue) + added
+            scene.action_description = action
+
+            repaired_dialogue: list[DialogueLine] = []
+            seen: set[tuple[str, str]] = set()
+            for line in scene.dialogue:
+                text = str(line.line or "").strip()
+                moved: list[str] = []
+                leading = _PAREN_STAGE_DIRECTION_RE.match(text)
+                if leading:
+                    moved.append(leading.group(1).strip())
+                    text = text[leading.end():]
+                trailing = _TRAILING_PAREN_STAGE_DIRECTION_RE.search(text)
+                if trailing:
+                    moved.append(trailing.group(1).strip())
+                    text = text[:trailing.start()]
+                text = text.strip(" ，,、")
+                if moved:
+                    detail = "；".join(moved)
+                    action = (action.rstrip() + "，" + detail) if action else detail
+                if not text or _SILENCE_ONLY_RE.match(text):
+                    continue
+                line.line = text
+                key = (str(line.character or "").strip(), text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                repaired_dialogue.append(line)
+            scene.dialogue = repaired_dialogue
+            scene.action_description = action.strip(" ，,、")
+        return script
+
+    @staticmethod
+    def _scene_semantic_errors(script: ScriptBreakdown) -> list[str]:
+        """Cheap local semantic checks that feed the existing retry channel."""
+        errors: list[str] = []
+        for scene in script.scenes:
+            location = str(scene.location or "").strip()
+            if "→" in location or "->" in location:
+                errors.append(
+                    f"第 {scene.scene_id} 场 location「{location}」包含多个物理地点，"
+                    "请拆成独立场景，每个场景只保留一个物理地点"
+                )
+            elif "。" in location:
+                errors.append(
+                    f"第 {scene.scene_id} 场 location「{location}」包含完整句子，"
+                    "请只写稳定物理地点身份（如“便利店外部”“旧钟楼地下室”）"
+                )
+        return errors
+
+    @staticmethod
     def _validate_visual_assets(script: ScriptBreakdown, require_manifest: bool) -> ScriptBreakdown:
+        # Deterministic dialogue/action separation first so every downstream
+        # consumer (manifest builder, TTS, prompt composer) sees clean scenes.
+        ScriptAgent._repair_scene_semantics(script)
         # Preserve every LLM-produced beat while enforcing the video pipeline's
         # practical minimum duration. This is a deterministic repair, not a
         # narrative rewrite.
@@ -398,6 +564,12 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
             # the legacy schema range so old serialized projects remain valid.
             scene.transition_from_prev = "cut"
             scene.transition_duration_sec = max(0.15, min(0.8, float(scene.transition_duration_sec or 0.25)))
+        # Declared total must match the timed shot list; otherwise downstream
+        # duration-budget logic stretches shots to fill a phantom total.
+        script.duration_sec = sum(scene.duration_sec for scene in script.scenes)
+        semantic_errors = ScriptAgent._scene_semantic_errors(script)
+        if semantic_errors:
+            raise ValueError("分镜结构语义错误：" + "；".join(semantic_errors[:3]))
         if require_manifest and script.asset_manifest is None:
             script.asset_manifest = build_manifest_from_scenes(script)
         repair_asset_manifest(script)
