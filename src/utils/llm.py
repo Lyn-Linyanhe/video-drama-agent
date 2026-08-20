@@ -1,11 +1,14 @@
 """LLM client abstraction — supports Anthropic and OpenAI-compatible APIs."""
 
 import json
+import logging
 import re
 import sys
 import asyncio
 from typing import Any, Type, TypeVar
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 # 修复 Windows 中文环境 print emoji 崩溃
 if hasattr(sys.stdout, 'reconfigure'):
@@ -35,14 +38,22 @@ def _strip_json_fence(text: str) -> str:
     t = re.sub(r"\s*```$", "", t)
     return t
 
+_ALLOWED_REASONING_EFFORTS = {"low", "medium", "high", "max"}
+
+
 def _reasoning_effort_kwargs(provider: str) -> dict[str, Any]:
     """Return OpenAI-style reasoning_effort when enabled for DeepSeek.
 
-    The relay/DeepSeek endpoint accepts low/medium/high; leaving it unset keeps
-    legacy behavior for other providers or when LLM_REASONING_EFFORT is off.
+    The relay/DeepSeek endpoint accepts low/medium/high/max; leaving it unset
+    keeps legacy behavior for other providers or when LLM_REASONING_EFFORT is
+    off. Invalid values are ignored (with a warning) instead of being passed
+    through to the API.
     """
     value = str(LLM_REASONING_EFFORT or "").strip().casefold()
     if provider != "deepseek" or value in {"", "off", "none", "no", "0", "false"}:
+        return {}
+    if value not in _ALLOWED_REASONING_EFFORTS:
+        logger.warning("Ignoring invalid LLM_REASONING_EFFORT=%r (allowed: low/medium/high/max)", value)
         return {}
     return {"reasoning_effort": value}
 
@@ -631,7 +642,8 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
             chunks: list[str] = []
             request_kwargs = dict(kwargs)
             request_kwargs.update(stream=True, timeout=timeout_sec)
-            request_kwargs.update(_reasoning_effort_kwargs(self.provider))
+            # reasoning_effort is only injected on the non-streaming DeepSeek
+            # path (_request_completion); streaming here is Kimi-only.
             if telemetry is not None:
                 telemetry["transport_attempts"] = int(telemetry.get("transport_attempts", 0)) + 1
             try:

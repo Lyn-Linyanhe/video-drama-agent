@@ -110,7 +110,8 @@ DYNAMIC_ENVIRONMENT_CUES = {
     # These describe a temporary visual state or an event, not a reusable
     # location identity. They used to slip through the compact-manifest
     # fallback because they do not always contain an explicit actor verb.
-    "忽明忽暗", "闪烁", "红光一闪", "一闪", "被雨水打得", "落下", "滴落",
+    "忽明忽暗", "闪烁", "红光一闪", "一闪", "被雨水打得", "落下",
+    "发梢滴落", "从身上滴落", "顺着发梢", "衣角滴落", "从下巴滴落", "从额头滴落",
     "字迹模糊", "被水汽泡得模糊", "水汽泡得模糊", "手电光", "光束扫过",
     # General action/state variants that frequently appear in compact script
     # outputs. These are transient shot facts, even when the clause also names
@@ -122,7 +123,7 @@ DYNAMIC_ENVIRONMENT_CUES = {
     # A clause naming a static fixture (e.g. 巷口) is still a character action
     # when it also names looking/thinking; it must not become reusable set.
     "望向", "抬眼", "视线", "目光", "瞥向", "盯着", "凝视", "神色", "神情",
-    "怕", "担心", "害怕", "心里",
+    "怕", "担心", "害怕", "心里", "紧张", "不安", "屏息", "颤抖", "浸透", "被雨水",
     # Directional movement ("沿石阶向下走", "朝前走") is a shot action even
     # when it names a static fixture such as 石阶.
     "向下走", "向上走", "向前走", "往前走", "向后走", "朝前走", "朝里走", "朝外走",
@@ -1086,24 +1087,34 @@ def _clean_environment_description(
         if str(name or "").strip()
     )
     cleaned: list[str] = []
-    for raw in re.split(r"[。；;\n]+", text):
-        clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
-        if len(clause) < 2:
+    seen: set[str] = set()
+    # Two-stage split: sentences first (。；;\n) so an old recovered noun
+    # fragment such as "电箱、墙" is still removed as a whole, then clause
+    # fragments (，,、) so a static fact is not deleted just because a
+    # dynamic character clause shares the same comma-joined sentence.
+    for sentence in re.split(r"[。；;\n]+", text):
+        if _is_legacy_dynamic_fragment(sentence, legacy_fragments):
             continue
-        if _is_legacy_dynamic_fragment(clause, legacy_fragments):
-            continue
-        if any(name and name in clause for name in names) and not _is_named_fixed_fixture_clause(clause, names):
-            continue
-        if any(term and term in clause.casefold() for term in TRANSIENT_ENVIRONMENT_TERMS):
-            continue
-        if _has_voice_or_action_cue(clause):
-            clause = _stable_prefix_before_visual_fluctuation(clause)
-            if not clause:
+        for raw in re.split(r"[，,、]+", sentence):
+            clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
+            if len(clause) < 2:
                 continue
-        if not any(term.casefold() in clause.casefold() for term in STATIC_ENVIRONMENT_TERMS):
-            continue
-        if clause not in cleaned:
-            cleaned.append(clause)
+            if _is_legacy_dynamic_fragment(clause, legacy_fragments):
+                continue
+            if any(name and name in clause for name in names) and not _is_named_fixed_fixture_clause(clause, names):
+                continue
+            if any(term and term in clause.casefold() for term in TRANSIENT_ENVIRONMENT_TERMS):
+                continue
+            if _has_voice_or_action_cue(clause):
+                clause = _stable_prefix_before_visual_fluctuation(clause)
+                if not clause:
+                    continue
+            if not any(term.casefold() in clause.casefold() for term in STATIC_ENVIRONMENT_TERMS):
+                continue
+            key = clause.casefold()
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(clause)
     return "；".join(cleaned)[:700]
 
 

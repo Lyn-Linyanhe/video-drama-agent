@@ -1378,6 +1378,8 @@ def test_gu_heng_entrance_does_not_become_su_mian_pov_turnback():
     assert "看门口监控" in rendered
     assert "瞥向街对面" in rendered
     assert "信封位置清楚" in rendered
+    assert "门铃轻响" in rendered
+    assert "苏眠把信封藏到身后" in rendered
 
 
 def test_photo_back_check_is_current_action_not_turnback_or_flashback():
@@ -1641,6 +1643,8 @@ def test_gu_heng_entrance_does_not_pull_underground_surveillance_template():
     assert "电箱" not in rendered
     assert "折叠刀" not in rendered
     assert "红色摄像头指示灯一闪而过" not in rendered
+    assert "门铃轻响" in rendered
+    assert "苏眠把信封藏到身后" in rendered
 
 
 def test_alley_chase_does_not_pull_lu_lin_reveal_or_basement_staging():
@@ -2292,6 +2296,7 @@ def test_gu_heng_entrance_does_not_start_with_sms_when_sms_is_only_dialogue_cont
 
     assert "便利店门被推开" in first_timed_line
     assert "短信提示音" not in first_timed_line
+    assert "门铃轻响" not in first_timed_line
 
 
 def test_hide_black_clad_threat_keeps_action_instead_of_generic_fallback():
@@ -2416,6 +2421,43 @@ def test_exit_and_chase_scene_does_not_trigger_entrance_template():
     assert "门被推开" not in rendered
     assert "门铃" not in rendered
     assert "藏到身后" not in rendered
+
+
+def test_chase_scene_with_real_door_cue_keeps_entrance_template():
+    script = ScriptBreakdown(
+        title="test",
+        genre="都市",
+        logline="test",
+        duration_sec=5,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=9,
+                duration_sec=5,
+                location="老城区巷口咖啡店门口",
+                characters=["林默", "阿岚"],
+                dialogue=[
+                    DialogueLine(character="林默", line="你怎么来了？", emotion="意外"),
+                    DialogueLine(character="阿岚", line="给你送咖啡。", emotion="温和"),
+                ],
+                action_description="林默追上阿岚，推门走进咖啡店。",
+                camera_direction="中近景/侧面固定",
+                emotion_tone="温和",
+            )
+        ],
+    )
+    shot = ShotPrompt(
+        scene_id=9,
+        prompt="林默追上阿岚，推门走进咖啡店。",
+        duration_sec=5,
+    )
+
+    rendered = build_timed_shot_prompt(shot, script)
+
+    assert "门被推开" in rendered
+    assert "林默走出" in rendered
+    assert "藏到身后" not in rendered
+    assert "门铃" not in rendered
 
 
 def test_plain_exit_scene_does_not_trigger_entrance_template():

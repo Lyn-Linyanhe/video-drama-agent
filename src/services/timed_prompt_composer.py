@@ -1509,10 +1509,12 @@ def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
 
 
 def _has_entrance_cue(text: str) -> bool:
-    # Exit / chase scenes mention 走出/店门 without an entrance beat; never
-    # substitute the generic door-entry narrative for them.
-    if _contains(text, "追出", "追上", "塞进", "追出门", "追出店门"):
-        return False
+    # The door-entry narrative is only used when the event names a concrete
+    # door beat (推门/玻璃门/门铃) or an explicit doorway signal (黑伞/监控/
+    # 街对面). Exit/chase scenes such as 追出店门塞拿铁 carry none of those
+    # signals, so they fall through to the generic physical-action beat. Chase
+    # texts that DO name a door beat (e.g. 追上阿岚后推门进店) still describe
+    # a door event and keep the template.
     return (
         _contains(text, "推门", "玻璃门", "门铃", "黑伞", "监控", "街对面")
         and not _contains(text, "把信给我", "交出信封", "不要交给你")

@@ -484,7 +484,7 @@ def test_environment_cleaner_drops_gaze_and_psychology_clauses():
     ]
     value = (
         "再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；"
-        "沿石阶向下走；雨水从发梢滴落；街角路灯亮着；墙面大片水痕"
+        "沿石阶向下走；雨水从发梢滴落，街角路灯亮着；雨棚边缘雨水成线滴落；墙面大片水痕"
     )
     cleaned = vam._clean_environment_description(value, scenes)
 
@@ -494,4 +494,5 @@ def test_environment_cleaner_drops_gaze_and_psychology_clauses():
     assert "沿石阶向下走" not in cleaned
     assert "雨水从发梢滴落" not in cleaned
     assert "街角路灯亮着" in cleaned
+    assert "雨棚边缘雨水成线滴落" in cleaned
     assert "墙面大片水痕" in cleaned

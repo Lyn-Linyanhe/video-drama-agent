@@ -90,7 +90,7 @@ def test_sanitize_keeps_clean_env():
     from src.agents.visual_prompt_agent import _sanitize_environment
 
     env = "旧钟楼地下通道；墙上大片水痕，灯管部分损坏，地面浅水。"
-    assert _sanitize_environment(env) == "旧钟楼地下通道；墙上大片水痕，灯管部分损坏，地面浅水"
+    assert _sanitize_environment(env) == "旧钟楼地下通道；墙上大片水痕；灯管部分损坏；地面浅水"
 
 
 def test_sanitize_empty_when_all_action():
@@ -622,21 +622,23 @@ def test_parallel_fallback_keeps_prior_attempts_and_marks_fallback(monkeypatch):
 def test_sanitize_drops_gaze_and_psychology_clauses():
     from src.agents.visual_prompt_agent import _sanitize_environment
 
-    env = "再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；街角路灯亮着"
+    env = "再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；门灯照亮湿润台阶，雨水从发梢滴落；街角路灯亮着"
     out = _sanitize_environment(env)
     assert "望向" not in out
     assert "视线" not in out
     assert "怕它" not in out
+    assert "发梢" not in out
+    assert "门灯照亮湿润台阶" in out
     assert "街角路灯亮着" in out
 
 
 def test_sanitize_dedupes_repeated_clauses():
     from src.agents.visual_prompt_agent import _sanitize_environment
 
-    env = "门灯照亮湿润台阶。门灯照亮湿润台阶；街角路灯亮着。街角路灯亮着"
+    env = "雨棚边缘雨水成线滴落。雨棚边缘雨水成线滴落；门灯照亮湿润台阶。门灯照亮湿润台阶"
     out = _sanitize_environment(env)
+    assert out.count("雨棚边缘雨水成线滴落") == 1
     assert out.count("门灯照亮湿润台阶") == 1
-    assert out.count("街角路灯亮着") == 1
 
 
 def test_assembled_prompt_env_is_clean_and_deduplicated():
@@ -665,7 +667,7 @@ def test_assembled_prompt_env_is_clean_and_deduplicated():
             locations=[LocationAsset(
                 location_id="loc_cafe", canonical_name="巷口咖啡店",
                 representative_scene_id=1, shot_ids=[1],
-                environment_description="街角路灯亮着；再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；街角路灯亮着",
+                environment_description="街角路灯亮着；再抬眼望向空旷巷口；说话时视线仍偏向巷口；怕它被雨水浸透；雨水从发梢滴落；街角路灯亮着",
             )],
             shot_bindings=[ShotVisualBinding(scene_id=1, location_id="loc_cafe")],
         ),
@@ -691,5 +693,6 @@ def test_assembled_prompt_env_is_clean_and_deduplicated():
     assert "望向" not in env_line
     assert "视线" not in env_line
     assert "怕它" not in env_line
+    assert "发梢" not in env_line
     assert env_line.count("路灯") == 1
     assert env_line.count("门灯") == 1

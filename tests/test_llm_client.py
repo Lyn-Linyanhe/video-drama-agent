@@ -265,6 +265,15 @@ def test_reasoning_effort_kwargs_deepseek_enabled(monkeypatch):
     assert llm_mod._reasoning_effort_kwargs("deepseek") == {"reasoning_effort": "high"}
 
 
+def test_reasoning_effort_kwargs_invalid_value_ignored(monkeypatch):
+    from src.utils import llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "banana")
+    assert llm_mod._reasoning_effort_kwargs("deepseek") == {}
+    monkeypatch.setattr(llm_mod, "LLM_REASONING_EFFORT", "MAX")
+    assert llm_mod._reasoning_effort_kwargs("deepseek") == {"reasoning_effort": "max"}
+
+
 def test_reasoning_effort_kwargs_disabled_or_other_provider(monkeypatch):
     from src.utils import llm as llm_mod
 
