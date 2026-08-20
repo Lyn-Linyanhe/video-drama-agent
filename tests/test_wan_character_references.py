@@ -333,11 +333,10 @@ def test_scene_master_second_hard_failure_auto_selects_retry_and_keeps_both_cand
     result = asyncio.run(asset_generation.generate_scene_master(project_id, location_id))
 
     assert len(fake.single_calls) == 2
-    assert result["quality"]["auto_selected_after_review"] is True
+    assert result["quality"]["review_decision"] == "failed_after_retry"
+    assert result.get("candidate_version_id")
     assert result["needs_confirmation"] is True
-    active = next(record for record in result["history"] if record.get("active"))
-    assert active["attempt_no"] == 2
-    assert active["quality_report"]["visual_review"]["score"] == 0.55
+    assert not any(record.get("active") for record in result["history"])
     assert {record.get("attempt_no") for record in result["history"] if record.get("candidate")} == {1, 2}
 
 
@@ -526,15 +525,14 @@ def test_character_group_retry_candidate_keeps_the_original_group_id(tmp_path, m
     monkeypatch.setattr(asset_generation, "_validate_generated_image", validate)
     result = asyncio.run(asset_generation.generate_character_reference_group(project_id, "hero"))
 
-    assert result["auto_selected_after_review"] is True
+    assert result["generated"] == []
     assert calls.count("left_profile") == 2
     histories = result["candidate_histories"]["left_profile"]
     group_ids = {record.get("group_id") for record in histories if record.get("candidate")}
     assert group_ids == {result["group_id"]}
     state = api_context._load_project_state(project_id)
-    left = next(item for item in state.character_images.characters if item.character_name == "hero" and item.view_type == "left_profile")
-    assert left.version_id
-    assert left.quality_report["visual_review"]["hard_fail"] is True
+    left = next((item for item in state.character_images.characters if item.character_name == "hero" and item.view_type == "left_profile"), None)
+    assert left is None or not left.image_path
 
 
 def test_scene_reference_group_second_hard_failure_auto_selects_retry(tmp_path, monkeypatch):
@@ -567,13 +565,16 @@ def test_scene_reference_group_second_hard_failure_auto_selects_retry(tmp_path, 
     monkeypatch.setattr(asset_generation, "_validate_generated_image", validate)
     result = asyncio.run(asset_generation.generate_scene_reference_group(project_id, location_id))
 
-    assert result["auto_selected_after_review"] is True
+    assert result["generated"] == []
     assert calls == ["scene_left_45", "scene_left_45"]
+    assert result["retry_performed"] is True
+    state = api_context._load_project_state(project_id)
     left = next(
-        item for item in api_context._load_project_state(project_id).scene_images.scenes
-        if item.location_id == location_id and item.view_type == "scene_left_45"
+        (item for item in state.scene_images.scenes
+         if item.location_id == location_id and item.view_type == "scene_left_45"),
+        None,
     )
-    assert left.image_path and left.quality_report["visual_review"]["hard_fail"] is True
+    assert left is None or not left.image_path
     assert {record.get("attempt_no") for record in result["candidate_histories"]["scene_left_45"] if record.get("candidate")} == {1, 2}
 
 
@@ -607,13 +608,16 @@ def test_prop_reference_group_second_hard_failure_auto_selects_retry(tmp_path, m
     monkeypatch.setattr(asset_generation, "_validate_generated_image", validate)
     result = asyncio.run(asset_generation.generate_prop_reference_views(project_id, "hero_prop", ("back", "left")))
 
-    assert result["auto_selected_after_review"] is True
+    assert result["generated"] == []
     assert calls == ["back", "back"]
+    assert result["retry_performed"] is True
+    state = api_context._load_project_state(project_id)
     back = next(
-        item for item in api_context._load_project_state(project_id).prop_images.props
-        if item.prop_id == "hero_prop" and item.view_type == "back"
+        (item for item in state.prop_images.props
+         if item.prop_id == "hero_prop" and item.view_type == "back"),
+        None,
     )
-    assert back.image_path and back.quality_report["visual_review"]["hard_fail"] is True
+    assert back is None or not back.image_path
     assert {record.get("attempt_no") for record in result["candidate_histories"]["back"] if record.get("candidate")} == {1, 2}
 
 
@@ -644,15 +648,15 @@ def test_character_group_multiple_hard_failures_activate_usable_group_without_ex
     monkeypatch.setattr(asset_generation, "_validate_generated_image", validate)
     result = asyncio.run(asset_generation.generate_character_reference_group(project_id, "hero"))
 
-    assert result["auto_selected_after_review"] is True
-    assert set(result["auto_selected_views"]) == {"left_profile", "back_full"}
+    assert result["generated"] == []
     assert result["retry_performed"] is False
     assert fake.edit_calls == []
     state = api_context._load_project_state(project_id)
     assert {
         item.view_type for item in state.character_images.characters
         if item.character_name == "hero" and item.view_type in {"left_profile", "back_full"} and item.image_path
-    } == {"left_profile", "back_full"}
+    } == set()
+    assert {record.get("attempt_no") for record in result["candidate_histories"]["left_profile"] if record.get("candidate")} == {1}
 
 
 def test_character_reference_edit_quality_failure_keeps_the_active_version(tmp_path, monkeypatch):
@@ -1178,3 +1182,92 @@ def test_wan_scene_batch_creation_uses_master_before_reference_group(tmp_path, m
     assert [(job["job_type"], job["target_id"]) for job in second.json()["jobs"]] == [
         ("scene.reference.group", location_id)
     ]
+
+
+def test_character_reference_edit_warning_keeps_active_version(tmp_path, monkeypatch):
+    _enable_wan(monkeypatch)
+    _, project_id = _prepare_character_project(tmp_path, monkeypatch)
+    fake = FakeWanClient(tmp_path)
+    monkeypatch.setattr(asset_generation, "client_for_policy", lambda _policy: fake)
+    asyncio.run(asset_generation.regenerate_image_asset(
+        project_id,
+        RegenerateImageRequest(
+            asset_type="character", asset_id="hero", view_type="front_half",
+            provider="wan", model="wan2.7-image-pro", resolution="2K",
+        ),
+    ))
+    group = asyncio.run(asset_generation.generate_character_reference_group(project_id, "hero"))
+    before = api_context._load_project_state(project_id)
+    active_before = next(item.version_id for item in before.character_images.characters if item.view_type == "back_full")
+
+    async def warn(*_args, **_kwargs):
+        return {
+            "status": "warning", "passed": False, "review_verdict": "warning",
+            "review_decision": "uncertain", "automatic_reference_allowed": False,
+            "visual_review": {"status": "warning", "passed": False, "issues": ["证据不足"]},
+        }
+
+    monkeypatch.setattr(asset_generation, "_validate_generated_image", warn)
+    result = asyncio.run(asset_generation.edit_character_reference(
+        project_id,
+        CharacterReferenceEditRequest(
+            asset_type="character", asset_id="hero", view_type="back_full",
+            prompt="make the coat longer", provider="wan", model="wan2.7-image-pro", resolution="2K",
+            reference_version_ids=[group["master_version_id"]],
+        ),
+    ))
+
+    after = api_context._load_project_state(project_id)
+    active_after = next(item.version_id for item in after.character_images.characters if item.view_type == "back_full")
+    assert active_after == active_before
+    assert result.get("candidate_version_id")
+    history = result.get("history") or []
+    assert any(item.get("candidate") and item.get("attempt_no") == 1 for item in history)
+
+
+def test_scene_reference_edit_warning_keeps_active_version(tmp_path, monkeypatch):
+    _enable_wan(monkeypatch)
+    _client_obj, project_id, location_id = _prepare_scene_project(tmp_path, monkeypatch)
+    from src.services.scene_view_requirements import set_scene_view_requirements
+
+    state = api_context._load_project_state(project_id)
+    set_scene_view_requirements(state, location_id, "", ["scene_reverse"])
+    api_context._save_project_state(state)
+    fake = FakeWanClient(tmp_path, count=1)
+    monkeypatch.setattr(asset_generation, "client_for_policy", lambda _policy: fake)
+    master = asyncio.run(asset_generation.generate_scene_master(project_id, location_id))
+    asyncio.run(asset_generation.confirm_scene_master(project_id, location_id, master["version_id"]))
+    group = asyncio.run(asset_generation.generate_scene_reference_group(project_id, location_id))
+    before = api_context._load_project_state(project_id)
+    active_before = next(
+        item.version_id for item in before.scene_images.scenes
+        if item.location_id == location_id and item.view_type == "scene_reverse"
+    )
+
+    async def warn(*_args, **_kwargs):
+        return {
+            "status": "warning", "passed": False, "review_verdict": "warning",
+            "review_decision": "uncertain", "automatic_reference_allowed": False,
+            "visual_review": {"status": "warning", "passed": False, "issues": ["证据不足"]},
+        }
+
+    monkeypatch.setattr(asset_generation, "_validate_generated_image", warn)
+    result = asyncio.run(asset_generation.edit_scene_reference_view(
+        project_id,
+        location_id,
+        group["state_id"],
+        "scene_reverse",
+        "增加墙面水痕",
+        [],
+        {"provider": "wan", "model": "wan2.7-image-pro", "resolution": "2K"},
+    ))
+
+    after = api_context._load_project_state(project_id)
+    active_after = next(
+        item.version_id for item in after.scene_images.scenes
+        if item.location_id == location_id and item.view_type == "scene_reverse"
+    )
+    assert active_after == active_before
+    assert result.get("candidate_version_id")
+    history = result.get("history") or []
+    assert any(item.get("candidate") and item.get("attempt_no") == 1 for item in history)

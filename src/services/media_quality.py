@@ -47,7 +47,9 @@ def image_allows_automatic_reference(image: Any) -> bool:
     status = str(report.get("status") or "").strip().casefold()
     visual_status = str(visual.get("status") or "").strip().casefold()
     verdict = str(report.get("review_verdict") or visual.get("review_verdict") or "").strip().casefold()
-    if verdict and verdict != "passed":
+    # ``unreviewed`` is allowed through: the unreviewed branch below still
+    # requires mock provider + automatic_reference_allowed before auto-binding.
+    if verdict and verdict not in {"passed", "unreviewed"}:
         return False
     if _quality_flag(report.get("should_regenerate")) or _quality_flag(visual.get("should_regenerate")):
         return False
@@ -481,6 +483,12 @@ def review_decision(report: dict[str, Any] | None) -> str:
     payload = report if isinstance(report, dict) else {}
     if str(payload.get("status") or "").strip().casefold() == "passed" and _coerce_review_bool(payload.get("passed"), True):
         return "passed"
+    verdict = str(payload.get("review_verdict") or "").strip().casefold()
+    if verdict == "hard_fail":
+        # Missing contract evidence / malformed JSON is labelled hard_fail by
+        # _parse_visual_review; let that label drive the bounded retry instead
+        # of silently activating the image.
+        return "hard_fail"
     if _coerce_review_bool(payload.get("hard_fail")) and str(payload.get("evidence_confidence") or "high").casefold() != "low":
         return "hard_fail"
     return "uncertain"

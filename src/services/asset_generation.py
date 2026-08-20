@@ -289,6 +289,27 @@ async def _validate_generated_image(
     return report
 
 
+def _quality_allows_activation(report: dict[str, Any] | None) -> bool:
+    """Whether a final quality report may become the active version.
+
+    passed and unreviewed (mock / skipped) results stay activatable;
+    warning and hard-fail-after-retry results are candidates for the user.
+    Reports may carry the review inside ``visual_review`` (unit stubs) or at
+    the top level (persisted reports); both are checked.  Legacy reports
+    without review fields keep the historical behavior.
+    """
+    payload = report if isinstance(report, dict) else {}
+    visual = payload.get("visual_review") if isinstance(payload.get("visual_review"), dict) else {}
+    verdict = str(payload.get("review_verdict") or visual.get("review_verdict") or "").strip().casefold()
+    status = str(payload.get("status") or visual.get("status") or "").strip().casefold()
+    decision = str(payload.get("review_decision") or "").strip().casefold()
+    if decision == "failed_after_retry":
+        return False
+    if verdict in {"warning", "hard_fail"} or status in {"warning", "failed"}:
+        return False
+    return True
+
+
 def required_asset_views(state: Any, asset_type: str) -> dict[str, tuple[str, ...]]:
     """Return current visual-manifest identities and the views they require."""
     from src.agents.image_gen_agent import CHARACTER_VIEWS, SCENE_VIEWS
@@ -421,7 +442,7 @@ async def generate_scene_master(
     state_id: str = "",
 ) -> dict:
     """Generate one unconfirmed center master for a scene state."""
-    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _state_to_json
 
     state = _load_project_state(project_id)
     policy = normalize_policy(state.image_generation_policy, override)
@@ -542,6 +563,19 @@ async def generate_scene_master(
 
     def commit() -> dict:
         latest, updated, updated_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
+        if not _quality_allows_activation(quality):
+            history = updated_versions.list_versions("scene", asset_id, "scene_center", prompt)
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "history": history,
+                "quality": quality,
+                "candidate_version_id": quality.get("candidate_version_id") or retry_of_version_id,
+                "version_id": "",
+                "image_path": "",
+                "state_id": resolved_state_id,
+                "needs_confirmation": True,
+                "policy": policy,
+            }
         active_path, history = updated_versions.replace_with_file(
             "scene",
             asset_id,
@@ -681,7 +715,7 @@ async def generate_prop_master(
     user_regenerate: bool = False,
 ) -> dict:
     """Generate one unconfirmed front master for a prop."""
-    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _state_to_json
 
     state = _load_project_state(project_id)
     if not _prop_manifest_asset(state, prop_id):
@@ -795,6 +829,19 @@ async def generate_prop_master(
     def commit() -> dict:
         latest, updated, updated_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
         updated.width, updated.height = asset.width, asset.height
+        if not _quality_allows_activation(quality):
+            history = updated_versions.list_versions("prop", prop_id, "front", prompt)
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "history": history,
+                "quality": quality,
+                "candidate_version_id": quality.get("candidate_version_id") or retry_of_version_id,
+                "version_id": "",
+                "image_path": "",
+                "seed": 0,
+                "needs_confirmation": True,
+                "policy": policy,
+            }
         active_path, history = updated_versions.replace_with_file(
             "prop",
             prop_id,
@@ -969,7 +1016,7 @@ async def generate_prop_reference_views(
     The active prop views are not changed until the provider returns exactly the
     requested set and every returned local file is present.
     """
-    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _save_project_state, _state_to_json
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _state_to_json, _save_project_state, _state_to_json
 
     requested = tuple(dict.fromkeys(view for view in views if view in PROP_DERIVED_VIEWS))
     if not requested:
@@ -1031,6 +1078,8 @@ async def generate_prop_reference_views(
     repair_reference_ids_by_view: dict[str, list[str]] = {}
     auto_selected_views: list[str] = []
     retry_performed = False
+    attempt_group_id = group_id or uuid.uuid4().hex
+    candidate_histories: dict[str, list[dict]] = {}
     quality_reports, failures = await _validate_group_images(
         [(view_type, produced_by_view[view_type], review_prompts[view_type], "prop") for view_type in requested],
         policy["provider"],
@@ -1136,6 +1185,29 @@ async def generate_prop_reference_views(
             ),
         )
         repair_reference_ids_by_view[failed_view] = [master.version_id, *([neighbor_id] if neighbor_id else [])]
+    blocked_views = [view for view in requested if not _quality_allows_activation(quality_reports.get(view))]
+    if blocked_views:
+        for view in blocked_views:
+            if not candidate_histories.get(view):
+                candidate_histories.update(_persist_group_candidates(
+                    project_id, "prop", prop_id, "", {view: produced_by_view[view]},
+                    {view: view_prompts[view]}, {view: quality_reports[view]},
+                    attempt_group_id, master.version_id, policy,
+                    attempt_no=attempt_by_view.get(view, 1),
+                ))
+        return {
+            "state_json": _state_to_json(_load_project_state(project_id)),
+            "generated": [], "histories": candidate_histories,
+            "candidate_histories": candidate_histories, "generation_mode": generation_mode,
+            "group_id": group_id, "view_count": len(requested),
+            "master_version_id": master.version_id, "reference_version_ids": [master.version_id],
+            "requirement_signature": _prop_reference_signature(prop_id, requested),
+            "policy": policy, "quality_reports": quality_reports,
+            "review_decision": "failed_after_retry" if (retry_performed or any(_review_report_is_hard_fail(quality_reports.get(v)) for v in blocked_views)) else "uncertain",
+            "retry_performed": retry_performed,
+            "auto_selected_after_review": bool(auto_selected_views),
+            "auto_selected_views": auto_selected_views,
+        }
     signature = _prop_reference_signature(prop_id, requested)
 
     async def commit() -> dict:
@@ -1513,7 +1585,7 @@ async def generate_asset_views(
 
 async def generate_scene_reference_group(project_id: str, asset_id: str, custom_instructions: str = "", override: dict | None = None, project_lock: asyncio.Lock | None = None, state_id: str = "") -> dict:
     """Atomically save a coherent Wan scene-reference group; never activate partial results."""
-    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _save_project_state, _state_to_json
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _state_to_json, _save_project_state, _state_to_json
     from src.services.asset_prompt_composer import build_scene_group_prompt, build_scene_prompt_layers
     from src.services.scene_view_requirements import derive_scene_view_requirements
 
@@ -1576,6 +1648,7 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
     repair_reference_ids_by_view: dict[str, list[str]] = {}
     auto_selected_views: list[str] = []
     retry_performed = False
+    candidate_histories: dict[str, list[dict]] = {}
     quality_reports, failures = await _validate_group_images(
         [(view_type, group_images[view_type], review_prompts[view_type], "scene") for view_type in views],
         policy["provider"],
@@ -1706,6 +1779,32 @@ async def generate_scene_reference_group(project_id: str, asset_id: str, custom_
             ),
         )
         repair_reference_ids_by_view[failed_view] = [master.version_id, *([neighbor_id] if neighbor_id else [])]
+    blocked_views = [view for view in views if not _quality_allows_activation(quality_reports.get(view))]
+    if blocked_views:
+        for view in blocked_views:
+            if not candidate_histories.get(view):
+                candidate_histories.update(_persist_group_candidates(
+                    project_id, "scene", asset_id, resolved_state_id,
+                    {view: group_images[view]}, {view: view_prompts[view]}, {view: quality_reports[view]},
+                    group_id, master.version_id, policy,
+                    attempt_no=attempt_by_view.get(view, 1),
+                ))
+        return {
+            "state_json": _state_to_json(_load_project_state(project_id)),
+            "group_id": group_id,
+            "view_count": count,
+            "histories": candidate_histories,
+            "candidate_histories": candidate_histories,
+            "policy": policy,
+            "quality_reports": quality_reports,
+            "master_version_id": master.version_id,
+            "state_id": resolved_state_id,
+            "generated": [],
+            "review_decision": "failed_after_retry" if (retry_performed or any(_review_report_is_hard_fail(quality_reports.get(v)) for v in blocked_views)) else "uncertain",
+            "retry_performed": retry_performed,
+            "auto_selected_after_review": bool(auto_selected_views),
+            "auto_selected_views": auto_selected_views,
+        }
 
     async def commit():
         with _asset_transaction(project_id):
@@ -1822,7 +1921,7 @@ async def edit_scene_reference_view(
     project_lock: asyncio.Lock | None = None,
 ) -> dict:
     """Edit one scene view from the confirmed state master plus optional references."""
-    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state
+    from src.api.context import RegenerateImageRequest, _load_project_state, _resolve_image_asset, _save_image_asset_state, _state_to_json
     from src.services.asset_prompt_composer import build_scene_prompt_layers
 
     if view_type not in {"scene_left_45", "scene_right_45", "scene_reverse"}:
@@ -1937,6 +2036,30 @@ async def edit_scene_reference_view(
         current_master = _confirmed_scene_master(latest, asset_id, resolved_state_id)
         if not current_master or current_master.version_id != master.version_id:
             raise HTTPException(409, "Scene master changed while the edit was generating")
+        if not _quality_allows_activation(quality_report):
+            candidate_version_id = quality_report.get("candidate_version_id") or ""
+            if not candidate_version_id:
+                candidate_version_id, _ = versions.add_candidate_file(
+                    "scene", asset_id, view_type, Path(result.local_path), edit_prompt,
+                    "reference_edit_attempt",
+                    metadata={
+                        "attempt_no": attempt_no,
+                        "review_decision": quality_report.get("review_decision") or "uncertain",
+                        "group_id": source_group_id,
+                        "master_version_id": master.version_id,
+                        "reference_version_ids": [master.version_id, *(reference_version_ids or [])],
+                        "quality_report": quality_report,
+                    },
+                )
+            history = updated_versions.list_versions("scene", asset_id, view_type, edit_prompt)
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "history": history,
+                "quality_report": quality_report,
+                "candidate_version_id": candidate_version_id,
+                "version_id": "",
+                "image_path": "",
+            }
         active_path, history = updated_versions.replace_with_file(
             "scene",
             asset_id,
@@ -2144,7 +2267,35 @@ async def regenerate_image_asset(
         except MediaQualityFailure as first_failure:
             review = (first_failure.report or {}).get("visual_review") or {}
             if not should_retry_visual_review(review):
-                raise
+                # warning / uncertain: persist as a candidate and return without
+                # retrying or activating (the user decides via candidate review).
+                candidate_id, history = versions.add_candidate_file(
+                    req.asset_type,
+                    req.asset_id,
+                    req.view_type,
+                    Path(result.local_path),
+                    prompt,
+                    "generated_attempt",
+                    metadata={
+                        "attempt_no": 1,
+                        "review_decision": review_decision(review) or "uncertain",
+                        "quality_report": first_failure.report,
+                    },
+                )
+                quality = {
+                    **first_failure.report,
+                    "review_decision": review_decision(review) or "uncertain",
+                    "candidate_version_id": candidate_id,
+                    "attempt_no": 1,
+                }
+                return {
+                    "state_json": _state_to_json(state),
+                    "history": history,
+                    "quality": quality,
+                    "candidate_version_id": candidate_id,
+                    "version_id": "",
+                    "image_path": "",
+                }
             retry_patch = build_review_retry_patch(review, prompt)
             # Archive the first provider result before spending a second
             # request.  It is never made active by this operation.
@@ -2232,6 +2383,36 @@ async def regenerate_image_asset(
             else:
                 selected_prompt = retry_prompt
                 selected_provider_prompt = retry_provider_prompt
+
+    if not _quality_allows_activation(quality):
+        # warning or hard-fail after the one permitted retry: keep candidates,
+        # never replace the current active image.
+        candidate_version_id = quality.get("candidate_version_id") or ""
+        if not candidate_version_id:
+            # A plain warning returns from _validate_generated_image without an
+            # exception; persist that first (only) attempt as a candidate now.
+            candidate_version_id, history = versions.add_candidate_file(
+                req.asset_type,
+                req.asset_id,
+                req.view_type,
+                Path(result.local_path),
+                selected_prompt,
+                "generated_attempt",
+                metadata={
+                    "attempt_no": 1,
+                    "review_decision": quality.get("review_decision") or "uncertain",
+                    "quality_report": quality,
+                },
+            )
+        history = versions.list_versions(req.asset_type, req.asset_id, req.view_type, selected_prompt)
+        return {
+            "state_json": _state_to_json(state),
+            "history": history,
+            "quality": quality,
+            "candidate_version_id": candidate_version_id,
+            "version_id": "",
+            "image_path": "",
+        }
 
     from src.services.generation_hooks import get_generation_hooks
 
@@ -2455,6 +2636,7 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
     repair_reference_ids_by_view: dict[str, list[str]] = {}
     auto_selected_views: list[str] = []
     retry_performed = False
+    candidate_histories: dict[str, list[dict]] = {}
     review_prompts = {
         view_type: f"{view_prompts[view_type]}\nReview this returned image only against this view contract."
         for view_type in validation_views
@@ -2567,6 +2749,30 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
                     ),
                 )
                 repair_reference_ids_by_view[failed_view] = [master_id, *([neighbor_id] if neighbor_id else [])]
+    blocked_views = [view for view in generated_views if not _quality_allows_activation(quality_reports.get(view))]
+    if blocked_views:
+        for view in blocked_views:
+            if not candidate_histories.get(view):
+                candidate_histories.update(_persist_group_candidates(
+                    project_id, "character", asset_id, "", {view: group_images[view]},
+                    {view: view_prompts[view]}, {view: quality_reports[view]},
+                    group_id, master_id, policy,
+                    attempt_no=attempt_by_view.get(view, 1),
+                ))
+        return {
+            "state_json": _state_to_json(_load_project_state(project_id)),
+            "group_id": group_id,
+            "master_version_id": master_id,
+            "histories": candidate_histories,
+            "candidate_histories": candidate_histories,
+            "policy": policy,
+            "quality_reports": quality_reports,
+            "generated": [],
+            "review_decision": "failed_after_retry" if (retry_performed or any(_review_report_is_hard_fail(quality_reports.get(v)) for v in blocked_views)) else "uncertain",
+            "retry_performed": retry_performed,
+            "auto_selected_after_review": bool(auto_selected_views),
+            "auto_selected_views": auto_selected_views,
+        }
     async def commit():
         with _asset_transaction(project_id):
             return await commit_group()
@@ -2625,7 +2831,7 @@ async def generate_character_reference_group(project_id: str, asset_id: str, cus
 
 
 async def edit_character_reference(project_id: str, req, project_lock: asyncio.Lock | None = None) -> dict:
-    from src.api.context import _load_project_state, _save_image_asset_state
+    from src.api.context import _load_project_state, _save_image_asset_state, _state_to_json
     from src.agents.image_gen_agent import CHARACTER_PROMPT_TEMPLATE_VERSION
 
     state, asset, versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
@@ -2739,6 +2945,30 @@ async def edit_character_reference(project_id: str, req, project_lock: asyncio.L
         attempt_no = 2
     async def commit():
         latest, updated, updated_versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
+        if not _quality_allows_activation(quality_report):
+            candidate_version_id = quality_report.get("candidate_version_id") or ""
+            if not candidate_version_id:
+                candidate_version_id, _ = versions.add_candidate_file(
+                    "character", req.asset_id, req.view_type, Path(result.local_path), prompt,
+                    "reference_edit_attempt",
+                    metadata={
+                        "attempt_no": attempt_no,
+                        "review_decision": quality_report.get("review_decision") or "uncertain",
+                        "group_id": source_group_id,
+                        "master_version_id": master_id,
+                        "reference_version_ids": [master_id, *req.reference_version_ids],
+                        "quality_report": quality_report,
+                    },
+                )
+            history = updated_versions.list_versions("character", req.asset_id, req.view_type, prompt)
+            return {
+                "state_json": _state_to_json(_load_project_state(project_id)),
+                "history": history,
+                "quality_report": quality_report,
+                "candidate_version_id": candidate_version_id,
+                "version_id": "",
+                "image_path": "",
+            }
         active_path, history = updated_versions.replace_with_file(
             "character", req.asset_id, req.view_type, Path(result.local_path), prompt, "reference_edit",
             metadata={**_style_snapshot_metadata(latest), "provider": policy["provider"], "model": policy["model"], "resolution": policy["resolution"], "generation_mode": "reference_edit", "group_id": source_group_id, "master_version_id": master_id, "reference_version_ids": [master_id, *req.reference_version_ids], "attempt_no": attempt_no, "original_prompt": original_prompt, "retry_prompt_patch": retry_patch, "retry_of_version_id": retry_of_version_id, "quality_report": quality_report},

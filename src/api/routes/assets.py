@@ -19,7 +19,7 @@ from src.services.asset_generation import (
     required_asset_views as _required_asset_views,
 )
 from src.services.asset_prompt_composer import compose_asset_prompt
-from src.services.media_quality import MediaQualityFailure, review_decision, review_image_subjective
+from src.services.media_quality import MediaQualityFailure, classify_quality_report, review_decision, review_image_subjective
 from src.services.image_capabilities import normalize_policy, public_capabilities
 from src.services.prop_view_requirements import infer_prop_view_requirement, set_prop_view_requirement
 from src.services.scene_view_requirements import derive_scene_view_requirements, set_scene_view_requirements
@@ -605,7 +605,7 @@ async def review_image_history(project_id: str, req: ImageHistoryReviewRequest):
         current_report = selected.get("quality_report") if isinstance(selected.get("quality_report"), dict) else {}
         report = {**current_report, "visual_review": visual}
         visual_status = str(visual.get("status") or "").strip().casefold()
-        verdict = review_decision(visual)
+        verdict = classify_quality_report(report)
         report["review_verdict"] = verdict
         report["status"] = (
             "passed" if verdict == "passed"

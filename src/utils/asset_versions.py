@@ -76,15 +76,20 @@ class ImageAssetVersions:
         active_path = self.active_path(asset_type, asset_id, view_type)
         manifest = self._load_manifest()
         versions = manifest.setdefault("versions", {}).setdefault(key, [])
+        legacy_appended = False
         if active_path.is_file() and not any(record.get("path") == str(active_path) for record in versions):
             versions.append(self._record(active_path, prompt, "legacy", active=True))
+            legacy_appended = True
         # Projects can be moved between machines.  In that case an old
         # absolute path may still carry ``active=true`` even though the
         # current active file has a different root.  Normalize the marker
         # whenever history is read so exactly one record represents the
         # active slot (or none when the slot is missing).
-        self._set_active(versions, str(active_path) if active_path.is_file() else "")
-        self._save_manifest(manifest)
+        marker_changed = self._set_active(versions, str(active_path) if active_path.is_file() else "")
+        # Reading history is not a write: only persist when a repair actually
+        # changed the manifest so concurrent readers cannot clobber each other.
+        if legacy_appended or marker_changed:
+            self._save_manifest(manifest)
         return sorted(
             (
                 {
@@ -170,7 +175,7 @@ class ImageAssetVersions:
             prompt,
             source,
             active=False,
-            metadata={"candidate": True, **(metadata or {})},
+            metadata={"candidate": True, "pending_review": True, **(metadata or {})},
         )
         versions.append(record)
         self._set_active(versions, str(active_path) if active_path.is_file() else "")
@@ -387,9 +392,15 @@ class ImageAssetVersions:
         return record
 
     @staticmethod
-    def _set_active(versions: list[dict[str, Any]], active_path: str) -> None:
+    def _set_active(versions: list[dict[str, Any]], active_path: str) -> bool:
+        """Normalize active markers; return True when any record changed."""
+        changed = False
         for record in versions:
-            record["active"] = record.get("path") == active_path
+            flag = record.get("path") == active_path
+            if bool(record.get("active")) != flag:
+                record["active"] = flag
+                changed = True
+        return changed
 
     @staticmethod
     def _key(asset_type: str, asset_id: str, view_type: str) -> str:

@@ -70,6 +70,7 @@ def test_candidate_version_is_kept_without_replacing_active(tmp_path):
     candidate = next(item for item in history if item["id"] == candidate_id)
     assert candidate["active"] is False
     assert candidate["candidate"] is True
+    assert candidate["pending_review"] is True
     assert Path(candidate["path"]).is_file()
 
 
@@ -136,7 +137,7 @@ def test_single_hard_failure_retries_once_and_keeps_first_attempt(tmp_path, monk
     assert any(item.get("candidate") and item.get("attempt_no") == 1 for item in versions)
 
 
-def test_second_hard_failure_auto_selects_the_better_attempt(tmp_path, monkeypatch):
+def test_second_hard_failure_keeps_both_candidates_without_activation(tmp_path, monkeypatch):
     _, project_id = _client(tmp_path, monkeypatch)
     state = api_context._load_project_state(project_id)
     state.image_generation_policy = {"provider": "wan", "model": "wan2.7-image-pro", "resolution": "1K"}
@@ -176,9 +177,63 @@ def test_second_hard_failure_auto_selects_the_better_attempt(tmp_path, monkeypat
     ))
 
     assert len(fake.calls) == 2
-    assert result["quality"]["auto_selected_after_review"] is True
     assert result["quality"]["review_decision"] == "failed_after_retry"
-    active = next(item for item in result["history"] if item.get("active"))
-    assert active["attempt_no"] == 2
-    assert active["quality_report"]["visual_review"]["score"] == 0.62
+    assert result.get("candidate_version_id")
+    assert not any(item.get("active") for item in result["history"])
     assert {item.get("attempt_no") for item in result["history"] if item.get("candidate")} == {1, 2}
+
+
+def test_warning_visual_review_keeps_candidate_without_activation(tmp_path, monkeypatch):
+    _, project_id = _client(tmp_path, monkeypatch)
+    state = api_context._load_project_state(project_id)
+    state.image_generation_policy = {"provider": "wan", "model": "wan2.7-image-pro", "resolution": "1K"}
+    api_context._save_project_state(state)
+
+    class FakeClient:
+        provider_name = "wan"
+
+        def __init__(self):
+            self.calls = []
+
+        async def generate_image(self, **kwargs):
+            self.calls.append(kwargs)
+            path = _image(tmp_path / f"warning-attempt-{len(self.calls)}.png", (90, 70, 50))
+            return ImageGenResult(True, local_path=str(path), width=96, height=96, seed=kwargs["seed"], provider_name="wan")
+
+    fake = FakeClient()
+    monkeypatch.setattr(asset_generation, "client_for_policy", lambda _policy: fake)
+
+    async def validate(*_args, **_kwargs):
+        return {
+            "status": "warning", "passed": False, "review_verdict": "warning",
+            "review_decision": "uncertain", "automatic_reference_allowed": False,
+            "visual_review": {"status": "warning", "passed": False, "issues": ["证据不足"]},
+        }
+
+    monkeypatch.setattr(asset_generation, "_validate_generated_image", validate)
+    result = __import__("asyncio").run(asset_generation.regenerate_image_asset(
+        project_id,
+        RegenerateImageRequest(asset_type="prop", asset_id="old_key", view_type="front"),
+    ))
+
+    assert len(fake.calls) == 1
+    assert result["quality"]["review_verdict"] == "warning"
+    assert result.get("candidate_version_id")
+    assert not any(item.get("active") for item in result["history"])
+    assert any(item.get("candidate") and item.get("attempt_no") == 1 for item in result["history"])
+
+
+def test_list_versions_does_not_rewrite_manifest_when_unchanged(tmp_path, monkeypatch):
+    versions = ImageAssetVersions(tmp_path)
+    active_source = _image(tmp_path / "active.png", (10, 30, 50))
+    versions.replace_with_file(
+        "prop", "letter", "front", active_source, "active prompt", "generated",
+        metadata={"quality_report": {"status": "passed"}},
+    )
+
+    saved = []
+    monkeypatch.setattr(ImageAssetVersions, "_save_manifest", lambda self, manifest: saved.append(1))
+    versions.list_versions("prop", "letter", "front", "active prompt")
+    versions.list_versions("prop", "letter", "front", "active prompt")
+    versions.find_version("prop", "letter", "front", "")
+    assert saved == []

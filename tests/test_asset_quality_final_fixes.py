@@ -501,6 +501,11 @@ async def test_character_reference_edit_validates_and_persists_quality(tmp_path,
         ),
     )
     group = await asset_generation.generate_character_reference_group(project_id, "hero")
+    before_state = api_context._load_project_state(project_id)
+    active_before = next(
+        image.version_id for image in before_state.character_images.characters
+        if image.view_type == "back_full"
+    )
     expected = {"status": "warning", "automatic_reference_allowed": False, "technical_checks": []}
     seen = []
 
@@ -518,12 +523,16 @@ async def test_character_reference_edit_validates_and_persists_quality(tmp_path,
     )
 
     assert seen == [("character", "back_full")]
-    active = next(item for item in result["history"] if item["active"])
-    assert active["quality_report"] == expected
+    assert result["quality_report"] == expected
+    assert result.get("candidate_version_id")
+    candidate = next(
+        item for item in result["history"]
+        if item.get("candidate") and item.get("attempt_no") == 1
+    )
+    assert candidate["quality_report"] == expected
     state = api_context._load_project_state(project_id)
     edited = next(image for image in state.character_images.characters if image.view_type == "back_full")
-    assert edited.quality_report == expected
-    assert result["quality_report"] == expected
+    assert edited.version_id == active_before
 
 
 @pytest.mark.asyncio
@@ -582,3 +591,28 @@ async def test_scene_master_and_job_result_return_quality_reports(tmp_path, monk
         Context(project_id), {"asset_type": "scene", "asset_id": location_id, "view_type": "wide"},
     )
     assert job_result["quality_report"] == report
+
+
+def test_review_endpoint_normalizes_warning_and_skipped_verdicts(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    generated = client.post(f"/api/projects/{project_id}/assets/prop/old_key/generate", json={})
+    assert generated.status_code == 200
+
+    visuals = [
+        {"status": "warning", "passed": False, "issues": ["证据不足"], "review_verdict": "warning"},
+        {"status": "skipped", "reason": "模型未配置"},
+    ]
+    for visual in visuals:
+        async def review(*_args, **_kwargs):
+            return visual
+
+        monkeypatch.setattr("src.api.routes.assets.review_image_subjective", review)
+        response = client.post(
+            f"/api/projects/{project_id}/image-history/review",
+            json={"asset_type": "prop", "asset_id": "old_key", "view_type": "front"},
+        )
+        assert response.status_code == 200
+        history = response.json()["history"]
+        reviewed = next(item for item in history if item.get("quality_report", {}).get("visual_review") == visual)
+        verdict = reviewed["quality_report"]["review_verdict"]
+        assert verdict in {"passed", "warning", "hard_fail", "unreviewed"}

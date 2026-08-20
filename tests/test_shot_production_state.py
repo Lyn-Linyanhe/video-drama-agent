@@ -829,6 +829,7 @@ def test_mock_unreviewed_image_can_opt_in_to_auto_binding(monkeypatch):
             api_provider="mock",
             quality_report={
                 "status": "unreviewed",
+                "review_verdict": "unreviewed",
                 "automatic_reference_allowed": True,
             },
         )

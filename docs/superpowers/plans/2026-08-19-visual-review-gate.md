@@ -107,7 +107,7 @@
     - 只有低分但没有具体失败证据时为 warning；
     - 完整证据且无问题时为 passed；
     - 证据项必须有 item、布尔 passed、非空 evidence 和 severity。
-    
+
     不从任意自然语言中猜测 hard_fail。只有失败的必需契约、技术失败、格式无效或明确的高置信度违规才阻断。
 
 - [ ] Step 4: 为三个图片模型增加默认字段 review_verdict、review_reason、pending_review_version_id、pending_review_group_id，旧项目自动使用空默认值。

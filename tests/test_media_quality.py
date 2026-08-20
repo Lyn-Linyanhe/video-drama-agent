@@ -406,6 +406,8 @@ def test_visual_review_classifies_missing_evidence_with_a_stable_verdict():
     assert report["review_reason"]
     assert report["review_evidence"]
     assert report["should_regenerate"] is True
+    assert media_quality.review_decision(report) == "hard_fail"
+    assert media_quality.should_retry_visual_review(report) is True
 
 
 def test_visual_review_classifies_low_score_without_evidence_as_warning():
