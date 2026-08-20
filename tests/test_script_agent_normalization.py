@@ -349,3 +349,38 @@ async def test_compact_script_prompt_contains_parse_rules_without_manifest_terms
     assert "先切场" in user_prompt
     assert "视觉资产清单（必须输出 asset_manifest）" not in user_prompt
     assert "asset_manifest.characters" not in user_prompt
+
+
+
+def test_repair_skips_negated_speech_between_speaker_and_verb():
+    script = ScriptBreakdown(
+        title="t", genre="悬疑", logline="l", duration_sec=10, narration_style="无",
+        scenes=[
+            _scene(
+                1,
+                characters=["苏眠"],
+                action_description="苏眠没答：“我没听见。”",
+            ),
+        ],
+    )
+    ScriptAgent._repair_scene_semantics(script)
+    scene = script.scenes[0]
+    assert scene.dialogue == []
+    assert "苏眠没答" in scene.action_description
+
+
+def test_repair_keeps_negation_inside_quoted_line():
+    script = ScriptBreakdown(
+        title="t", genre="悬疑", logline="l", duration_sec=10, narration_style="无",
+        scenes=[
+            _scene(
+                1,
+                characters=["苏眠"],
+                action_description="苏眠说：“不是这样的。”",
+            ),
+        ],
+    )
+    ScriptAgent._repair_scene_semantics(script)
+    scene = script.scenes[0]
+    assert [d.line for d in scene.dialogue] == ["不是这样的。"]
+    assert "不是这样的。" not in scene.action_description

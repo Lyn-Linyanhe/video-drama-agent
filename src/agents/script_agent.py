@@ -184,6 +184,14 @@ def _extract_quoted_speech(action: str, known_names: list[str]) -> list[tuple[st
             prefix = action[max(0, match.start() - 6):match.start()]
             if re.search(r"(没有|没|未|不曾|不是)[^，。；]{0,4}$", prefix):
                 continue
+            # Also guard negation between the speaker and the verb (e.g.
+            # 苏眠没答："..."): the quote is not an utterance when the speech
+            # verb itself is negated.
+            name_end = match.start() + len(speaker)
+            quote_start = match.end() - len(line) - 2
+            between = action[name_end:max(name_end, quote_start)]
+            if re.search(r"(没有|没|未|不曾|不是)[^，。；]{0,3}$", between):
+                continue
             seen.add((speaker, line))
             found.append((speaker, line, match.start(), match.end()))
     return found
