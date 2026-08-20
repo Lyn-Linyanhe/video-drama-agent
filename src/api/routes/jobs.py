@@ -495,13 +495,17 @@ async def _job_script_visualize(context, payload: dict) -> dict:
         # Merge per-scene/global records produced by the visual agent (Plan B
         # parallel telemetry) with the project's existing persisted history.
         requests = list((latest.visual_performance or {}).get("requests") or [])
-        seen_keys = {(item.get("stage"), item.get("scene_id", 0)) for item in requests}
+        request_index = {(item.get("stage"), item.get("scene_id", 0)): idx for idx, item in enumerate(requests)}
         for agent_req in list((llm_metrics or {}).get("requests") or []):
             key = (agent_req.get("stage"), agent_req.get("scene_id", 0))
-            if key not in seen_keys:
+            if key in request_index:
+                # A repeated run replaces the previous run's record for the same
+                # key so the detail panel shows the latest attempt.
+                requests[request_index[key]] = agent_req
+            else:
+                request_index[key] = len(requests)
                 requests.append(agent_req)
-                seen_keys.add(key)
-        requests.append({
+        total_request = {
             "stage": "visualize", "elapsed_ms": round((time.perf_counter() - started) * 1000),
             "provider": getattr(visual_prompt_agent.llm, "provider", ""),
             "model": getattr(visual_prompt_agent.llm, "model", ""),
@@ -514,7 +518,12 @@ async def _job_script_visualize(context, payload: dict) -> dict:
             "transport_attempts": llm_metrics.get("transport_attempts", 0),
             "transport_retries": llm_metrics.get("transport_retries", 0),
             "timeout_sec": llm_metrics.get("timeout_sec", 0),
-        })
+        }
+        total_index = next((i for i, item in enumerate(requests) if item.get("stage") == "visualize"), None)
+        if total_index is None:
+            requests.append(total_request)
+        else:
+            requests[total_index] = total_request
         latest.visual_performance = {"requests": requests}
         project_store.set_visual_design(context.project_id, visual.model_dump())
         project_store.add_stage(context.project_id, "stage1")

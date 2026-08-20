@@ -240,4 +240,3 @@ def test_split_output_appends_continuity_segment_after_timed_structure():
     assert "拆开信封" not in shot2.prompt
     shot1 = next(sp for sp in prompts.shots if sp.scene_id == 1)
     assert "【顺承上一镜】" not in shot1.prompt
-

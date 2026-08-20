@@ -532,3 +532,88 @@ def test_parallel_scene_failure_keeps_partial_requests_and_falls_back(monkeypatc
     assert len(scene_reqs) == 5
     # Progress only advanced for completed shots.
     assert [call[1] for call in progress_calls] == [1, 2, 3, 4, 5]
+
+
+def test_parallel_cancel_does_not_retry_or_fallback(monkeypatch):
+    import asyncio
+    import re
+
+    from src.schemas.script import ScriptBreakdown
+    import src.agents.visual_prompt_agent as vpa
+    from src.agents.visual_prompt_agent import VisualPromptAgent, _CompactShotVisualPrompt
+    from src.services.job_manager import JobCanceled
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(1)
+    )
+    agent = VisualPromptAgent()
+    scene_calls = []
+
+    async def fake_global(*_a, **_k):
+        return vpa._GlobalVisualOutput(
+            overall_style="s", color_palette="c", aspect_ratio="9:16",
+            global_negative_prompt="n", global_character_descriptions_cn={},
+        )
+
+    class FakeLLM:
+        provider = "deepseek"
+
+        async def generate_structured(self, **kw):
+            scene_calls.append(kw["output_schema"].__name__)
+            m = re.search(r"第\s*(\d+)\s*镜", kw["user_prompt"])
+            sid = int(m.group(1)) if m else 1
+            return _CompactShotVisualPrompt(
+                scene_id=sid, subject_state=f"s{sid}", action_timeline=f"0-5s a{sid}",
+                environment_delta="", camera_motion="中景", lighting_delta="自然光",
+                negative_prompt="neg", motion_strength=0.5,
+            )
+
+    def progress(*_args, **_kwargs):
+        raise JobCanceled("任务已由用户终止")
+
+    async def single(*_a, **_k):
+        raise AssertionError("fallback must not run on cancel")
+
+    agent._generate_global_visual = fake_global
+    agent.llm = FakeLLM()
+    monkeypatch.setattr(agent, "_run_single_shot", single)
+    with pytest.raises(JobCanceled):
+        asyncio.run(agent._run_parallel_visualize(
+            script, prompt_overrides=None, creative_profile=None, telemetry={},
+            source_text="", _repair_character_profiles=False, progress_callback=progress,
+        ))
+    assert len(scene_calls) == 1
+
+
+def test_parallel_fallback_keeps_prior_attempts_and_marks_fallback(monkeypatch):
+    import asyncio
+
+    from src.schemas.script import ScriptBreakdown
+    from src.agents.visual_prompt_agent import VisualPromptAgent
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(2)
+    )
+    agent = VisualPromptAgent()
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("phase down")
+
+    async def single(*_a, **_k):
+        # Simulates the real generate_structured resetting its own telemetry
+        # dict and recording one single-shot call.
+        _k["telemetry"]["attempts"] = 3
+        _k["telemetry"]["input_chars"] = 50
+        return ("single-visual", "single-prompts")
+
+    monkeypatch.setattr(agent, "_generate_global_visual", boom)
+    monkeypatch.setattr(agent, "_run_single_shot", single)
+    telemetry = {"requests": [{"stage": "visualize_scene", "scene_id": 1, "attempts": 2}]}
+    result = asyncio.run(agent._run_parallel_visualize(
+        script, prompt_overrides=None, creative_profile=None, telemetry=telemetry,
+        source_text="", _repair_character_profiles=False,
+    ))
+    assert result == ("single-visual", "single-prompts")
+    assert telemetry["fallback_used"] is True
+    assert telemetry["attempts"] == 5
+    assert telemetry["input_chars"] == 50

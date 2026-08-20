@@ -22,6 +22,11 @@ from src.services.timed_prompt_composer import apply_timed_prompt_structure
 from src.config import DEFAULT_API
 
 
+def _job_canceled_type():
+    from src.services.job_manager import JobCanceled
+    return JobCanceled
+
+
 _ENV_ACTION_CUES = (
     "站在", "出现", "走进", "走入", "踏入", "走近", "走来", "从阴影", "逆光站",
     "脚步声", "推开", "推开门", "蹲", "冲进", "躲", "掏出", "放进", "攥",
@@ -798,6 +803,8 @@ class VisualPromptAgent:
                                 "timeout_sec": metric.get("timeout_sec", 0),
                             })
                         return shot, metric
+                    except _job_canceled_type():
+                        raise
                     except Exception as exc:
                         last = exc
                 raise last
@@ -858,9 +865,11 @@ class VisualPromptAgent:
                 output.global_character_descriptions = repaired_en
                 output.global_character_descriptions_cn = repaired_cn
             return self._split_output(output, script, prompt_overrides, creative_profile)
+        except _job_canceled_type():
+            raise
         except Exception:
+            attempted = 0
             if telemetry is not None:
-                telemetry["fallback_used"] = True
                 # Keep the aggregate attempt counter accurate when phase 2 fails
                 # partway: sum the per-request records that already happened so
                 # the single-shot fallback counter does not hide prior calls.
@@ -869,16 +878,24 @@ class VisualPromptAgent:
                     for req in (telemetry.get("requests") or [])
                     if isinstance(req, dict)
                 )
-                if attempted:
-                    telemetry["attempts"] = max(int(telemetry.get("attempts") or 0), attempted)
-            return await self._run_single_shot(
+            # Run the fallback against a dedicated metric dict: generate_structured
+            # resets attempts/fallback_used at call start, so sharing telemetry
+            # would wipe the parallel-phase counts recorded above.
+            fallback_metrics: dict = {}
+            result = await self._run_single_shot(
                 script,
                 prompt_overrides=prompt_overrides,
                 creative_profile=creative_profile,
-                telemetry=telemetry,
+                telemetry=fallback_metrics,
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
             )
+            if telemetry is not None:
+                prior_attempts = int(telemetry.get("attempts") or 0)
+                telemetry["fallback_used"] = True
+                _merge_visualize_telemetry(telemetry, fallback_metrics)
+                telemetry["attempts"] = max(prior_attempts, attempted) + int(fallback_metrics.get("attempts") or 0)
+            return result
 
     async def _run_stepwise(
         self,

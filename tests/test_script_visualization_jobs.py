@@ -761,3 +761,54 @@ async def test_structured_llm_telemetry_records_retries_and_json_repairs():
     assert telemetry["repair_attempts"] == 1
     assert telemetry["fallback_used"] is False
     assert telemetry["input_chars"] == len("system") + len("user")
+
+
+@pytest.mark.asyncio
+async def test_repeat_visualize_replaces_previous_run_records(monkeypatch):
+    state = DramaState(
+        project_id="c" * 12,
+        script=_script("s"),
+        visual_stage="generating",
+        visual_script_signature="sig",
+    )
+    visual = VisualDesign(overall_style="写实", color_palette="冷色", scenes=[])
+    prompts = GenerationPrompts(api_provider="mock", shots=[ShotPrompt(scene_id=1, prompt="p", duration_sec=5)])
+
+    def fake_run(*_args, **kwargs):
+        telemetry = kwargs.get("telemetry")
+        telemetry["requests"] = [
+            {"stage": "visualize_scene", "scene_id": 1, "elapsed_ms": 111, "attempts": 1},
+        ]
+        return asyncio.sleep(0, result=(visual, prompts))
+
+    monkeypatch.setattr(jobs, "_load_project_state", lambda _project_id, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(jobs.project_store, "set_visual_design", lambda *_args: None)
+    monkeypatch.setattr(jobs.project_store, "add_stage", lambda *_args: None)
+    monkeypatch.setattr(jobs.project_store, "update_status", lambda *_args: None)
+    monkeypatch.setattr(jobs, "_script_signature", lambda _script: "sig")
+    monkeypatch.setattr(jobs.visual_prompt_agent, "run", fake_run)
+
+    await jobs._job_script_visualize(_Context(state.project_id), {"script_signature": "sig"})
+    first = (state.visual_performance or {}).get("requests") or []
+    assert len([r for r in first if r.get("stage") == "visualize"]) == 1
+
+    def fake_run2(*_args, **kwargs):
+        telemetry = kwargs.get("telemetry")
+        telemetry["requests"] = [
+            {"stage": "visualize_scene", "scene_id": 1, "elapsed_ms": 222, "attempts": 2},
+            {"stage": "visualize_scene", "scene_id": 2, "elapsed_ms": 333, "attempts": 1},
+        ]
+        return asyncio.sleep(0, result=(visual, prompts))
+
+    monkeypatch.setattr(jobs.visual_prompt_agent, "run", fake_run2)
+    await jobs._job_script_visualize(_Context(state.project_id), {"script_signature": "sig"})
+
+    requests = (state.visual_performance or {}).get("requests") or []
+    scenes = [r for r in requests if r.get("stage") == "visualize_scene"]
+    totals = [r for r in requests if r.get("stage") == "visualize"]
+    assert len(totals) == 1
+    assert len(scenes) == 2
+    by_id = {r.get("scene_id"): r for r in scenes}
+    assert by_id[1]["elapsed_ms"] == 222
+    assert by_id[2]["elapsed_ms"] == 333
