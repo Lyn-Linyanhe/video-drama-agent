@@ -513,11 +513,12 @@ def test_environment_cleaner_drops_looking_at_and_event_clauses():
             emotion_tone="紧张",
         )
     ]
-    value = "旧钟楼地下室；看着黑暗中的暗道；地下室的旧钟表被撞倒；玻璃门铃响；墙面大片水痕；中央一张长桌"
+    value = "旧钟楼地下室；看着黑暗中的暗道；地下室的旧钟表被撞倒；玻璃门铃响；玻璃门带动门铃轻响；墙面大片水痕；中央一张长桌"
     cleaned = vam._clean_environment_description(value, scenes)
 
     assert "看着" not in cleaned
     assert "撞倒" not in cleaned
     assert "门铃响" not in cleaned
+    assert "门铃轻响" not in cleaned
     assert "墙面大片水痕" in cleaned
     assert "中央一张长桌" in cleaned
