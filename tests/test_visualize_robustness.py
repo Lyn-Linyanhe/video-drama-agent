@@ -292,3 +292,66 @@ def test_parallel_falls_back_to_single_shot(monkeypatch):
     ))
     assert result == ("single-visual", "single-prompts")
     assert telemetry.get("fallback_used") is True
+
+
+def test_merge_visualize_telemetry_sums():
+    from src.agents.visual_prompt_agent import _merge_visualize_telemetry
+
+    t = {}
+    _merge_visualize_telemetry(t, {"attempts": 2, "input_chars": 100, "output_chars": 50,
+                                   "fallback_used": True, "timeout_sec": 300})
+    _merge_visualize_telemetry(t, {"attempts": 3, "input_chars": 200, "output_chars": 20})
+    assert t["attempts"] == 5
+    assert t["input_chars"] == 300
+    assert t["output_chars"] == 70
+    assert t["fallback_used"] is True
+    assert t["timeout_sec"] == 300
+
+
+def test_parallel_visualize_aggregates_telemetry():
+    import asyncio
+    import re
+
+    from src.schemas.script import ScriptBreakdown
+    import src.agents.visual_prompt_agent as vpa
+    from src.agents.visual_prompt_agent import VisualPromptAgent, _CompactShotVisualPrompt
+
+    script = ScriptBreakdown(
+        title="t", genre="g", logline="l", duration_sec=18, narration_style="n", scenes=_scenes(6)
+    )
+
+    class FakeLLM:
+        provider = "deepseek"
+
+        async def generate_structured(self, **kw):
+            if kw["output_schema"].__name__ == "_GlobalVisualOutput":
+                kw["telemetry"]["attempts"] = 1
+                kw["telemetry"]["input_chars"] = 100
+                return vpa._GlobalVisualOutput(overall_style="s", color_palette="c", aspect_ratio="9:16",
+                                               global_negative_prompt="n",
+                                               global_character_descriptions_cn={"c1": "女，25岁，鹅蛋脸，黑发。"})
+            kw["telemetry"]["attempts"] = 1
+            kw["telemetry"]["input_chars"] = 100
+            m = re.search(r"第\s*(\d+)\s*镜", kw["user_prompt"])
+            sid = int(m.group(1)) if m else 1
+            return _CompactShotVisualPrompt(scene_id=sid, subject_state=f"s{sid}", action_timeline=f"0-5s a{sid}",
+                                            environment_delta="", camera_motion="中景", lighting_delta="自然光",
+                                            negative_prompt="neg", motion_strength=0.5)
+
+    agent = VisualPromptAgent()
+    agent.llm = FakeLLM()
+    captured = {}
+
+    def fake_split(output, script, po, cp):
+        captured["output"] = output
+        return ("visual", "prompts")
+
+    agent._split_output = fake_split
+    telemetry = {}
+    asyncio.run(agent._run_parallel_visualize(
+        script, prompt_overrides=None, creative_profile=None, telemetry=telemetry,
+        source_text="", _repair_character_profiles=False,
+    ))
+    # 1 phase1 + 6 phase2 calls, each contributing attempts=1, input=100
+    assert telemetry.get("attempts") == 7
+    assert telemetry.get("input_chars") == 700

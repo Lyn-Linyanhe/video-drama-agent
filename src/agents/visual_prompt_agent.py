@@ -514,6 +514,30 @@ COMPACT_SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提�
 _PARALLEL_VISUALIZE_CONCURRENCY = 4
 
 
+def _merge_visualize_telemetry(target: dict, inc: dict) -> None:
+    """Accumulate per-call LLM metrics into a shared telemetry dict (no reset)."""
+    if not isinstance(target, dict) or not isinstance(inc, dict):
+        return
+    for key in (
+        "attempts",
+        "repair_attempts",
+        "input_chars",
+        "output_chars",
+        "transport_attempts",
+        "transport_retries",
+    ):
+        value = inc.get(key, 0) or 0
+        if value:
+            target[key] = target.get(key, 0) + value
+    if inc.get("fallback_used"):
+        target["fallback_used"] = True
+    if inc.get("timeout_sec") and not target.get("timeout_sec"):
+        target["timeout_sec"] = inc["timeout_sec"]
+    for key in ("provider", "model"):
+        if inc.get(key) and not target.get(key):
+            target[key] = inc[key]
+
+
 class VisualPromptAgent:
     """Agent that generates visual design and Chinese video prompts in one pass.
 
@@ -712,25 +736,30 @@ class VisualPromptAgent:
 {global_cn_text}
 
 \u53ea\u8f93\u51fa\u672c\u955c shot \u5dee\u5f02\uff1ascene_id\u3001subject_state\u3001action_timeline\u3001environment_delta(\u4ec5\u9759\u6001\u73af\u5883\u5dee\u5f02\uff0c\u7981\u6b62\u4eba\u7269\u52a8\u4f5c/\u60c5\u7eea/\u5728\u573a)\u3001camera_motion\u3001lighting_delta\u3001prop_state\u3001negative_prompt\u3001motion_strength\u3002\u53ea\u8f93\u51fa\u4e00\u4e2a JSON \u5bf9\u8c61\u3002"""
+            metric = {}
             async with sem:
                 last = None
                 for attempt in (1, 2):
                     try:
-                        return await self.llm.generate_structured(
+                        shot = await self.llm.generate_structured(
                             system_prompt=COMPACT_SYSTEM_PROMPT,
                             user_prompt=user,
                             output_schema=_CompactShotVisualPrompt,
                             temperature=0.7,
-                            telemetry=telemetry,
+                            telemetry=metric,
                             phase="script.visualize.delta",
                         )
+                        return shot, metric
                     except Exception as exc:
                         last = exc
                 raise last
 
         results = await asyncio.gather(*(one(scene) for scene in script.scenes))
-        results.sort(key=lambda s: s.scene_id)
-        return results
+        results.sort(key=lambda r: r[0].scene_id)
+        if telemetry is not None:
+            for _shot, metric in results:
+                _merge_visualize_telemetry(telemetry, metric)
+        return [shot for shot, _metric in results]
 
     async def _run_parallel_visualize(self, script, *, prompt_overrides, creative_profile, telemetry, source_text, _repair_character_profiles):
         """Plan B: two-phase parallel; falls back to single-shot on persistent failure."""
@@ -738,8 +767,11 @@ class VisualPromptAgent:
             manifest_text = self._format_manifest(script)
             profile = creative_profile
             profile_ratio = getattr(profile, "video_ratio", "") or "9:16"
-            global_out = await self._generate_global_visual(script, manifest_text, profile, telemetry)
+            gmetrics = {}
+            global_out = await self._generate_global_visual(script, manifest_text, profile, gmetrics)
             shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry)
+            if telemetry is not None:
+                _merge_visualize_telemetry(telemetry, gmetrics)
             output = _CompactVisualPromptOutput(
                 overall_style=global_out.overall_style,
                 color_palette=global_out.color_palette,
