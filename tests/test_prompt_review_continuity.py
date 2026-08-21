@@ -86,17 +86,13 @@ def test_continuity_same_location_no_issue():
     assert continuity == []
 
 
-def test_continuity_cross_location_is_critical():
+def test_continuity_cross_location_is_not_a_hard_rule():
     from src.agents.prompt_review_agent import PromptReviewAgent
 
     script = _script(loc_b="alley_night")
     result = PromptReviewAgent._apply_deterministic_checks(script, _prompts(script), _result())
     continuity = [i for i in result.issues if i.category == "continuity"]
-    assert len(continuity) == 1
-    assert continuity[0].severity == "critical"
-    assert "地点不同" in continuity[0].description
-    assert result.passed is False
-    assert result.overall_score <= 59
+    assert continuity == []
 
 
 def test_first_shot_marked_continuity_is_critical():
@@ -111,16 +107,14 @@ def test_first_shot_marked_continuity_is_critical():
     assert "首镜" in continuity[0].description
 
 
-def test_continuity_missing_prev_prop_is_major():
+def test_continuity_missing_prev_prop_is_not_a_hard_rule():
     from src.agents.prompt_review_agent import PromptReviewAgent
 
     script = _script()
     script.asset_manifest.shot_bindings[1].prop_ids = []
     result = PromptReviewAgent._apply_deterministic_checks(script, _prompts(script), _result())
     continuity = [i for i in result.issues if i.category == "continuity"]
-    assert len(continuity) == 1
-    assert continuity[0].severity == "major"
-    assert "关键道具" in continuity[0].description
+    assert continuity == []
 
 
 def test_assembled_prompt_injects_prev_state_only_for_continuity_shot():

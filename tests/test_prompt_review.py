@@ -10,7 +10,9 @@ from src.api.routes import jobs
 from src.graph.state import DramaState
 from src.schemas.prompt import GenerationPrompts, PromptPolicy, ShotPrompt
 from src.schemas.prompt_review import PromptReviewIssue, PromptReviewResult
+from src.services.job_manager import JobCanceled
 from src.schemas.script import Scene, ScriptBreakdown
+from src.schemas.visual import VisualDesign
 
 
 class _Context:
@@ -175,6 +177,72 @@ async def test_prompt_review_batches_long_projects(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_prompt_review_v2_uses_three_stages_and_marks_missing_source_not_applicable(monkeypatch):
+    state = _state()
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps({"issues": []})),
+            )])
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("KIMI_PROMPT_REVIEW_API_KEY", "test-key")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI))
+
+    result = await PromptReviewAgent().run(
+        state.script, state.generation_prompts, None, PromptPolicy(), source_text="",
+    )
+
+    assert result.report_version == 2
+    assert result.audit_snapshot.source_script.status == "not_applicable"
+    assert result.verdict == "pass"
+    assert [record.stage for record in result.stage_records] == [
+        "source_alignment", "single_shot", "candidate_rereview",
+    ]
+    assert result.stage_records[0].status == "skipped"
+    assert len(calls) == 1
+    assert calls[0]["temperature"] == 1
+    assert calls[0]["max_tokens"] == 16384
+    assert calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert calls[0]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_v2_invalid_json_becomes_unreviewed_after_format_retry(monkeypatch):
+    state = _state()
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="not json"),
+            )])
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setenv("KIMI_PROMPT_REVIEW_API_KEY", "test-key")
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI))
+
+    result = await PromptReviewAgent().run(
+        state.script, state.generation_prompts, None, PromptPolicy(), source_text="",
+    )
+
+    assert result.verdict == "unreviewed"
+    assert any(issue.category == "audit" and issue.confidence == "unreviewed" for issue in result.issues)
+    assert all(issue.category != "quality" for issue in result.issues if issue.confidence == "unreviewed")
+    assert len(calls) == 4  # single-shot plus candidate rereview, each with one repair
+
+
+@pytest.mark.asyncio
 async def test_prompt_review_persists_kimi_report(monkeypatch):
     state = _state()
     monkeypatch.setattr(jobs, "_load_project_state", lambda *_args, **_kwargs: state)
@@ -207,6 +275,216 @@ async def test_prompt_review_persists_kimi_report(monkeypatch):
     assert result["report"]["overall_score"] == 91
     assert state.prompt_review["status"] == "ready"
     assert state.prompt_review["provider"] == "kimi"
+
+
+def test_prompt_review_signature_changes_when_source_or_visual_inputs_change():
+    state = _state()
+    state.script_draft_text = "原始剧本 A"
+    first = jobs._prompt_review_signature(state)
+    state.script_draft_text = "原始剧本 B"
+    assert jobs._prompt_review_signature(state) != first
+    state.script_draft_text = "原始剧本 A"
+    state.visual_design = VisualDesign(
+        overall_style="写实", color_palette="冷色", scenes=[],
+    )
+    assert jobs._prompt_review_signature(state) != first
+
+
+def test_job_signature_matches_agent_audit_signature():
+    state = _state()
+    state.script_draft_text = "原始剧本"
+    snapshot = PromptReviewAgent.build_audit_snapshot(
+        state.script, state.generation_prompts, state.visual_design,
+        state.prompt_policy, source_text=state.script_draft_text,
+        scene_vision_descriptions=state.scene_vision_descriptions,
+    )
+    assert jobs._prompt_review_signature(state) == PromptReviewAgent.audit_signature(snapshot)
+
+
+def test_only_current_confirmed_deterministic_review_blocks_video_generation():
+    state = _state()
+    issue = PromptReviewIssue(
+        scene_id=1, severity="critical", category="coverage", description="空提示词。", suggestion="补充提示词。",
+        issue_code="rule.prompt_empty", confidence="confirmed", deterministic=True, blocks_generation=True,
+    )
+    state.prompt_review = {"status": "ready", "report": {"report_version": 2, "issues": [issue.model_dump()]}}
+    assert jobs._prompt_review_blocks_generation(state) is True
+    issue.confidence = "suspected"
+    state.prompt_review["report"]["issues"] = [issue.model_dump()]
+    assert jobs._prompt_review_blocks_generation(state) is False
+    state.prompt_review["status"] = "stale"
+    issue.confidence = "confirmed"
+    state.prompt_review["report"]["issues"] = [issue.model_dump()]
+    assert jobs._prompt_review_blocks_generation(state) is False
+
+
+def test_prompt_review_generation_gate_reads_shot_and_index_issues():
+    state = _state()
+    issue = PromptReviewIssue(
+        scene_id=1, severity="critical", category="coverage", description="空提示词。", suggestion="补充提示词。",
+        issue_code="rule.prompt_empty", confidence="confirmed", deterministic=True, blocks_generation=True,
+    )
+    report = {"report_version": 2, "issues": [], "shots": [{"issues": [issue.model_dump()]}]}
+    state.prompt_review = {"status": "ready", "report": report}
+    assert jobs._prompt_review_blocks_generation(state) is True
+
+    report["shots"] = []
+    report["shots_issue_index"] = {"1": [issue.model_dump()]}
+    assert jobs._prompt_review_blocks_generation(state) is True
+
+
+def test_direct_prompt_review_job_id_is_persisted(monkeypatch):
+    state = _state()
+    signature = "signature-123"
+    state.prompt_review = {"status": "generating", "prompt_signature": signature, "job_id": ""}
+    monkeypatch.setattr(jobs, "_load_project_state", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda *_args, **_kwargs: None)
+
+    assert jobs._persist_prompt_review_job_id("project-1", signature, "job-123") is True
+    assert state.prompt_review["job_id"] == "job-123"
+
+
+def test_prompt_review_deduplication_compares_signatures_and_stale_writes_are_owned():
+    same = {
+        "job_type": "prompt.review",
+        "target_type": "prompt_set",
+        "target_id": "current",
+        "request": {"prompt_signature": "same"},
+    }
+    same_spec = {**same, "payload": {"prompt_signature": "same"}}
+    changed_spec = {**same, "payload": {"prompt_signature": "changed"}}
+    assert jobs._active_job_matches_spec(same, same_spec) is True
+    assert jobs._active_job_matches_spec(same, changed_spec) is False
+
+    state = _state()
+    state.prompt_review = {"job_id": "new-job"}
+    assert jobs._prompt_review_job_owns_state(state, "old-job") is False
+    assert jobs._prompt_review_job_owns_state(state, "new-job") is True
+    assert jobs._prompt_review_job_can_claim_state(state, "old-job") is False
+    state.prompt_review["job_id"] = ""
+    assert jobs._prompt_review_job_can_claim_state(state, "new-job") is True
+
+
+@pytest.mark.asyncio
+async def test_superseded_same_signature_review_cannot_claim_or_overwrite(monkeypatch):
+    state = _state()
+    signature = jobs._prompt_review_signature(state)
+    state.prompt_review = {
+        "status": "generating",
+        "prompt_signature": signature,
+        "job_id": "new-job",
+    }
+    monkeypatch.setattr(jobs, "_load_project_state", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda *_args, **_kwargs: None)
+
+    class FakeReviewer:
+        def enabled(self):
+            return True
+
+        def is_configured(self):
+            return True
+
+        def _settings(self):
+            return ("key", "kimi-k2.6", "https://api.moonshot.cn/v1")
+
+        async def run(self, *_args):
+            raise AssertionError("superseded review must not call Kimi")
+
+    monkeypatch.setattr(jobs, "PromptReviewAgent", FakeReviewer)
+    result = await jobs._job_prompt_review(_Context(state.project_id), {"prompt_signature": signature})
+
+    assert result["superseded"] is True
+    assert state.prompt_review["job_id"] == "new-job"
+    assert state.prompt_review["status"] == "generating"
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_preflight_failure_persists_unavailable(monkeypatch):
+    state = _state()
+    signature = jobs._prompt_review_signature(state)
+    state.prompt_review = {"status": "generating", "prompt_signature": signature, "job_id": ""}
+    monkeypatch.setattr(jobs, "_load_project_state", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda *_args, **_kwargs: None)
+
+    class FakeReviewer:
+        def enabled(self):
+            return True
+
+        def is_configured(self):
+            return False
+
+        def _settings(self):
+            return ("", "kimi-k2.6", "https://api.moonshot.cn/v1")
+
+        def configuration_error(self):
+            return "Kimi 未配置"
+
+    monkeypatch.setattr(jobs, "PromptReviewAgent", FakeReviewer)
+
+    with pytest.raises(ValueError, match="Kimi 未配置"):
+        await jobs._job_prompt_review(_Context(state.project_id), {"prompt_signature": signature})
+
+    assert state.prompt_review["status"] == "unavailable"
+    assert state.prompt_review["error"] == "Kimi 未配置"
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_cancellation_persists_canceled(monkeypatch):
+    state = _state()
+    signature = jobs._prompt_review_signature(state)
+    state.prompt_review = {"status": "generating", "prompt_signature": signature, "job_id": ""}
+    monkeypatch.setattr(jobs, "_load_project_state", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda *_args, **_kwargs: None)
+
+    class FakeReviewer:
+        def enabled(self):
+            return True
+
+        def is_configured(self):
+            return True
+
+        def _settings(self):
+            return ("key", "kimi-k2.6", "https://api.moonshot.cn/v1")
+
+        async def run(self, *_args):
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(jobs, "PromptReviewAgent", FakeReviewer)
+
+    with pytest.raises(asyncio.CancelledError):
+        await jobs._job_prompt_review(_Context(state.project_id), {"prompt_signature": signature})
+
+    assert state.prompt_review["status"] == "canceled"
+    assert state.prompt_review["error"] == "审核任务已取消"
+
+
+@pytest.mark.asyncio
+async def test_prompt_review_job_canceled_exception_persists_canceled(monkeypatch):
+    state = _state()
+    signature = jobs._prompt_review_signature(state)
+    state.prompt_review = {"status": "generating", "prompt_signature": signature, "job_id": ""}
+    monkeypatch.setattr(jobs, "_load_project_state", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda *_args, **_kwargs: None)
+
+    class FakeReviewer:
+        def enabled(self):
+            return True
+
+        def is_configured(self):
+            return True
+
+        def _settings(self):
+            return ("key", "kimi-k2.6", "https://api.moonshot.cn/v1")
+
+        async def run(self, *_args):
+            raise JobCanceled("任务已由用户终止")
+
+    monkeypatch.setattr(jobs, "PromptReviewAgent", FakeReviewer)
+
+    with pytest.raises(JobCanceled):
+        await jobs._job_prompt_review(_Context(state.project_id), {"prompt_signature": signature})
+
+    assert state.prompt_review["status"] == "canceled"
 
 
 @pytest.mark.asyncio

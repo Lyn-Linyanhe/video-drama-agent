@@ -5,6 +5,7 @@ import time
 import shutil
 import os
 import asyncio
+from copy import deepcopy
 from pathlib import Path
 from ..context import *
 from src.services.audio_timeline import (
@@ -40,6 +41,11 @@ from src.services.asr import align_native_subtitles
 from src.schemas.audio import SceneAudio
 from src.schemas.prompt import ShotPrompt
 from src.agents.prompt_review_agent import PromptReviewAgent
+from src.services.job_manager import JobCanceled
+from src.services.prompt_review_facts import (
+    audit_snapshot_signature as _audit_snapshot_signature,
+    build_audit_snapshot as _build_prompt_review_snapshot,
+)
 
 router = APIRouter()
 
@@ -319,12 +325,29 @@ def _cancel_active_visual_jobs(project_id: str) -> None:
 
 
 def _prompt_review_signature(state: DramaState) -> str:
-    """Version the audit against the exact script, prompts, and project policy."""
-    payload = {
-        "script": state.script.model_dump() if state.script else None,
-        "generation_prompts": state.generation_prompts.model_dump() if state.generation_prompts else None,
-        "prompt_policy": state.prompt_policy.model_dump(),
-    }
+    """Version the audit against every input captured by the v2 snapshot."""
+    source_text = str(state.script_draft_text or "")
+    if not source_text.strip() and str(state.input_mode or "").strip().lower() == "script":
+        source_text = str(state.user_input or "")
+    if state.script and state.generation_prompts:
+        snapshot = _build_prompt_review_snapshot(
+            state.script,
+            state.generation_prompts,
+            state.visual_design,
+            state.prompt_policy,
+            source_text=source_text,
+            scene_vision_descriptions=state.scene_vision_descriptions,
+        )
+        return _audit_snapshot_signature(snapshot)
+    else:
+        payload = {
+            "source_text": source_text,
+            "script": state.script.model_dump() if state.script else None,
+            "visual_design": state.visual_design.model_dump() if state.visual_design else None,
+            "scene_vision_descriptions": state.scene_vision_descriptions,
+            "generation_prompts": state.generation_prompts.model_dump() if state.generation_prompts else None,
+            "prompt_policy": state.prompt_policy.model_dump(),
+        }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
@@ -339,22 +362,132 @@ def _mark_prompt_review_stale(state: DramaState) -> None:
     state.prompt_review = previous
 
 
+def _prompt_review_report_issues(report: dict) -> list[dict]:
+    """Flatten all persisted issue locations and remove duplicate entries."""
+    values: list[object] = []
+    values.extend(report.get("issues") or [])
+    for shot in report.get("shots") or []:
+        if isinstance(shot, dict):
+            values.extend(shot.get("issues") or [])
+    for indexed_issues in (report.get("shots_issue_index") or {}).values():
+        values.extend(indexed_issues or [])
+    result: list[dict] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        identity = str(value.get("candidate_id") or "")
+        if not identity:
+            identity = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(value)
+    return result
+
+
+def _prompt_review_blocks_generation(state: DramaState) -> bool:
+    """Only confirmed deterministic v2 errors are a generation gate."""
+    if (state.prompt_review or {}).get("status") != "ready":
+        return False
+    report = (state.prompt_review or {}).get("report") or {}
+    if int(report.get("report_version") or 1) < 2:
+        return False
+    return any(
+        bool(issue.get("deterministic"))
+        and bool(issue.get("blocks_generation"))
+        and issue.get("confidence") == "confirmed"
+        for issue in _prompt_review_report_issues(report)
+    )
+
+
+def _persist_prompt_review_job_id(project_id: str, prompt_signature: str, job_id: str) -> bool:
+    """Attach a directly-created review job without overwriting newer state."""
+    state = _load_project_state(project_id, require_visual=False, require_script=False)
+    review = dict(state.prompt_review or {})
+    if review.get("prompt_signature") != prompt_signature:
+        return False
+    review["job_id"] = job_id
+    state.prompt_review = review
+    _save_project_state(state)
+    return True
+
+
+def _prompt_review_job_owns_state(state: DramaState, job_id: str) -> bool:
+    return str((state.prompt_review or {}).get("job_id") or "") == str(job_id or "")
+
+
+def _prompt_review_job_can_claim_state(state: DramaState, job_id: str) -> bool:
+    stored_job_id = str((state.prompt_review or {}).get("job_id") or "")
+    return not stored_job_id or stored_job_id == str(job_id or "")
+
+
+def _active_job_matches_spec(active: dict, spec: dict) -> bool:
+    """Treat prompt-review jobs with different snapshots as distinct work."""
+    if any(active.get(key, "") != spec.get(key, "") for key in ("job_type", "target_type", "target_id")):
+        return False
+    if spec.get("job_type") != "prompt.review":
+        return True
+    expected = str((spec.get("payload") or {}).get("prompt_signature") or "")
+    existing_request = active.get("request") or active.get("payload") or {}
+    existing = str(existing_request.get("prompt_signature") or "")
+    return bool(expected) and expected == existing
+
+
+async def _persist_prompt_review_runtime_state(
+    context,
+    expected_signature: str,
+    agent,
+    status: str,
+    error: str,
+) -> bool:
+    """Record preflight/cancellation outcomes without overwriting newer work."""
+    async with context.project_lock:
+        state = _load_project_state(context.project_id, require_visual=False, require_script=False)
+        current_signature = _prompt_review_signature(state)
+        if expected_signature and current_signature != expected_signature:
+            return False
+        if not _prompt_review_job_can_claim_state(state, context.job_id):
+            return False
+        state.prompt_review = {
+            **dict(state.prompt_review or {}),
+            "status": status,
+            "prompt_signature": expected_signature or current_signature,
+            "job_id": context.job_id,
+            "provider": "kimi",
+            "model": agent._settings()[1],
+            "error": error[:500],
+        }
+        _save_project_state(state)
+    return True
+
+
 async def _job_prompt_review(context, payload: dict) -> dict:
     """Audit generated storyboard prompts with the configured Kimi account."""
     expected_signature = str(payload.get("prompt_signature") or "")
     agent = PromptReviewAgent()
     if not agent.enabled():
+        await _persist_prompt_review_runtime_state(
+            context, expected_signature, agent, "unavailable", "Kimi 分镜审核已关闭",
+        )
         return {"skipped": True, "reason": "Kimi 分镜审核已关闭"}
     if not agent.is_configured():
-        raise ValueError(agent.configuration_error())
+        error = agent.configuration_error()
+        await _persist_prompt_review_runtime_state(
+            context, expected_signature, agent, "unavailable", error,
+        )
+        raise ValueError(error)
 
     async with context.project_lock:
         state = _load_project_state(context.project_id)
         current_signature = _prompt_review_signature(state)
         if expected_signature and expected_signature != current_signature:
-            _mark_prompt_review_stale(state)
-            _save_project_state(state)
+            if _prompt_review_job_owns_state(state, context.job_id):
+                _mark_prompt_review_stale(state)
+                _save_project_state(state)
             return {"stale": True, "prompt_signature": expected_signature}
+        if not _prompt_review_job_can_claim_state(state, context.job_id):
+            return {"stale": True, "superseded": True, "prompt_signature": expected_signature}
         state.prompt_review = {
             **dict(state.prompt_review or {}),
             "status": "generating",
@@ -369,33 +502,45 @@ async def _job_prompt_review(context, payload: dict) -> dict:
         prompts = state.generation_prompts.model_copy(deep=True)
         visual = state.visual_design.model_copy(deep=True) if state.visual_design else None
         policy = state.prompt_policy.model_copy(deep=True)
+        source_text = str(state.script_draft_text or "")
+        if not source_text.strip() and str(state.input_mode or "").strip().lower() == "script":
+            source_text = str(state.user_input or "")
+        scene_vision_descriptions = deepcopy(state.scene_vision_descriptions or {})
 
     context.progress("waiting_provider", 0, 1, "Kimi 正在核对剧本与分镜提示词")
     try:
-        result = await agent.run(script, prompts, visual, policy)
+        result = await agent.run(
+            script, prompts, visual, policy, source_text, scene_vision_descriptions,
+        )
+        context.check_cancelled()
     except BaseException as exc:
         async with context.project_lock:
             latest = _load_project_state(context.project_id, require_visual=False)
-            if _prompt_review_signature(latest) == expected_signature:
+            if (
+                _prompt_review_signature(latest) == expected_signature
+                and _prompt_review_job_owns_state(latest, context.job_id)
+            ):
                 latest.prompt_review = {
                     **dict(latest.prompt_review or {}),
-                    "status": "failed",
+                    "status": "canceled" if isinstance(exc, (asyncio.CancelledError, JobCanceled)) else "failed",
                     "prompt_signature": expected_signature,
                     "job_id": context.job_id,
                     "provider": "kimi",
                     "model": agent._settings()[1],
-                    "error": str(exc)[:500],
+                    "error": "审核任务已取消" if isinstance(exc, (asyncio.CancelledError, JobCanceled)) else str(exc)[:500],
                 }
                 _save_project_state(latest)
         raise
-    context.check_cancelled()
     async with context.project_lock:
         latest = _load_project_state(context.project_id)
         current_signature = _prompt_review_signature(latest)
         if expected_signature and expected_signature != current_signature:
-            _mark_prompt_review_stale(latest)
-            _save_project_state(latest)
+            if _prompt_review_job_owns_state(latest, context.job_id):
+                _mark_prompt_review_stale(latest)
+                _save_project_state(latest)
             return {"stale": True, "prompt_signature": expected_signature}
+        if not _prompt_review_job_owns_state(latest, context.job_id):
+            return {"stale": True, "superseded": True, "prompt_signature": expected_signature}
         latest.prompt_review = {
             "status": "ready",
             "prompt_signature": current_signature,
@@ -540,15 +685,23 @@ async def _job_script_visualize(context, payload: dict) -> dict:
                 "error": "",
             }
             _save_project_state(latest)
-            review_job = job_manager.create_job(
-                context.project_id,
-                "prompt.review",
-                "prompt_set",
-                "current",
-                {"prompt_signature": prompt_signature},
-                provider="kimi",
-            )
-            latest.prompt_review["job_id"] = review_job["job_id"]
+            try:
+                review_job = job_manager.create_job(
+                    context.project_id,
+                    "prompt.review",
+                    "prompt_set",
+                    "current",
+                    {"prompt_signature": prompt_signature},
+                    provider="kimi",
+                )
+            except Exception as exc:
+                latest.prompt_review.update({
+                    "status": "failed",
+                    "job_id": "",
+                    "error": str(exc)[:500],
+                })
+            else:
+                latest.prompt_review["job_id"] = review_job["job_id"]
         else:
             latest.prompt_review = {
                 "status": "unavailable",
@@ -1483,6 +1636,8 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
         })
     elif req.job_type == "video.generate":
         state = _load_project_state(project_id)
+        if _prompt_review_blocks_generation(state):
+            raise HTTPException(409, "Kimi 审核发现确定性结构错误；请修复后重新审核再生成视频")
         scene_id = int(req.payload.get("scene_id") or req.target_id or 0)
         scenes = [scene_id] if scene_id else [scene.scene_id for scene in state.script.scenes]
         skipped_video_shots: list[dict[str, object]] = []
@@ -1548,20 +1703,19 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
             "payload": req.payload,
         })
     active_jobs = job_store.list_jobs(project_id, states=ACTIVE_JOB_STATES, limit=500)
-    active_by_target = {
-        (item["job_type"], item["target_type"], item["target_id"]): item
-        for item in active_jobs
-    }
-    duplicates = [
-        active_by_target[(spec["job_type"], spec.get("target_type", ""), spec.get("target_id", ""))]
-        for spec in specs
-        if (spec["job_type"], spec.get("target_type", ""), spec.get("target_id", "")) in active_by_target
-    ]
-    specs = [
-        spec for spec in specs
-        if (spec["job_type"], spec.get("target_type", ""), spec.get("target_id", "")) not in active_by_target
-    ]
+    duplicates: list[dict] = []
+    remaining_specs: list[dict] = []
+    for spec in specs:
+        match = next((job for job in active_jobs if _active_job_matches_spec(job, spec)), None)
+        if match:
+            duplicates.append(match)
+        else:
+            remaining_specs.append(spec)
+    specs = remaining_specs
     if not specs:
+        if duplicates:
+            if req.job_type == "prompt.review":
+                _persist_prompt_review_job_id(project_id, signature, duplicates[0]["job_id"])
         if len(duplicates) == 1:
             public_job = _job_public(duplicates[0])
             result = {"job": public_job, "jobs": [public_job]}
@@ -1581,7 +1735,21 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
             result["skipped"] = skipped_video_shots
         return result
     if len(specs) == 1:
-        job = job_manager.create_job(project_id=project_id, **specs[0])
+        try:
+            job = job_manager.create_job(project_id=project_id, **specs[0])
+        except Exception as exc:
+            if req.job_type == "prompt.review":
+                latest = _load_project_state(project_id, require_visual=False, require_script=False)
+                if (latest.prompt_review or {}).get("prompt_signature") == signature:
+                    latest.prompt_review = {
+                        **dict(latest.prompt_review or {}),
+                        "status": "failed",
+                        "error": str(exc)[:500],
+                    }
+                    _save_project_state(latest)
+            raise
+        if req.job_type == "prompt.review":
+            _persist_prompt_review_job_id(project_id, signature, job["job_id"])
         public_job = _job_public(job)
         result = {"job": public_job, "jobs": [public_job]}
         if req.job_type == "video.generate" and 'skipped_video_shots' in locals():

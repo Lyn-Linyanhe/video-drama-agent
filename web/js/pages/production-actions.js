@@ -635,19 +635,90 @@ async function productionApplyReferenceVersion(index, versionId) {
   await productionSaveCurrent();
 }
 
+function promptReviewReport(review = {}) {
+  const report = review?.report || {};
+  return {
+    ...report,
+    report_version: Number(report.report_version || 1),
+    verdict: report.verdict || (report.passed ? 'pass' : 'needs_review'),
+  };
+}
+
+function promptReviewIssues(report = {}) {
+  const values = [];
+  const add = issue => {
+    if (!issue || typeof issue !== 'object') return;
+    const key = [
+      issue.layer || '', issue.scope || '', issue.issue_code || '', issue.scene_id || 0,
+      (issue.related_scene_ids || []).join(','), (issue.fact_ids || []).join(','),
+      (issue.evidence_items || []).map(item => item.fact_id || item.excerpt || '').join(','),
+      issue.severity || '', issue.description || '', issue.confidence || '',
+    ].join('|');
+    if (!values.some(item => item.__key === key)) values.push({...issue, __key: key});
+  };
+  (report.issues || []).forEach(add);
+  (report.shots || []).forEach(shot => (shot.issues || []).forEach(add));
+  Object.values(report.shots_issue_index || {}).forEach(items => (items || []).forEach(add));
+  return values.map(({__key, ...issue}) => issue);
+}
+
+function promptReviewIssueGroup(issue) {
+  if (issue?.layer === 'source_parse' || issue?.scope === 'source_alignment') return '解析问题';
+  if (issue?.scope === 'cross_shot') return '跨镜问题';
+  return '分镜问题';
+}
+
+function promptReviewShotStatusLabel(review, report, shot) {
+  const status = review?.status || 'pending';
+  if (status === 'stale') return '报告已过期';
+  if (status === 'generating') return '审核中';
+  if (status !== 'ready') return '未完成';
+  if (Number(report?.report_version || 1) < 2) return '旧版报告';
+  const labels = {pass: '通过', needs_review: '需复核', blocked: '已阻断', unreviewed: '未完成'};
+  return labels[report?.verdict] || (shot?.passed ? '通过' : '需复核');
+}
+
+function promptReviewEvidenceHtml(issue) {
+  const items = Array.isArray(issue?.evidence_items) ? issue.evidence_items : [];
+  if (!items.length && issue?.evidence) return `<div style="margin-top:5px;color:#a1a1aa">证据：${escapeHtml(issue.evidence)}</div>`;
+  if (!items.length) return '';
+  return `<div style="margin-top:5px;color:#a1a1aa">${items.slice(0, 4).map(item => {
+    const location = [item.source || '证据', item.section || '', item.line_start ? `第${item.line_start}-${item.line_end || item.line_start}行` : '', item.time_start_sec != null ? `${item.time_start_sec}-${item.time_end_sec}s` : ''].filter(Boolean).join(' · ');
+    return `<div style="margin-top:2px"><span style="color:#71717a">${escapeHtml(location)}：</span>${escapeHtml(item.excerpt || '')}</div>`;
+  }).join('')}</div>`;
+}
+
+function promptReviewRepairAction(issue) {
+  const action = issue?.repair_action;
+  if (!['edit_prompt', 'edit_script'].includes(action)) return '';
+  const sceneId = Number(issue.scene_id || 0);
+  if (action === 'edit_prompt' && sceneId <= 0) return '';
+  const encoded = action === 'edit_prompt' ? `StudioActions.productionFocusReviewRepair('edit_prompt', ${sceneId})` : `StudioActions.productionFocusReviewRepair('edit_script', ${sceneId})`;
+  return `<button type="button" class="btn-secondary btn-sm" style="margin-top:6px" onclick="${encoded}">${action === 'edit_script' ? '打开剧本编辑' : '定位提示词'}</button>`;
+}
+
+function promptReviewIssueHtml(issue, compact = false) {
+  const color = issue.severity === 'critical' ? '#ef4444' : issue.severity === 'major' ? '#f59e0b' : '#60a5fa';
+  const related = Array.isArray(issue.related_scene_ids) && issue.related_scene_ids.length ? ` · 关联 ${issue.related_scene_ids.join('、')}` : '';
+  return `<div style="padding:8px;border-left:3px solid ${color};background:#202024;font-size:11px"><b>${escapeHtml(promptReviewIssueGroup(issue))} · 镜头 ${escapeHtml(String(issue.scene_id || '全片'))}${escapeHtml(related)} · ${escapeHtml(issue.severity || '')}${issue.confidence && issue.confidence !== 'confirmed' ? ` · ${escapeHtml(issue.confidence)}` : ''}</b><div style="margin-top:3px">${escapeHtml(issue.description || '')}</div><div style="margin-top:3px;color:#a1a1aa">${escapeHtml(issue.suggestion || '')}</div>${promptReviewEvidenceHtml(issue)}${promptReviewRepairAction(issue)}</div>`;
+}
+
 function promptReviewHtml(review) {
   const status = review?.status || 'pending';
+  const report = promptReviewReport(review);
+  const legacyReport = report.report_version < 2;
+  const verdictLabels = {pass: '通过', needs_review: '需人工复核', blocked: '已阻断', unreviewed: '未完成'};
   const labels = {
     pending: '待审核',
     generating: 'Kimi 审核中',
-    ready: '检验通过',
+    ready: legacyReport ? '旧版报告' : (verdictLabels[report.verdict] || '审核完成'),
     stale: '报告已过期',
     failed: '审核失败',
+    canceled: '已取消',
     unavailable: '未配置 Kimi',
   };
-  const report = review?.report || {};
   const score = Number.isFinite(Number(report.overall_score)) ? Number(report.overall_score) : null;
-  const color = status === 'ready' && report.passed
+  const color = status === 'ready' && !legacyReport && report.verdict === 'pass'
     ? '#86efac'
     : status === 'ready' || status === 'stale'
       ? '#fbbf24'
@@ -661,15 +732,17 @@ function promptReviewHtml(review) {
         ? '请在 API 设置的“分镜提示词审核（Kimi）”中保存 Kimi API Key 后再检验。'
         : '审核将逐镜核对剧本覆盖度、剧情忠实度、连续性和可执行性。'
   );
-  const issues = report.issues || [];
+  const issues = promptReviewIssues(report);
+  const grouped = ['解析问题', '分镜问题', '跨镜问题'].map(group => ({group, items: issues.filter(issue => promptReviewIssueGroup(issue) === group)})).filter(item => item.items.length);
+  const groupHtml = grouped.length ? grouped.map(item => `<div style="margin-top:8px"><b style="font-size:11px;color:#d4d4d8">${item.group} · ${item.items.length}</b><div style="display:grid;gap:6px;margin-top:5px">${item.items.map(issue => promptReviewIssueHtml(issue)).join('')}</div></div>`).join('') : '';
   return `<section class="production-panel" style="margin:0 0 10px;padding:12px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <div><b style="font-size:13px">Kimi 分镜提示词检验</b><span style="margin-left:8px;color:${color};font-size:12px">${escapeHtml(labels[status] || status)}${score !== null ? ` · ${score} 分` : ''}</span></div>
+      <div><b style="font-size:13px">Kimi 分镜提示词检验</b><span style="margin-left:8px;color:${color};font-size:12px">${escapeHtml(labels[status] || status)}${score !== null ? ` · ${score} 分` : ''}${report.report_version > 1 ? ` · v${report.report_version}` : ''}</span></div>
       <button class="btn-secondary btn-sm" onclick="StudioActions.productionReviewPrompts()" ${status === 'generating' ? 'disabled' : ''}>${status === 'generating' ? '审核中' : '重新检验'}</button>
       ${review?.model ? `<span style="color:#71717a;font-size:11px">${escapeHtml(review.model)}</span>` : ''}
     </div>
     <div style="margin-top:7px;color:#d4d4d8;font-size:12px;line-height:1.55">${escapeHtml(summary)}</div>
-    ${issues.length ? `<div style="display:grid;gap:6px;margin-top:10px">${issues.slice(0, 3).map(item => `<div style="padding:8px;border-left:3px solid ${item.severity === 'critical' ? '#ef4444' : item.severity === 'major' ? '#f59e0b' : '#60a5fa'};background:#202024;font-size:11px"><b>镜头 ${escapeHtml(String(item.scene_id || '全片'))} · ${escapeHtml(item.severity)}</b><div style="margin-top:3px">${escapeHtml(item.description)}</div><div style="margin-top:3px;color:#a1a1aa">${escapeHtml(item.suggestion)}</div></div>`).join('')}</div>` : ''}
+    ${groupHtml}
   </section>`;
 }
 
@@ -704,6 +777,22 @@ function promptPolicySummaryHtml(policy = {}) {
   return `<div id="production-prompt-policy-slot" class="production-policy-slot">${promptPolicyEditorHtml(policy)}</div>`;
 }
 
+function productionFocusReviewRepair(action, sceneId) {
+  const id = Number(sceneId || 0);
+  if (action === 'edit_prompt' && id > 0) {
+    productionSelectScene(id);
+    setTimeout(() => {
+      const editor = document.getElementById('production-prompt');
+      editor?.focus({preventScroll: false});
+    }, 0);
+    return;
+  }
+  if (action === 'edit_script') {
+    globalThis.StudioActions.navigateTo?.('script');
+    setTimeout(() => document.getElementById('structured-script-editor')?.focus(), 0);
+  }
+}
+
 function productionOpenPromptPolicy() {
   const slot = document.getElementById('production-prompt-policy-slot');
   if (!slot) return;
@@ -722,13 +811,11 @@ function renderProductionWorkspace() {
   const effective = current.effective_prompt || {};
   const promptQuality = productionData.prompt_quality || {};
   const promptReview = productionData.prompt_review || {};
-  const currentPromptReview = (promptReview.report?.shots || []).find(item => Number(item.scene_id) === Number(scene.scene_id));
-  const currentPromptIssues = [
-    ...(currentPromptReview?.issues || []),
-    ...(promptReview.report?.issues || []).filter(item => Number(item.scene_id) === Number(scene.scene_id)),
-  ];
-  const currentPromptReviewHtml = currentPromptReview
-    ? `<div style="margin-top:8px;padding:8px;border:1px solid ${currentPromptReview.passed ? '#166534' : '#854d0e'};background:#18181b;font-size:11px;line-height:1.55"><b style="color:${currentPromptReview.passed ? '#86efac' : '#fbbf24'}">Kimi 检验：${escapeHtml(String(currentPromptReview.score))} 分 · ${currentPromptReview.passed ? '通过' : '需修改'}</b>${currentPromptReview.summary ? `<div style="margin-top:3px;color:#d4d4d8">${escapeHtml(currentPromptReview.summary)}</div>` : ''}${currentPromptIssues.length ? `<div style="display:grid;gap:4px;margin-top:6px">${currentPromptIssues.map(item => `<div><span style="color:${item.severity === 'critical' ? '#fca5a5' : '#fbbf24'}">${escapeHtml(item.severity)}</span> · ${escapeHtml(item.description)}<br><span style="color:#a1a1aa">${escapeHtml(item.suggestion)}</span></div>`).join('')}</div>` : ''}</div>`
+  const reviewReport = promptReviewReport(promptReview);
+  const currentPromptReview = (reviewReport.shots || []).find(item => Number(item.scene_id) === Number(scene.scene_id));
+  const currentPromptIssues = promptReviewIssues(reviewReport).filter(item => Number(item.scene_id) === Number(scene.scene_id) || (item.related_scene_ids || []).map(Number).includes(Number(scene.scene_id)));
+  const currentPromptReviewHtml = (currentPromptReview || currentPromptIssues.length)
+    ? `<div style="margin-top:8px;padding:8px;border:1px solid ${promptReview.status === 'ready' && reviewReport.verdict === 'pass' && currentPromptReview?.passed ? '#166534' : '#854d0e'};background:#18181b;font-size:11px;line-height:1.55"><b style="color:${promptReview.status === 'ready' && reviewReport.verdict === 'pass' && currentPromptReview?.passed ? '#86efac' : '#fbbf24'}">Kimi 检验：${escapeHtml(String(currentPromptReview?.score ?? ''))} 分 · ${escapeHtml(promptReviewShotStatusLabel(promptReview, reviewReport, currentPromptReview))}</b>${currentPromptReview?.summary ? `<div style="margin-top:3px;color:#d4d4d8">${escapeHtml(currentPromptReview.summary)}</div>` : ''}${currentPromptIssues.length ? `<div style="display:grid;gap:4px;margin-top:6px">${currentPromptIssues.map(item => promptReviewIssueHtml(item, true)).join('')}</div>` : ''}</div>`
     : '';
   const providerPrompt = effective.provider_prompt || effective.effective_prompt || prompt.prompt || '';
   const providerNegative = effective.provider_negative_prompt || '';
@@ -1079,6 +1166,11 @@ const __moduleActions = {
   productionMentionReferenceId,
   productionMentionLabel,
   promptReviewHtml,
+  promptReviewReport,
+  promptReviewIssues,
+  promptReviewIssueGroup,
+  promptReviewShotStatusLabel,
+  productionFocusReviewRepair,
   renderProductionWorkspace,
   productionSaveCurrent,
   productionMentionToken,
