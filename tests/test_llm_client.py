@@ -1,6 +1,8 @@
 import asyncio
+import importlib
 from types import SimpleNamespace
 
+import dotenv
 import pytest
 from pydantic import BaseModel
 
@@ -9,6 +11,35 @@ from src.utils.llm import LLMClient, LLMRequestError
 
 class StructuredExample(BaseModel):
     title: str
+
+
+def test_reasoning_effort_defaults_to_high_without_environment_override(monkeypatch):
+    """The committed default must not depend on a developer's local .env file."""
+    import src.config as config
+
+    try:
+        with monkeypatch.context() as isolated:
+            isolated.delenv("LLM_REASONING_EFFORT", raising=False)
+            isolated.setattr(dotenv, "load_dotenv", lambda: False)
+            importlib.reload(config)
+
+            assert config.LLM_REASONING_EFFORT == "high"
+    finally:
+        importlib.reload(config)
+
+
+def test_reasoning_effort_environment_override_takes_precedence(monkeypatch):
+    import src.config as config
+
+    try:
+        with monkeypatch.context() as isolated:
+            isolated.setenv("LLM_REASONING_EFFORT", "low")
+            isolated.setattr(dotenv, "load_dotenv", lambda: False)
+            importlib.reload(config)
+
+            assert config.LLM_REASONING_EFFORT == "low"
+    finally:
+        importlib.reload(config)
 
 
 def test_deepseek_requests_use_fixed_temperature_point_two_five():
