@@ -26,6 +26,7 @@ from src.config import (
     LLM_TIMEOUT,
     LLM_STREAM,
     LLM_REASONING_EFFORT,
+    LLM_MAX_TOKENS,
 )
 
 T = TypeVar("T", bound=BaseModel)
@@ -222,6 +223,7 @@ class LLMClient:
                 break
             request_kwargs = dict(kwargs)
             request_kwargs.setdefault("timeout", timeout_sec)
+            request_kwargs.setdefault("max_tokens", LLM_MAX_TOKENS)
             request_kwargs.update(_reasoning_effort_kwargs(self.provider))
             if telemetry is not None:
                 telemetry["transport_attempts"] = int(telemetry.get("transport_attempts", 0)) + 1

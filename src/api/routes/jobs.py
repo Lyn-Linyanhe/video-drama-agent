@@ -40,7 +40,9 @@ from src.services.video_continuity import continuity_reference, extract_tail_fra
 from src.services.asr import align_native_subtitles
 from src.schemas.audio import SceneAudio
 from src.schemas.prompt import ShotPrompt
+from src.schemas.prompt_review import PromptReviewIssue
 from src.agents.prompt_review_agent import PromptReviewAgent
+from src.config import MAX_PROMPT_REVISION_ROUNDS
 from src.services.job_manager import JobCanceled
 from src.services.prompt_review_facts import (
     audit_snapshot_signature as _audit_snapshot_signature,
@@ -401,6 +403,21 @@ def _prompt_review_blocks_generation(state: DramaState) -> bool:
     )
 
 
+def _prompt_review_has_auto_revisable_issues(result) -> bool:
+    """True when the audit found confirmed, editable, non-rule issues.
+
+    Deterministic rule issues (empty prompt, duration conflict, ...) are
+    structural and cannot be repaired by an LLM rewrite, so they never trigger
+    the automatic revise loop — they stop for human review instead.
+    """
+    return any(
+        issue.confidence == "confirmed"
+        and issue.repair_action in {"edit_prompt", "edit_script"}
+        and not issue.deterministic
+        for issue in (getattr(result, "issues", None) or [])
+    )
+
+
 def _persist_prompt_review_job_id(project_id: str, prompt_signature: str, job_id: str) -> bool:
     """Attach a directly-created review job without overwriting newer state."""
     state = _load_project_state(project_id, require_visual=False, require_script=False)
@@ -541,6 +558,9 @@ async def _job_prompt_review(context, payload: dict) -> dict:
             return {"stale": True, "prompt_signature": expected_signature}
         if not _prompt_review_job_owns_state(latest, context.job_id):
             return {"stale": True, "superseded": True, "prompt_signature": expected_signature}
+        prior_round = int((dict(latest.prompt_review or {}).get("revision_round") or 0) or 0)
+        requested_round = int(payload.get("revision_round") or 0)
+        current_round = max(prior_round, requested_round)
         latest.prompt_review = {
             "status": "ready",
             "prompt_signature": current_signature,
@@ -548,14 +568,136 @@ async def _job_prompt_review(context, payload: dict) -> dict:
             "provider": "kimi",
             "model": agent._settings()[1],
             "error": "",
+            "revision_round": current_round,
             "report": result.model_dump(),
         }
         _save_project_state(latest)
+        # Closed loop: if the audit still found confirmed, editable issues and we
+        # are under the round cap, queue an automatic revise (which re-reviews).
+        auto_revise = (
+            bool(getattr(result, "passed", True) is False)
+            and _prompt_review_has_auto_revisable_issues(result)
+            and current_round < int(MAX_PROMPT_REVISION_ROUNDS)
+        )
+
     context.progress("saving", 1, 1, "已保存 Kimi 分镜审核报告")
+    revise_job_id = ""
+    if auto_revise:
+        try:
+            revise_job = job_manager.create_job(
+                context.project_id,
+                "prompt.revise",
+                "prompt_set",
+                "current",
+                {"revision_round": current_round},
+                provider="kimi",
+            )
+            revise_job_id = str(revise_job["job_id"] or "")
+        except Exception:
+            # A failed auto-revise must not fail the review job itself.
+            revise_job_id = ""
     return {
         "stale": False,
         "prompt_signature": current_signature,
         "report": result.model_dump(),
+        "auto_revise": auto_revise,
+        "revise_job_id": revise_job_id,
+    }
+
+
+async def _job_prompt_revise(context, payload: dict) -> dict:
+    """Revise the prompts using the audit report, then re-review (bounded loop).
+
+    This is the "review → revise → re-review" closed loop. It does not regenerate
+    the prompts from scratch; it edits only the shots flagged by the confirmed
+    issues, then schedules a fresh ``prompt.review`` job against the new prompt
+    signature. The loop is capped by ``MAX_PROMPT_REVISION_ROUNDS``.
+    """
+    agent = PromptReviewAgent()
+    if not agent.enabled() or not agent.is_configured():
+        raise ValueError(agent.configuration_error() or "Kimi 分镜审核不可用")
+
+    async with context.project_lock:
+        state = _load_project_state(context.project_id, require_visual=False, require_script=False)
+        if not state.script or not state.generation_prompts:
+            raise ValueError("剧本或分镜提示词不存在，无法修订")
+        review = dict(state.prompt_review or {})
+        report = review.get("report") or {}
+        # Count prior revision rounds from the persisted review envelope.
+        revision_round = int(review.get("revision_round") or 0)
+        if revision_round >= int(MAX_PROMPT_REVISION_ROUNDS):
+            review["status"] = "revision_capped"
+            review["error"] = f"已达最大修订轮次 {MAX_PROMPT_REVISION_ROUNDS}"
+            state.prompt_review = review
+            _save_project_state(state)
+            return {
+                "skipped": True,
+                "reason": review["error"],
+                "revision_round": revision_round,
+            }
+
+        raw_issues = _prompt_review_report_issues(report)
+        issues: list[PromptReviewIssue] = []
+        for raw in raw_issues:
+            try:
+                issues.append(PromptReviewIssue.model_validate(raw))
+            except Exception:
+                # Ignore malformed persisted issues rather than failing the loop.
+                continue
+        script = state.script.model_copy(deep=True)
+        prompts = state.generation_prompts.model_copy(deep=True)
+        source_text = str(state.script_draft_text or "")
+        if not source_text.strip() and str(state.input_mode or "").strip().lower() == "script":
+            source_text = str(state.user_input or "")
+
+        review["status"] = "revising"
+        review["revision_round"] = revision_round + 1
+        state.prompt_review = review
+        _save_project_state(state)
+
+    context.progress("waiting_provider", 0, 1, "正在依据审核报告修订分镜提示词")
+    try:
+        revised = await agent.revise_prompts(script, prompts, issues, source_text=source_text)
+        context.check_cancelled()
+    except BaseException as exc:
+        async with context.project_lock:
+            latest = _load_project_state(context.project_id, require_visual=False, require_script=False)
+            latest.prompt_review = {
+                **dict(latest.prompt_review or {}),
+                "status": "revision_failed",
+                "error": str(exc)[:500],
+            }
+            _save_project_state(latest)
+        raise
+
+    async with context.project_lock:
+        latest = _load_project_state(context.project_id, require_visual=False, require_script=False)
+        latest.generation_prompts = revised
+        latest.prompt_review = {
+            **dict(latest.prompt_review or {}),
+            "status": "revised",
+            "revision_round": revision_round + 1,
+            "error": "",
+        }
+        _save_project_state(latest)
+        new_signature = _prompt_review_signature(latest)
+
+    # Schedule a re-review against the revised prompts. The review job records
+    # the round so the next revise (if still failing) advances the counter.
+    review_job = job_manager.create_job(
+        context.project_id,
+        "prompt.review",
+        "prompt_set",
+        "current",
+        {"prompt_signature": new_signature, "revision_round": revision_round + 1},
+        provider="kimi",
+    )
+    return {
+        "revised": True,
+        "revision_round": revision_round + 1,
+        "prompt_signature": new_signature,
+        "review_job_id": review_job["job_id"],
+        "generation_prompts": revised.model_dump(),
     }
 
 
@@ -1240,6 +1382,7 @@ register_handlers(job_manager, {
     "script.analyze": _job_script_analyze,
     "script.visualize": _job_script_visualize,
     "prompt.review": _job_prompt_review,
+    "prompt.revise": _job_prompt_revise,
     "asset.generate": _job_asset_generate,
     "character.reference.group": _job_character_reference_group,
     "scene.reference.group": _job_scene_reference_group,

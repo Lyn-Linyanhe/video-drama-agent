@@ -97,6 +97,33 @@ class PromptReviewAgent:
         base_url = os.getenv("KIMI_PROMPT_REVIEW_BASE_URL", "").strip() or "https://api.moonshot.cn/v1"
         return key, model, base_url
 
+    @staticmethod
+    def _timeout_seconds() -> float:
+        """Per-request timeout for one Kimi audit stage.
+
+        Kimi's reasoning mode is slow; a single stage can take well over a
+        minute. A generous default avoids spurious timeouts while a hard cap
+        still bounds the overall job.
+        """
+        try:
+            return max(60.0, float(os.getenv("KIMI_PROMPT_REVIEW_TIMEOUT_SEC", "300")))
+        except ValueError:
+            return 300.0
+
+    @classmethod
+    def _concurrency(cls) -> int:
+        """Maximum in-flight Kimi audit requests.
+
+        The v2 run fans single-shot and cross-shot stages out in parallel. A
+        conservative default keeps Moonshot rate limits from rejecting the
+        burst while still being several times faster than fully serial.
+        """
+        try:
+            requested = int(os.getenv("KIMI_PROMPT_REVIEW_CONCURRENCY", "4"))
+        except ValueError:
+            requested = 4
+        return max(1, min(requested, 8))
+
     @classmethod
     def enabled(cls) -> bool:
         return os.getenv("KIMI_PROMPT_REVIEW_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
@@ -137,7 +164,7 @@ class PromptReviewAgent:
             return await self._run_legacy(script, prompts, visual_design, prompt_policy, key, model, base_url)
 
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=300, max_retries=0)
+        client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=self._timeout_seconds(), max_retries=0)
         snapshot = self.build_audit_snapshot(
             script, prompts, visual_design, prompt_policy, source_text, scene_vision_descriptions,
         )
@@ -145,6 +172,18 @@ class PromptReviewAgent:
         stage_records: list[PromptReviewStageRecord] = []
         candidates: list[PromptReviewIssue] = []
         scene_ids = {sheet.scene_id for sheet in snapshot.scene_facts}
+
+        # Fan out the per-shot and adjacent-shot stages with bounded concurrency.
+        # _stage_call already converts provider/format errors into unreviewed
+        # issues, so a gather never raises from a stage body.
+        semaphore = asyncio.Semaphore(self._concurrency())
+
+        async def _guarded(stage, payload, target_scene_ids, default_layer, default_scope):
+            async with semaphore:
+                return await self._stage_call(
+                    client, model, stage, payload, snapshot,
+                    target_scene_ids, default_layer, default_scope,
+                )
 
         if snapshot.source_script.status == "available":
             issues, status = await self._stage_call(
@@ -161,23 +200,31 @@ class PromptReviewAgent:
                 stage="source_alignment", status="skipped", error="source_parse=not_applicable",
             ))
 
-        for index, sheet in enumerate(snapshot.scene_facts):
-            issues, status = await self._stage_call(
-                client, model, "single_shot", self._single_shot_payload(snapshot, index), snapshot,
-                {sheet.scene_id}, "prompt", "single_shot",
+        single_tasks = [
+            _guarded(
+                "single_shot", self._single_shot_payload(snapshot, index), {sheet.scene_id},
+                "prompt", "single_shot",
             )
+            for index, sheet in enumerate(snapshot.scene_facts)
+        ]
+        single_results = await asyncio.gather(*single_tasks)
+        for sheet, (issues, status) in zip(snapshot.scene_facts, single_results):
             candidates.extend(issues)
             stage_records.append(PromptReviewStageRecord(
                 stage="single_shot", status=status, scene_ids=[sheet.scene_id], candidate_count=len(issues),
                 error=self._stage_error(issues),
             ))
 
-        for index in range(1, len(snapshot.scene_facts)):
-            previous, current = snapshot.scene_facts[index - 1:index + 1]
-            issues, status = await self._stage_call(
-                client, model, "cross_shot", self._continuity_payload(snapshot, previous, current), snapshot,
+        adjacent_pairs = list(zip(snapshot.scene_facts[:-1], snapshot.scene_facts[1:]))
+        cross_tasks = [
+            _guarded(
+                "cross_shot", self._continuity_payload(snapshot, previous, current),
                 {previous.scene_id, current.scene_id}, "prompt", "cross_shot",
             )
+            for previous, current in adjacent_pairs
+        ]
+        cross_results = await asyncio.gather(*cross_tasks)
+        for (previous, current), (issues, status) in zip(adjacent_pairs, cross_results):
             candidates.extend(issues)
             stage_records.append(PromptReviewStageRecord(
                 stage="cross_shot", status=status, scene_ids=[previous.scene_id, current.scene_id], candidate_count=len(issues),
@@ -203,7 +250,7 @@ class PromptReviewAgent:
 
     async def _run_legacy(self, script, prompts, visual_design, prompt_policy, key, model, base_url):
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=300, max_retries=0)
+        client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=self._timeout_seconds(), max_retries=0)
         batch_results = []
         prompt_by_scene = {item.scene_id: item for item in prompts.shots}
         scenes = list(script.scenes)
@@ -1120,6 +1167,106 @@ class PromptReviewAgent:
                 for issue in shot.get("issues") or []:
                     normalize(issue)
         return normalized
+
+    async def revise_prompts(
+        self,
+        script: ScriptBreakdown,
+        prompts: GenerationPrompts,
+        issues: list[PromptReviewIssue],
+        source_text: str = "",
+    ) -> GenerationPrompts:
+        """Revise the storyboard prompts in place using the audit report.
+
+        This is the "review → revise" half of the closed loop. It does NOT
+        regenerate the visual design or the prompts from scratch; it feeds the
+        confirmed issues (description + suggestion + evidence) back to Kimi and
+        asks it to edit only the offending shot prompts, leaving clean shots and
+        structural fields (seed, duration, api_provider, ...) untouched.
+        """
+        actionable = [
+            issue for issue in issues
+            if issue.repair_action in {"edit_prompt", "edit_script"}
+            and (issue.confidence == "confirmed" or issue.severity in {"major", "critical"})
+        ]
+        if not actionable:
+            return prompts
+
+        key, model, base_url = self._settings()
+        if not key:
+            raise ValueError(self.configuration_error())
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=key, base_url=base_url, timeout=self._timeout_seconds(), max_retries=0)
+
+        shot_by_scene = {shot.scene_id: shot for shot in prompts.shots}
+        # Only send the shots that actually have confirmed issues, plus their
+        # immediate neighbours for continuity edits. This keeps the payload
+        # small and avoids re-touching clean shots.
+        touched_scene_ids: set[int] = set()
+        for issue in actionable:
+            if issue.scene_id:
+                touched_scene_ids.add(issue.scene_id)
+            touched_scene_ids.update(issue.related_scene_ids)
+
+        revision_targets: list[dict[str, Any]] = []
+        for scene in script.scenes:
+            if scene.scene_id not in touched_scene_ids:
+                continue
+            shot = shot_by_scene.get(scene.scene_id)
+            if shot is None:
+                continue
+            revision_targets.append({
+                "scene_id": scene.scene_id,
+                "current_prompt": shot.prompt,
+                "current_negative_prompt": shot.negative_prompt,
+            })
+
+        issues_payload = [
+            {
+                "scene_id": issue.scene_id,
+                "related_scene_ids": issue.related_scene_ids,
+                "severity": issue.severity,
+                "category": issue.category,
+                "description": issue.description,
+                "suggestion": issue.suggestion,
+                "repair_action": issue.repair_action,
+            }
+            for issue in actionable
+        ]
+
+        user_prompt = (
+            "以下是分镜提示词的审核报告。请**只修改**列出的目标镜头的 prompt（和必要时 negative_prompt），"
+            "逐条消除报告中的问题；未列出的镜头和字段（seed、duration、api_provider 等）保持原样，不得重写。\n"
+            "返回严格 JSON：{\"revisions\": [{\"scene_id\": <int>, \"prompt\": <string>, \"negative_prompt\": <string>}]}，"
+            "只包含确实被修改的镜头。\n\n"
+            f"审核问题：\n{json.dumps(issues_payload, ensure_ascii=False)}\n\n"
+            f"待修改镜头：\n{json.dumps(revision_targets, ensure_ascii=False)}\n\n"
+            f"原始剧本（仅作事实参照，不要改剧本）：\n{source_text[:8000] if source_text else '（无）'}"
+        )
+        system_prompt = (
+            "你是短剧分镜提示词修订编辑。你根据审核报告逐条修订提示词，不重新生成、不扩大改动范围。"
+            "提示词必须保持中文、符合视频生成 API 规范。"
+        )
+        raw = await self._request_json(client, model, user_prompt)
+        revisions = raw.get("revisions")
+        if not isinstance(revisions, list):
+            return prompts
+        revised_by_scene = {
+            int(item["scene_id"]): item
+            for item in revisions
+            if isinstance(item, dict) and "scene_id" in item and "prompt" in item
+        }
+        result = prompts.model_copy(deep=True)
+        for shot in result.shots:
+            rev = revised_by_scene.get(shot.scene_id)
+            if not rev:
+                continue
+            new_prompt = str(rev.get("prompt") or "").strip()
+            if new_prompt:
+                shot.prompt = new_prompt
+            new_negative = str(rev.get("negative_prompt") or "").strip()
+            if new_negative:
+                shot.negative_prompt = new_negative
+        return result
 
 
 class _ReviewFormatError(ValueError):

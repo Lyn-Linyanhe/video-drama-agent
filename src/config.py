@@ -31,6 +31,10 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # For custom endpoints
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "1800"))
 LLM_STREAM = os.getenv("LLM_STREAM", "true").strip().lower() not in {"0", "false", "no", "off"}
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "high").strip().lower()  # deepseek: low/medium/high/max; 空/off 关闭
+# Default max output tokens for OpenAI-compatible structured/text calls that do
+# not set their own cap. The storyboard-visualize stage emits large JSON for
+# every shot, so the API default is too small and truncates the response.
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
 
 # Post-generation video review. Kept separate from the main LLM so Kimi can
 # continue handling script parsing while a vision model audits generated clips.
@@ -103,3 +107,7 @@ MAX_PROJECT_HISTORY = 50
 # LangGraph settings
 MAX_REVIEW_LOOPS = 2  # Max review-retry cycles
 CHECKPOINT_DB_PATH = str(OUTPUT_DIR / "checkpoints.db")
+
+# Prompt review → revise → re-review closed loop. Cap the number of automatic
+# revision rounds so a stubborn issue set cannot loop forever.
+MAX_PROMPT_REVISION_ROUNDS = int(os.getenv("MAX_PROMPT_REVISION_ROUNDS", "3"))
