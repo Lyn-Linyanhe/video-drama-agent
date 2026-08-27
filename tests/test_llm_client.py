@@ -28,6 +28,22 @@ def test_reasoning_effort_defaults_to_high_without_environment_override(monkeypa
         importlib.reload(config)
 
 
+def test_structured_output_budget_defaults_to_32768_without_environment_override(monkeypatch):
+    """The committed output budget must cover the long structured script contract."""
+    import src.config as config
+
+    try:
+        with monkeypatch.context() as isolated:
+            isolated.delenv("LLM_MAX_TOKENS", raising=False)
+            isolated.setattr(dotenv, "load_dotenv", lambda: False)
+            importlib.reload(config)
+
+            assert config.LLM_MAX_TOKENS == 32768
+            assert config.LLM_REASONING_EFFORT == "high"
+    finally:
+        importlib.reload(config)
+
+
 def test_reasoning_effort_environment_override_takes_precedence(monkeypatch):
     import src.config as config
 

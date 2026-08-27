@@ -54,6 +54,7 @@ from src.config import (
     KLING_MODEL, KLING_MODE, KLING_IMAGE_MODEL,
     HAPPYHORSE_API_KEY, HAPPYHORSE_BASE_URL, HAPPYHORSE_MODEL, HAPPYHORSE_RESOLUTION,
     ARK_API_KEY, ARK_BASE_URL, ARK_MODEL, ARK_RESOLUTION,
+    LLM_MAX_INPUT_CHARS,
 )
 from src.utils.project_store import ProjectStore
 from src.utils.asset_versions import ImageAssetVersions
@@ -148,7 +149,7 @@ video_jobs: set[tuple[str, int]] = set()
 class ScriptRequest(BaseModel):
     visual_style_id: str = ""
     style_modifiers: list[str] = Field(default_factory=list)
-    user_input: str = Field(..., min_length=1, max_length=60000, description="用户输入的故事创意或文本")
+    user_input: str = Field(..., min_length=1, max_length=LLM_MAX_INPUT_CHARS, description="用户输入的故事创意或文本")
     input_mode: str = Field(default="idea", description="idea or script")
     source_filename: str = Field(default="", max_length=255)
     genre_tags: str = Field(default="都市", description="剧集类型")
@@ -177,14 +178,14 @@ class ScriptRevisionRequest(BaseModel):
 
 
 class ScriptAnalyzeRequest(BaseModel):
-    source_text: str = Field(..., min_length=1, max_length=60000)
+    source_text: str = Field(..., min_length=1, max_length=LLM_MAX_INPUT_CHARS)
     source_filename: str = Field(default="", max_length=255)
     input_mode: str = Field(default="script", description="idea or script")
-    original_input: str = Field(default="", max_length=60000)
+    original_input: str = Field(default="", max_length=LLM_MAX_INPUT_CHARS)
 
 
 class ScriptDraftSaveRequest(BaseModel):
-    draft_text: str = Field(..., min_length=1, max_length=60000)
+    draft_text: str = Field(..., min_length=1, max_length=LLM_MAX_INPUT_CHARS)
     input_mode: Literal["idea", "script"] = "script"
     source_filename: str = Field(default="", max_length=255)
 

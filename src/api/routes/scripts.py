@@ -85,8 +85,8 @@ async def import_script_source(file: UploadFile = File(...)):
         raise HTTPException(400, str(exc)) from exc
     if not text:
         raise HTTPException(400, "No readable text found in the source file")
-    if len(text) > 60000:
-        raise HTTPException(400, "Extracted screenplay exceeds 60,000 characters")
+    if len(text) > LLM_MAX_INPUT_CHARS:
+        raise HTTPException(400, f"Extracted screenplay exceeds {LLM_MAX_INPUT_CHARS:,} characters")
     return {"filename": filename, "text": text}
 
 

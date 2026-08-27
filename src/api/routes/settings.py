@@ -925,6 +925,20 @@ def _reload_env_and_config():
     cfg.OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
     cfg.LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "1800"))
     cfg.LLM_STREAM = os.getenv("LLM_STREAM", "true").strip().lower() not in {"0", "false", "no", "off"}
+    cfg.LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "high").strip().lower()
+    try:
+        cfg.LLM_MAX_TOKENS = max(1, int(os.getenv("LLM_MAX_TOKENS", "32768")))
+    except (TypeError, ValueError):
+        cfg.LLM_MAX_TOKENS = 32768
+    try:
+        cfg.LLM_MAX_INPUT_CHARS = max(1, int(os.getenv("LLM_MAX_INPUT_CHARS", "80000")))
+    except (TypeError, ValueError):
+        cfg.LLM_MAX_INPUT_CHARS = 80000
+    # ``llm.py`` imports these settings as module globals, so hot reload must
+    # update both config and the client module before replacing agents.
+    import src.utils.llm as llm_module
+    llm_module.LLM_REASONING_EFFORT = cfg.LLM_REASONING_EFFORT
+    llm_module.LLM_MAX_TOKENS = cfg.LLM_MAX_TOKENS
     cfg.REVIEW_LLM_ENABLED = os.getenv("REVIEW_LLM_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
     cfg.REVIEW_LLM_PROVIDER = os.getenv("REVIEW_LLM_PROVIDER", "").strip().lower()
     cfg.REVIEW_LLM_MODEL = os.getenv("REVIEW_LLM_MODEL", "qwen-vl-max")

@@ -6,6 +6,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _positive_env_int(name: str, default: int) -> int:
+    """Read a positive integer setting without allowing invalid budgets."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(1, value)
+
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -34,7 +43,10 @@ LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "high").strip().lower()
 # Default max output tokens for OpenAI-compatible structured/text calls that do
 # not set their own cap. The storyboard-visualize stage emits large JSON for
 # every shot, so the API default is too small and truncates the response.
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+LLM_MAX_TOKENS = _positive_env_int("LLM_MAX_TOKENS", 32768)
+# Maximum screenplay text accepted by the API and source-file import route.
+# This is a character limit; provider context-window limits still apply.
+LLM_MAX_INPUT_CHARS = _positive_env_int("LLM_MAX_INPUT_CHARS", 80000)
 
 # Post-generation video review. Kept separate from the main LLM so Kimi can
 # continue handling script parsing while a vision model audits generated clips.
