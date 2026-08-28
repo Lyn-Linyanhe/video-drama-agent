@@ -125,6 +125,177 @@ async def test_deepseek_structured_output_uses_plain_json_without_tool_choice():
 
 
 @pytest.mark.asyncio
+async def test_deepseek_structured_output_uses_reasoning_content_when_content_is_empty():
+    """Some reasoning responses put the valid JSON in reasoning_content."""
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content="",
+                            reasoning_content='{"title":"from reasoning"}',
+                        ),
+                    )
+                ]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "deepseek"
+    client.model = "deepseek-v4-flash"
+    client._openai = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    client._anthropic = None
+
+    result = await client.generate_structured(
+        system_prompt="system",
+        user_prompt="user",
+        output_schema=StructuredExample,
+    )
+
+    assert result.title == "from reasoning"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_structured_output_treats_whitespace_content_as_empty():
+    """Whitespace-only content must not hide a valid DeepSeek reasoning answer."""
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content="   ",
+                            reasoning_content='{"title":"from whitespace fallback"}',
+                        ),
+                    )
+                ]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "deepseek"
+    client.model = "deepseek-v4-flash"
+    client._openai = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    client._anthropic = None
+
+    result = await client.generate_structured(
+        system_prompt="system",
+        user_prompt="user",
+        output_schema=StructuredExample,
+    )
+
+    assert result.title == "from whitespace fallback"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_structured_output_does_not_use_reasoning_after_length_finish():
+    """A length-truncated response must remain a failure, not use hidden output."""
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(
+                            content="",
+                            reasoning_content='{"title":"should not be accepted"}',
+                        ),
+                    )
+                ]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "deepseek"
+    client.model = "deepseek-v4-flash"
+    client._openai = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    client._anthropic = None
+
+    with pytest.raises(ValueError, match="Fallback extraction failed"):
+        await client.generate_structured(
+            system_prompt="system",
+            user_prompt="user",
+            output_schema=StructuredExample,
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_structured_output_requires_stop_before_reasoning_fallback():
+    """Unknown completion status must not authorize a hidden final answer."""
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="",
+                            reasoning_content='{"title":"unknown status"}',
+                        ),
+                    )
+                ]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "deepseek"
+    client.model = "deepseek-v4-flash"
+    client._openai = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    client._anthropic = None
+
+    with pytest.raises(ValueError, match="Fallback extraction failed"):
+        await client.generate_structured(
+            system_prompt="system",
+            user_prompt="user",
+            output_schema=StructuredExample,
+        )
+
+
+@pytest.mark.asyncio
+async def test_non_deepseek_structured_output_does_not_use_reasoning_content():
+    """Only DeepSeek opts into the provider-specific reasoning fallback."""
+
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content="",
+                            reasoning_content='{"title":"wrong provider"}',
+                        ),
+                    )
+                ]
+            )
+
+    client = LLMClient.__new__(LLMClient)
+    client.provider = "qwen"
+    client.model = "qwen-plus"
+    client._openai = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    client._anthropic = None
+
+    with pytest.raises(ValueError, match="Fallback extraction failed"):
+        await client.generate_structured(
+            system_prompt="system",
+            user_prompt="user",
+            output_schema=StructuredExample,
+        )
+
+
+@pytest.mark.asyncio
 async def test_kimi_text_generation_uses_required_temperature_one():
     captured = []
 

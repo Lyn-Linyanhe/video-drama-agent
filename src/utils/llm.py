@@ -590,7 +590,12 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
                 {"role": "user", "content": f"IMPORTANT: Output ONLY valid JSON matching this schema, no markdown, no extra text:\n{json.dumps(schema_json, ensure_ascii=False)}"},
             ],
         }
-        text = await self._openai_chat_content(kwargs, phase=phase, telemetry=telemetry)
+        text = await self._openai_chat_content(
+            kwargs,
+            phase=phase,
+            telemetry=telemetry,
+            fallback_to_reasoning=self.provider == "deepseek",
+        )
 
         # Fences are common with DeepSeek: strip them before any parse.
         cleaned = _strip_json_fence(text)
@@ -631,12 +636,27 @@ Male, 25 years old, 178cm slim build, oval face, fair skin, deep-set almond eyes
         *,
         phase: str = "",
         telemetry: dict[str, Any] | None = None,
+        fallback_to_reasoning: bool = False,
     ) -> str:
         """Return chat content, using streaming for Kimi/OpenAI-compatible slow calls."""
         use_stream = bool(LLM_STREAM and self.provider == "kimi")
         if not use_stream:
             resp = await self._request_completion(kwargs, phase=phase, telemetry=telemetry)
-            return resp.choices[0].message.content or ""
+            choice = resp.choices[0]
+            message = choice.message
+            content = getattr(message, "content", None) or ""
+            if content.strip() or not fallback_to_reasoning:
+                return content
+            # A hidden reasoning field is only a usable final answer for the
+            # observed DeepSeek response shape. Never use it after truncation;
+            # a length finish means the visible answer was not completed.
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason != "stop":
+                return content
+            # DeepSeek reasoning responses can place the complete structured
+            # answer in reasoning_content while leaving content empty.
+            reasoning_content = getattr(message, "reasoning_content", None) or ""
+            return reasoning_content if reasoning_content.strip() else ""
 
         timeout_sec = self._request_timeout(phase)
         last_error: BaseException | None = None
