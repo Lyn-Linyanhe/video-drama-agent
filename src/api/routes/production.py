@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 from ..context import *
+from src.services.audio_timeline import project_audio_assets as _project_audio_assets
 from src.services.video_capabilities import (
     normalize_video_policy,
     public_video_capabilities,
@@ -397,6 +398,8 @@ async def update_project_production_settings(
     state.subtitle_mode = mode
     state.subtitle_enabled = mode != "off"
     audio = _project_audio_assets(state)
+    if req.audio_mode is not None:
+        state.creative_profile.audio_mode = req.audio_mode
     if req.asr_enabled is not None:
         audio.asr_enabled = bool(req.asr_enabled)
     if req.asr_model is not None and req.asr_model.strip():

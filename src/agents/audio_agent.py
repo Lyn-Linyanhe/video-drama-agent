@@ -52,6 +52,7 @@ class AudioAgent:
         self, script: ScriptBreakdown, assets: GeneratedAssets, project_id: str = "",
         existing: AudioAssets | None = None, force_line_ids: set[str] | None = None,
         native_scene_audio: dict[int, dict] | None = None,
+        audio_mode: str = "auto",
     ) -> AudioAssets:
         """Generate all audio for the drama.
 
@@ -70,6 +71,18 @@ class AudioAgent:
         existing = existing or AudioAssets(scenes=[])
         force_line_ids = force_line_ids or set()
         native_scene_audio = native_scene_audio or {}
+        audio_mode = str(audio_mode or "auto").strip().lower()
+        if audio_mode == "auto":
+            # Legacy callers did not pass a project mode but did provide
+            # provider-native scene metadata. Preserve that behavior while
+            # keeping explicit external_tts authoritative.
+            audio_mode = (
+                "native_dialogue"
+                if any(bool(item.get("native_audio_enabled")) for item in native_scene_audio.values())
+                else "external_tts"
+            )
+        if audio_mode not in {"native_dialogue", "external_tts"}:
+            audio_mode = "external_tts"
         old_lines = {
             item.line_id or f"{scene.scene_id}:{item.dialogue_index}": item
             for scene in existing.scenes for item in scene.dialogue_audios
@@ -131,9 +144,19 @@ class AudioAgent:
             native_info = native_scene_audio.get(scene.scene_id) or {}
             scene_audio.native_audio_enabled = bool(native_info.get("native_audio_enabled"))
             scene_audio.native_audio_path = str(native_info.get("native_audio_path") or "")
-            scene_audio.native_audio_source = str(native_info.get("audio_source") or "native") if scene_audio.native_audio_enabled else ""
+            native_provider = str(
+                native_info.get("api_used")
+                or native_info.get("provider")
+                or native_info.get("audio_source")
+                or "video-model"
+            ).strip()
+            scene_audio.native_audio_source = native_provider if scene_audio.native_audio_enabled else ""
             if scene_audio.native_audio_enabled:
                 scene_audio.subtitle_correction_status = "fallback"
+
+            # A native-dialogue request is explicit: a missing provider audio
+            # result must remain unresolved instead of silently becoming TTS.
+            native_audio_missing = audio_mode == "native_dialogue" and not scene_audio.native_audio_enabled
 
             # Generate TTS for each dialogue line
             for dialogue_index, dialogue in enumerate(scene.dialogue, start=1):
@@ -146,10 +169,23 @@ class AudioAgent:
                         character=dialogue.character,
                         text=dialogue.line,
                         line_id=line_id,
-                        provider="seedance-native",
+                        provider=f"{native_provider}-native",
                         success=True,
                     )
                     scene_audio.dialogue_audios.append(dialogue_audio)
+                    continue
+                if native_audio_missing:
+                    scene_audio.dialogue_audios.append(DialogueAudio(
+                        scene_id=scene.scene_id,
+                        dialogue_index=dialogue_index,
+                        character=dialogue.character,
+                        text=dialogue.line,
+                        line_id=line_id,
+                        provider="native-pending",
+                        success=False,
+                        error_message="视频模型未返回原生音频",
+                        fallback_reason="已请求原生音频，但本次视频没有返回可用音频；请重试原生音频或主动切换到外部 TTS。",
+                    ))
                     continue
                 profile = voice_profiles.get(dialogue.character)
                 if not profile:
@@ -285,9 +321,12 @@ class AudioAgent:
             library_assets=existing.library_assets,
             preview_mix_path=existing.preview_mix_path,
             timeline_version=existing.timeline_version + 1,
+            # External TTS owns the dialogue mix.  Explicitly disable source
+            # video audio so a provider that still embeds native speech cannot
+            # be mixed twice during final assembly.
             source_audio_enabled=(
-                True if any(item.native_audio_enabled for item in scene_audio_list)
-                else (existing.source_audio_enabled if existing.source_audio_enabled is not None else False)
+                audio_mode == "native_dialogue"
+                and any(item.native_audio_enabled for item in scene_audio_list)
             ),
         )
 

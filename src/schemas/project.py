@@ -35,13 +35,13 @@ class CreativeProfile(BaseModel):
         genre_tags: str = "",
         art_style: str = "",
         video_ratio: str = "",
-        audio_mode: str = "auto",
+        audio_mode: str = "native_dialogue",
         visual_style_id: str = "",
         style_modifiers: list[str] | None = None,
     ) -> "CreativeProfile":
         tags = [item.strip() for item in genre_tags.replace("，", "、").split("、") if item.strip()]
         ratio = video_ratio if video_ratio in {"9:16", "16:9"} else "9:16"
-        mode = audio_mode if audio_mode in {"auto", "native_dialogue", "external_tts"} else "auto"
+        mode = audio_mode if audio_mode in {"auto", "native_dialogue", "external_tts"} else "native_dialogue"
         from src.services.visual_styles import resolve_visual_style
 
         requested_style = art_style.strip()

@@ -383,9 +383,8 @@
     <div style="margin-bottom:20px">
       <label for="proj-audio-mode" style="font-size:12px;color:#a1a1aa">对白生成方式</label>
       <select id="proj-audio-mode" style="width:100%;margin-top:4px">
-        <option value="auto">自动选择（Seedance 原生对白，其他模型使用 TTS）</option>
-        <option value="native_dialogue">优先使用视频模型原生对白</option>
-        <option value="external_tts">始终使用外部配音（TTS）</option>
+        <option value="native_dialogue" selected>视频模型原生对白（默认）</option>
+        <option value="external_tts">外部 TTS 配音</option>
       </select>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end">

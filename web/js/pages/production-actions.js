@@ -800,6 +800,39 @@ function productionOpenPromptPolicy() {
   slot.querySelector('#production-style-prefix')?.focus();
 }
 
+function productionAudioModeHtml(audioMode = 'native_dialogue', videoPolicy = {}, capability = {}) {
+  const supportsNative = capability.supports_native_dialogue === true;
+  const capabilityStatus = String(capability.native_audio_status || 'unsupported');
+  const legacyAuto = audioMode === 'auto';
+  const effectiveMode = legacyAuto
+    ? (supportsNative ? 'native_dialogue' : 'external_tts')
+    : audioMode;
+  const provider = String(videoPolicy.provider || 'unknown');
+  const model = String(videoPolicy.model || 'unknown');
+  const capabilityLabel = capabilityStatus === 'best_effort'
+    ? '尽力保留（生成后检测实际音轨）'
+    : (supportsNative ? '已验证支持' : '当前模型不支持');
+  const capabilityClass = supportsNative ? 'audio-ok' : 'audio-warning';
+  const reason = String(capability.native_audio_reason || '').trim();
+  const warning = capabilityStatus === 'best_effort' && effectiveMode === 'native_dialogue'
+    ? '<div class="production-audio-mode-warning">当前模型将尝试生成并保留视频原生音频；生成完成后检测实际音轨。若没有音轨，不会静默改用外部 TTS。</div>'
+    : (!supportsNative && effectiveMode === 'native_dialogue'
+      ? '<div class="production-audio-mode-warning">当前模型不支持或尚未接通原生对白，请切换为外部 TTS 配音后再生成。</div>'
+      : '');
+  const legacy = legacyAuto
+    ? '<div class="production-audio-mode-legacy">旧版自动策略：切换一次后将保存为明确的音频来源。</div>'
+    : '';
+  return `<div class="production-audio-mode" data-audio-mode="${escapeHtml(audioMode)}">
+    <div class="production-audio-mode-heading"><strong>对白音频来源</strong><span>${escapeHtml(provider)} · ${escapeHtml(model)}</span></div>
+    <div class="production-audio-mode-options">
+      <label><input type="radio" name="production-audio-mode" value="native_dialogue" ${effectiveMode === 'native_dialogue' ? 'checked' : ''} onchange="StudioActions.productionSetAudioMode(this.value)"><span>视频模型原生对白</span></label>
+      <label><input type="radio" name="production-audio-mode" value="external_tts" ${effectiveMode === 'external_tts' ? 'checked' : ''} onchange="StudioActions.productionSetAudioMode(this.value)"><span>外部 TTS 配音</span></label>
+    </div>
+    <div class="production-audio-mode-capability ${capabilityClass}">原生对白能力：${capabilityLabel}${reason ? ` · ${escapeHtml(reason)}` : ''}</div>
+    ${legacy}${warning}
+  </div>`;
+}
+
 function renderProductionWorkspace() {
   const root = document.getElementById('shot-production-workspace');
   if (!root) return;
@@ -837,6 +870,7 @@ function renderProductionWorkspace() {
   const videoPolicy = current.video_policy || productionData.video_generation_policy || {provider:'mock',model:'mock',resolution:'1080p'};
   const videoCapabilities = productionData.video_capabilities || {};
   const currentCapability = current.video_capability || videoCapabilities[videoPolicy.provider]?.models?.[videoPolicy.model] || {};
+  const audioModeHtml = productionAudioModeHtml(productionData.audio_mode || 'auto', videoPolicy, currentCapability);
   const durationMin = Number(currentCapability.duration_min || 3);
   const durationMax = Number(currentCapability.duration_max || 15);
   const maxReferenceImages = Number(currentCapability.max_reference_images || 0);
@@ -931,6 +965,7 @@ function renderProductionWorkspace() {
           <div class="production-section-heading"><div><span class="production-eyebrow">03 · 生成设置</span><h4>生成设置</h4></div><span class="production-section-note">提交前可调整</span></div>
           <div class="production-settings-grid"><label class="production-field-label">视频服务<select id="production-video-provider" onchange="StudioActions.productionVideoProviderChanged()">${providerOptions}</select></label><label class="production-field-label">模型<select id="production-video-model" onchange="StudioActions.productionVideoModelChanged()">${modelOptions}</select></label><label class="production-field-label">清晰度<select id="production-video-resolution">${resolutionOptions}</select></label></div>
           <div class="production-capability-note">成本档位：${escapeHtml(current.video_capability?.cost_tier || '未标注')}</div>
+          ${audioModeHtml}
           <div class="production-continuity-row"><label class="production-toggle"><input id="production-continuity" type="checkbox" ${production.continuity_enabled ? 'checked' : ''}><span>承接上一镜尾帧</span></label><span class="production-continuity-state ${production.continuity_stale ? 'is-warning' : ''}">${escapeHtml(continuityHint)}</span><span class="production-chip production-hard-cut-chip">新任务采用硬切</span></div>
         </section>
         <section class="production-editor-section production-ai-section">
@@ -1028,6 +1063,14 @@ function updateProductionVideoSelection({resetModel = false} = {}) {
       resolution: resolution.value,
     };
   }
+  const audioModePanel = document.querySelector('#shot-production-workspace .production-audio-mode');
+  if (audioModePanel) {
+    audioModePanel.outerHTML = productionAudioModeHtml(
+      productionData.audio_mode || 'auto',
+      current?.video_policy || {provider, model: selectedModel},
+      selectedCapability,
+    );
+  }
   const hint = document.querySelector('#shot-production-workspace .production-reference-capability');
   if (hint) {
     const limit = Number(selectedCapability.max_reference_images || 0);
@@ -1064,6 +1107,26 @@ async function productionGeneratePending() {
   try { await submitProjectJob({job_type:'video.generate',target_type:'shot',payload:{}}); }
   catch(error){alert(error.message);}
 }
+async function productionSetAudioMode(mode) {
+  if (!['native_dialogue', 'external_tts'].includes(mode)) return;
+  try {
+    const data = await projectJsonRequest(
+      `${API_BASE}/api/projects/${appState.projectId}/production/settings`,
+      {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio_mode:mode})},
+      '保存对白音频来源失败',
+    );
+    if (!data) return;
+    productionData = data;
+    appState.audioMode = data.audio_mode || mode;
+    renderProductionWorkspace();
+    renderProductionAudioTimeline();
+    produceStatus(`<span style="color:#93c5fd">对白音频来源已切换为${mode === 'native_dialogue' ? '视频模型原生对白' : '外部 TTS 配音'}，应用于后续生成。</span>`);
+  } catch (error) {
+    alert(error.message);
+    renderProductionWorkspace();
+  }
+}
+
 async function productionSetSubtitle(enabled) {
   try {
     const data = await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/settings`, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({subtitle_enabled:Boolean(enabled)})}, '保存字幕设置失败');
@@ -1123,8 +1186,26 @@ async function productionGenerateAudio() {
 async function productionAssembleVideo() {
   const active = activeProjectJobs(job => job.job_type === 'final.assemble');
   if (active.length) return cancelMatchingJobs(active);
-  try { await submitProjectJob({job_type:'final.assemble',target_type:'project'}); produceStatus('<span style="color:#93c5fd">正在合成作品...</span>'); }
-  catch(error){produceStatus(`<span style="color:#ef4444">${escapeHtml(error.message)}</span>`);}
+  const audioSummary = productionData?.audio_summary || {};
+  const hasDialogue = Number(audioSummary.dialogue_count || 0) > 0;
+  const audioIncomplete = hasDialogue && audioSummary.can_assemble === false;
+  let payload = {};
+  if (audioIncomplete) {
+    const unresolved = Number(audioSummary.unresolved_line_count || 0);
+    const detail = unresolved ? `\n未解决台词：${unresolved} 条。` : '';
+    const confirmed = confirm(`当前对白音频不完整。${detail}\n请先点击“生成缺失台词”修复；如果确认继续，将生成无对白版本。\n\n是否仍生成无对白版本？`);
+    if (!confirmed) {
+      produceStatus('<span style="color:#fbbf24">已取消合成。请先生成或修复对白音频。</span>');
+      return;
+    }
+    payload = {audio_override: 'no_dialogue_confirmed'};
+  }
+  try {
+    await submitProjectJob({job_type:'final.assemble',target_type:'project',payload});
+    produceStatus(payload.audio_override
+      ? '<span style="color:#fbbf24">已确认生成无对白版本，正在合成作品...</span>'
+      : '<span style="color:#93c5fd">正在合成作品...</span>');
+  } catch(error){produceStatus(`<span style="color:#ef4444">${escapeHtml(error.message)}</span>`);}
 }
 async function productionActivateVersion(versionId) { try { const data=await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/shots/${productionSceneId}/activate-version`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version_id:versionId})},'切换版本失败'); if(!data)return; productionData=data; renderProductionWorkspace(); } catch(error){alert(error.message);} }
 async function productionRevisePrompt() { const feedback=document.getElementById('production-feedback').value.trim(); if(!feedback)return; try { const data=await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/shots/${productionSceneId}/revise-prompt`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feedback})},'AI 修改失败'); if(!data)return; productionData=data; renderProductionWorkspace(); } catch(error){alert(error.message);} }
@@ -1171,6 +1252,8 @@ const __moduleActions = {
   promptReviewIssueGroup,
   promptReviewShotStatusLabel,
   productionFocusReviewRepair,
+  productionAudioModeHtml,
+  productionSetAudioMode,
   renderProductionWorkspace,
   productionSaveCurrent,
   productionMentionToken,

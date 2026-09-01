@@ -15,7 +15,7 @@ class CreateProjectRequest(BaseModel):
     art_style: str = Field(default="写实")
     video_ratio: str = Field(default="9:16")
     script_source: Literal["idea", "script"] = "idea"
-    audio_mode: Literal["auto", "native_dialogue", "external_tts"] = "auto"
+    audio_mode: Literal["auto", "native_dialogue", "external_tts"] = "native_dialogue"
     visual_style_id: str = "cinematic_cel"
     style_modifiers: list[str] = Field(default_factory=list)
 

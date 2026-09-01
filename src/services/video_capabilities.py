@@ -43,6 +43,10 @@ def _seedance_capability(
         "resolutions": resolutions,
         "cost_tier": cost_tier,
         "legacy": legacy,
+        "supports_native_audio": True,
+        "supports_native_dialogue": True,
+        "native_audio_status": "supported",
+        "native_audio_reason": "Seedance client sends generate_audio and verifies the returned audio stream.",
     }
 
 
@@ -61,6 +65,10 @@ VIDEO_CAPABILITIES: dict[str, dict[str, Any]] = {
             "reference_modes": ["first_frame"],
             "resolutions": ["720p", "1080p"], "durations": [3, 5, 10, 15],
             "cost_tier": "economy",
+            "supports_native_audio": True,
+            "supports_native_dialogue": True,
+            "native_audio_status": "best_effort",
+            "native_audio_reason": "Happy Horse 视频结果按实际 MP4 音轨检测；当前网关未提供独立音频 URL。",
         },
         "happyhorse-1.1-r2v": {
             "text_to_video": False, "image_to_video": True, "multi_reference": True,
@@ -68,6 +76,10 @@ VIDEO_CAPABILITIES: dict[str, dict[str, Any]] = {
             "reference_modes": ["multi_reference"],
             "resolutions": ["720p", "1080p"], "durations": [3, 5, 10, 15],
             "cost_tier": "balanced",
+            "supports_native_audio": True,
+            "supports_native_dialogue": True,
+            "native_audio_status": "best_effort",
+            "native_audio_reason": "Happy Horse 视频结果按实际 MP4 音轨检测；当前网关未提供独立音频 URL。",
         },
     }},
     "wan": {"models": {
@@ -142,6 +154,31 @@ VIDEO_CAPABILITIES: dict[str, dict[str, Any]] = {
         ),
     }},
 }
+
+
+# Models without a verified request-and-response audio contract must never be
+# presented as native-dialogue capable.  This prevents a silent fallback to TTS.
+for _provider_name, _provider_data in VIDEO_CAPABILITIES.items():
+    for _model_name, _capability in _provider_data["models"].items():
+        _capability.setdefault("supports_native_audio", False)
+        _capability.setdefault("supports_native_dialogue", False)
+        _capability.setdefault("native_audio_status", "unsupported")
+        _capability.setdefault(
+            "native_audio_reason",
+            f"{_provider_name}/{_model_name} has no verified native-dialogue request contract.",
+        )
+
+
+def audio_capability(policy: dict[str, Any]) -> dict[str, Any]:
+    """Return the normalized native-dialogue capability for one policy."""
+    capability = dict(policy.get("capability") or {})
+    return {
+        "provider": str(policy.get("provider") or ""),
+        "model": str(policy.get("model") or ""),
+        "supported": bool(capability.get("supports_native_dialogue", False)),
+        "status": str(capability.get("native_audio_status") or "unsupported"),
+        "reason": str(capability.get("native_audio_reason") or ""),
+    }
 
 
 def dashscope_available() -> bool:

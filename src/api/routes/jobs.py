@@ -13,6 +13,7 @@ from src.services.audio_timeline import (
     audio_summary as _audio_summary,
     layout_project_audio as _layout_project_audio,
     project_audio_assets as _project_audio_assets,
+    final_assembly_audio_preflight as _final_assembly_audio_preflight,
     render_project_audio_preview as _render_project_audio_preview,
     validate_project_voice_profiles as _validate_project_voice_profiles,
 )
@@ -1366,13 +1367,27 @@ async def _refresh_native_asr(state: DramaState) -> None:
 
 async def _job_final_assemble(context, payload: dict) -> dict:
     context.progress("preparing", 0, 1, "正在准备成片合成")
+    override = str(payload.get("audio_override") or "")
     async with context.project_lock:
         state = _load_project_state(context.project_id)
-        result = await orchestrator.run_stage(6, state)
+        preflight = _final_assembly_audio_preflight(state, override=override)
+        if preflight["requires_confirmation"]:
+            raise ValueError(preflight["message"])
+        # Keep the one-shot no-dialogue choice scoped to this assembly run; it
+        # must not silently affect a later assembly after the user generates audio.
+        assembly_state = deepcopy(state)
+        assembly_state.assembly_audio_override = preflight["override"]
+        result = await orchestrator.run_stage(6, assembly_state)
         context.check_cancelled()
         project_store.set_final_video(context.project_id, result.output_video_path)
-        _save_project_state(result)
-    return {"output_video_path": result.output_video_path}
+        state.output_video_path = result.output_video_path
+        state.assembly_audio_override = ""
+        _save_project_state(state)
+    return {
+        "output_video_path": result.output_video_path,
+        "audio_override": preflight["override"],
+        "audio_preflight": preflight,
+    }
 
 
 register_handlers(job_manager, {
@@ -1837,6 +1852,29 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
             "target_id": line_id if req.payload.get("line_id") else req.target_id,
             "provider": "tts",
             "payload": ({"operation": "preview"} if operation == "preview" else ({"line_id": line_id} if req.payload.get("line_id") else {})),
+        })
+    elif req.job_type == "final.assemble":
+        state = _load_project_state(project_id)
+        override = str(req.payload.get("audio_override") or "")
+        if override not in {"", "no_dialogue_confirmed"}:
+            raise HTTPException(400, "无效的音频合成选项")
+        preflight = _final_assembly_audio_preflight(state, override=override)
+        if preflight["requires_confirmation"]:
+            raise HTTPException(409, detail={
+                "code": "audio_incomplete",
+                "message": preflight["message"],
+                "audio_summary": preflight,
+            })
+        specs.append({
+            "job_type": "final.assemble",
+            "target_type": req.target_type or "project",
+            "target_id": req.target_id,
+            "provider": "assembly",
+            "payload": {
+                **req.payload,
+                "audio_override": preflight["override"],
+                "audio_preflight": preflight,
+            },
         })
     else:
         specs.append({

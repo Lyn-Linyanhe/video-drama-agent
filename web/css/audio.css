@@ -224,3 +224,32 @@
 @media (prefers-reduced-motion: reduce) {
   #production-audio-timeline * { scroll-behavior: auto !important; transition: none !important; }
 }
+.production-audio-mode {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #303036;
+  border-radius: 6px;
+  background: #141417;
+}
+.production-audio-mode-heading,
+.production-audio-mode-options {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.production-audio-mode-heading strong { color: #e4e4e7; font-size: 12px; }
+.production-audio-mode-heading > span { color: #71717a; font-size: 10px; }
+.production-audio-mode-options { justify-content: flex-start; }
+.production-audio-mode-options label { display: inline-flex; align-items: center; gap: 6px; color: #d4d4d8; font-size: 11px; cursor: pointer; }
+.production-audio-mode-options input { accent-color: #60a5fa; }
+.production-audio-mode-capability { font-size: 10px; line-height: 1.45; }
+.production-audio-mode-capability.audio-ok { color: #86efac; }
+.production-audio-mode-capability.audio-warning,
+.production-audio-mode-warning { color: #fbbf24; }
+.production-audio-mode-warning,
+.production-audio-mode-legacy { font-size: 10px; line-height: 1.45; }
+.production-audio-mode-legacy { color: #a1a1aa; }

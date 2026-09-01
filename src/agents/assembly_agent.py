@@ -39,6 +39,7 @@ class AssemblyAgent:
         project_id: str = "",
         subtitle_enabled: bool = True,
         subtitle_mode: str | None = None,
+        audio_override: str = "",
     ) -> str:
         """Assemble all assets into the final video file.
 
@@ -50,8 +51,23 @@ class AssemblyAgent:
         Returns:
             Path to the final assembled video file.
         """
-        subtitle_mode = subtitle_mode if subtitle_mode in {"off", "dialogue", "speaker"} else ("dialogue" if subtitle_enabled else "off")
-        subtitle_enabled = subtitle_mode != "off"
+        silent_dialogue = audio_override == "no_dialogue_confirmed"
+        if silent_dialogue:
+            subtitle_mode = "off"
+            subtitle_enabled = False
+            if audio:
+                # Preserve BGM/SFX but remove generated dialogue tracks for
+                # this one assembly only. Native audio baked into source video
+                # remains provider-owned and is not rewritten here.
+                from copy import deepcopy
+                audio = deepcopy(audio)
+                for scene_audio in audio.scenes:
+                    scene_audio.dialogue_audios = []
+                    scene_audio.tts_audio_path = ""
+                    scene_audio.tts_text = ""
+        else:
+            subtitle_mode = subtitle_mode if subtitle_mode in {"off", "dialogue", "speaker"} else ("dialogue" if subtitle_enabled else "off")
+            subtitle_enabled = subtitle_mode != "off"
         output_dir = self.output_dir
         if project_id:
             output_dir = OUTPUT_DIR / project_id / "assets" / "final"
@@ -63,7 +79,7 @@ class AssemblyAgent:
         conflicts = [line.line_id or f"{scene.scene_id}:{line.dialogue_index}"
                      for scene in (audio.scenes if audio else []) for line in scene.dialogue_audios
                      if line.timing_conflict]
-        if conflicts:
+        if conflicts and not silent_dialogue:
             raise ValueError(f"Audio timing conflicts must be resolved before assembly: {', '.join(conflicts[:5])}")
         stale_lines = [line.line_id or f"{scene.scene_id}:{line.dialogue_index}"
                        for scene in (audio.scenes if audio else []) for line in scene.dialogue_audios
@@ -72,12 +88,12 @@ class AssemblyAgent:
             item for item in self._script_audio_mismatches(script, audio)
             if item not in stale_lines
         )
-        if stale_lines:
+        if stale_lines and not silent_dialogue:
             raise ValueError(f"Audio lines must be regenerated before assembly: {', '.join(stale_lines[:5])}")
         failed_lines = [line.line_id or f"{scene.scene_id}:{line.dialogue_index}"
                         for scene in (audio.scenes if audio else []) for line in scene.dialogue_audios
                         if line.text.strip() and not line.success]
-        if failed_lines:
+        if failed_lines and not silent_dialogue:
             raise ValueError(f"Audio lines failed or are missing: {', '.join(failed_lines[:5])}")
 
         # The FFmpeg path is the authoritative renderer for timeline offsets,

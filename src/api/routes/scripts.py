@@ -116,11 +116,16 @@ async def generate_script(req: ScriptRequest):
     state.input_mode = req.input_mode
     state.source_filename = req.source_filename
     state.project_id = project_id
+    requested_audio_mode = (
+        state.creative_profile.audio_mode
+        if req.project_id
+        else "native_dialogue"
+    )
     state.creative_profile = CreativeProfile.from_request(
         req.genre_tags,
         req.art_style,
         req.video_ratio,
-        state.creative_profile.audio_mode,
+        requested_audio_mode,
         visual_style_id=req.visual_style_id,
         style_modifiers=req.style_modifiers,
     )

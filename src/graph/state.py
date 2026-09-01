@@ -138,6 +138,9 @@ class DramaState:
     subtitle_mode: str = "dialogue"
     """Final subtitle mode: off, dialogue, or speaker."""
 
+    assembly_audio_override: str = ""
+    """One-shot final-assembly override, e.g. explicit no-dialogue confirmation."""
+
     review_loop_count: int = 0
     """Number of review-retry cycles executed. Capped at MAX_REVIEW_LOOPS."""
 
