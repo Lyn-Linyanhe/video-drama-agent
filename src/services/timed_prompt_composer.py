@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from math import ceil
+from typing import Literal
 
 from src.schemas.prompt import ShotPrompt
 from src.schemas.script import DialogueLine, Scene, ScriptBreakdown
@@ -254,6 +255,28 @@ def _current_event_text(scene: Scene, original: str) -> str:
     return " ".join(part for part in [original, scene.action_description] if part)
 
 
+
+def _direction_evidence_text(scene: Scene, original: str) -> str:
+    """Use all current-shot structured evidence before falling back to scene text.
+
+    A subject-state section often describes the starting pose while the action
+    timeline contains the actual doorway direction. Returning only the first
+    non-empty section could therefore hide a later, more specific entry/exit
+    cue and let a stale scene-level clause take precedence.
+    """
+    cleaned = _strip_binding_prop_section(_strip_model_prompt_supplement(original or ""))
+    sections = _sections(cleaned)
+    structured_values = [
+        _section_value(sections, section_name)
+        for section_name in ("主体状态", "角色状态", "动作时间轴")
+    ]
+    structured_text = " ".join(value for value in structured_values if value)
+    if structured_text:
+        return structured_text
+    core_intent = _preview_core_intent(cleaned)
+    return core_intent or _normalize_prompt_text(getattr(scene, "action_description", ""))
+
+
 def _has_identity_reveal_event(scene: Scene, event_text: str, visible_names: list[str]) -> bool:
     has_reveal_action = _contains(
         event_text,
@@ -397,6 +420,22 @@ def _action_clause(text: str, cues: tuple[str, ...]) -> str:
     return ""
 
 
+
+def _action_clauses(text: str, cues: tuple[str, ...]) -> list[str]:
+    """Return every current action clause containing one of the given cues."""
+    normalized = (text or "").replace("，", ",").replace("。", ".").replace("；", ";")
+    clauses: list[str] = []
+    for raw_clause in re.split(r"[,.;\n]", normalized):
+        clause = raw_clause.strip(", ")
+        if not clause or not any(cue in clause for cue in cues):
+            continue
+        for adverb in ("突然", "忽然", "猛然", "随即", "立即"):
+            clause = clause.replace(adverb, "")
+        if clause and clause not in clauses:
+            clauses.append(clause)
+    return clauses
+
+
 def _named_actor_for_event(scene: Scene | None, text: str, cues: tuple[str, ...]) -> str:
     names = _visible_character_names(scene, text)
     for cue in cues:
@@ -488,6 +527,32 @@ def _frame_label_for_characters(scene: Scene | None, names: list[str] | None = N
     if count == 1:
         return "中近景单人/正面固定"
     return "中景/侧面固定"
+
+
+def _missing_dialogue_addendum(scene: Scene | None, text: str) -> str:
+    """Return a traceable addendum for script dialogue absent from a draft."""
+    if scene is None:
+        return ""
+    missing: list[str] = []
+    visible_names = {str(name).strip() for name in getattr(scene, "characters", []) or [] if str(name).strip()}
+    offscreen_label = "电话那头（画外声音）" if _has_phone_call_cue(text) else "画外声音"
+    for line in getattr(scene, "dialogue", []) or []:
+        content = str(line.line or "").strip()
+        if not content or content in text:
+            continue
+        emotion = f"（{line.emotion}）" if line.emotion else ""
+        speaker = str(line.character or "").strip()
+        # Keep off-screen speech content without leaking an unshown speaker as
+        # a visible character into the visual prompt.
+        label = speaker if speaker in visible_names else offscreen_label
+        missing.append(f"{label}：“{content}”{emotion}")
+    if not missing:
+        return ""
+    return (
+        "【对白/独白】"
+        + " / ".join(missing)
+        + "。对白和独白原文必须完整保留；voice_only只控制画面是否出现说话者，不能删除声音内容。"
+    )
 
 
 def _dialogue_staging(scene: Scene, dialogue: str, text: str, names: list[str] | None = None) -> str:
@@ -1527,6 +1592,7 @@ def _lint_and_repair_prompt(
     source_text = " ".join([core_intent, authored_timeline, scene_text])
     lines: list[str] = []
     for line in text.splitlines():
+        line = _repair_direction_template_artifacts(line, source_text, scene)
         line = _repair_conflicting_envelope_reveal(line, source_text, scene)
         line = _repair_stale_event_line(line, scene_text, source_text, scene)
         line = _repair_context_sound(line, source_text)
@@ -1573,8 +1639,10 @@ def _lint_and_repair_prompt(
         "，重点表现呼吸、脚步、手部动作和环境声，动作连续可读。",
     )
     coverage = _coverage_addendum(scene, repaired, source_text, current_event_text=core_intent)
-    if coverage:
-        repaired = "\n".join([repaired, coverage])
+    dialogue_addendum = _missing_dialogue_addendum(scene, repaired)
+    additions = [item for item in (coverage, dialogue_addendum) if item]
+    if additions:
+        repaired = "\n".join([repaired, *additions])
     return _normalize_prompt_text(repaired)
 
 
@@ -1607,6 +1675,7 @@ def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
     text = _repair_dual_point_of_view(text, scene)
     lines: list[str] = []
     for line in text.splitlines():
+        line = _repair_direction_template_artifacts(line, " ".join([core_intent, scene_text]), scene)
         line = _repair_conflicting_envelope_reveal(line, core_intent, scene)
         line = _repair_stale_event_line(line, scene_text, source_text, scene)
         line = _repair_stale_flashback(line, source_text, scene)
@@ -1642,18 +1711,110 @@ def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
     return _lint_and_repair_prompt(repaired, scene)
 
 
-def _has_entrance_cue(text: str) -> bool:
-    # The door-entry narrative is only used when the event names a concrete
-    # door beat (推门/玻璃门/门铃) or an explicit doorway signal (黑伞/监控/
-    # 街对面). Exit/chase scenes such as 追出店门塞拿铁 carry none of those
-    # signals, so they fall through to the generic physical-action beat. Chase
-    # texts that DO name a door beat (e.g. 追上阿岚后推门进店) still describe
-    # a door event and keep the template.
-    return (
-        _contains(text, "推门", "玻璃门", "门铃", "黑伞", "监控", "街对面")
-        and not _contains(text, "把信给我", "交出信封", "不要交给你")
-    )
+def _direction_is_negated(text: str, start: int) -> bool:
+    """Return whether a direction cue is explicitly negated."""
+    prefix = text[max(0, start - 6):start]
+    negations = ("\u6ca1\u6709", "\u672a", "\u5c1a\u672a", "\u5e76\u672a", "\u6ca1", "\u4e0d", "\u65e0\u9700", "\u7981\u6b62", "\u4e0d\u5fc5")
+    if any(prefix.endswith(cue) for cue in negations):
+        return True
+    suffixes = ("\u8ba9\u4ed6", "\u8ba9\u5176", "\u4f1a", "\u8981", "\u80fd", "\u5e94", "\u5f97")
+    return any(prefix.endswith(cue + suffix) for cue in negations for suffix in suffixes)
 
+
+def detect_entry_exit_direction(text: str) -> Literal["enter", "exit", "none"]:
+    """Return the explicit doorway direction in the current-shot evidence."""
+    normalized = _normalize_prompt_text(text or "")
+    # Camera-language phrases describe leaving the frame/eyeline, not leaving
+    # the location. They must not activate the physical exit beat.
+    camera_only_exit = ("\u8d70\u51fa\u753b\u9762", "\u8d70\u51fa\u89c6\u7ebf", "\u79bb\u5f00\u753b\u9762", "\u79bb\u5f00\u89c6\u7ebf")
+    for phrase in camera_only_exit:
+        normalized = normalized.replace(phrase, "")
+    direction_cues = {
+        "enter": (
+            "\u63a8\u95e8\u8fdb\u5165", "\u63a8\u95e8\u8fdb", "\u5f00\u95e8\u8fdb\u5165",
+            "\u8d70\u8fdb", "\u8d70\u5165", "\u8fdb\u5165", "\u8e0f\u5165", "\u8fdb\u5c4b",
+            "\u8fdb\u5e97", "\u8fdb\u95e8",
+        ),
+        "exit": (
+            "\u8ffd\u51fa", "\u8ffd\u51fa\u53bb", "\u8d70\u51fa", "\u8d70\u51fa\u53bb",
+            "\u8dd1\u51fa", "\u8dd1\u51fa\u53bb", "\u51b2\u51fa", "\u51b2\u51fa\u53bb",
+            "\u79bb\u5f00", "\u51fa\u95e8", "\u9000\u51fa", "\u79bb\u5e97", "\u79bb\u5c4b",
+        ),
+    }
+    matches: list[tuple[int, int, str]] = []
+    for direction, cues in direction_cues.items():
+        for cue in cues:
+            search_from = 0
+            while True:
+                start = normalized.find(cue, search_from)
+                if start < 0:
+                    break
+                if not _direction_is_negated(normalized, start):
+                    matches.append((start, len(cue), direction))
+                search_from = start + 1
+    if not matches:
+        return "none"
+    _, _, direction = max(matches, key=lambda item: (item[0], item[1]))
+    return direction
+
+
+def _repair_direction_template_artifacts(
+    line: str,
+    source_text: str,
+    scene: Scene | None = None,
+) -> str:
+    """Repair legacy doorway-template wording using the current shot source.
+
+    Some model outputs arrive already formatted as a timed timeline. In that
+    path we must not blindly preserve a contradictory canned phrase such as
+    ``门被推开，人物走出；两人短暂对视`` when the source only says that the
+    character enters. This repair is deliberately narrow and only touches a
+    timed line plus phrases with explicit template wording.
+    """
+    if not re.match(r"^(?:切镜头，)?\d+(?:\.\d+)?s[，,]", line.strip()):
+        return line
+    direction = detect_entry_exit_direction(source_text)
+    if direction != "enter":
+        return line
+
+    repaired = line
+    if not _contains(source_text, "推门", "推开", "开门", "打开玻璃门", "打开木门"):
+        repaired = re.sub(r"[^，。；\n]*门被推开，", "", repaired, count=1)
+    if not _contains(source_text, "对视", "四目相对", "目光交汇"):
+        repaired = repaired.replace("两人短暂对视，", "").replace("两人短暂对视", "")
+    if not _contains(source_text, "门铃"):
+        repaired = repaired.replace("门铃轻响，", "").replace("门铃轻响", "")
+    repaired = repaired.replace("走出", "进入")
+    repaired = re.sub(r"，{2,}", "，", repaired)
+    repaired = re.sub(r"；{2,}", "；", repaired)
+    repaired = re.sub(r"，([。；])", r"\1", repaired)
+    return repaired
+
+
+def _has_entrance_cue(text: str) -> bool:
+    """Whether the current shot explicitly describes a doorway entry."""
+    if detect_entry_exit_direction(text) != "enter":
+        return False
+    if _contains(
+        text,
+        "\u8fdb\u5165\u753b\u9762", "\u8fdb\u5165\u89c6\u7ebf", "\u8fdb\u5165\u89c6\u91ce",
+        "\u8fdb\u5165\u955c\u5934", "\u8fdb\u5165\u72b6\u6001",
+    ):
+        return False
+    entry_verbs = ("\u63a8\u95e8", "\u5f00\u95e8", "\u8d70\u8fdb", "\u8d70\u5165", "\u8fdb\u5165", "\u8e0f\u5165", "\u8fdb\u5c4b", "\u8fdb\u5e97", "\u8fdb\u95e8")
+    spatial_targets = ("\u5e97", "\u5c4b", "\u623f\u95f4", "\u5ba4\u5185", "\u5927\u5385", "\u529e\u516c\u5ba4", "\u5efa\u7b51", "\u95e8\u5185", "\u95e8\u53e3", "\u7a7a\u95f4", "\u697c")
+    for verb in entry_verbs:
+        search_from = 0
+        while True:
+            start = text.find(verb, search_from)
+            if start < 0:
+                break
+            if not _direction_is_negated(text, start):
+                tail = text[start + len(verb):start + len(verb) + 10]
+                if any(target in tail for target in spatial_targets):
+                    return True
+            search_from = start + 1
+    return False
 
 def _has_reaction_pan_cue(text: str) -> bool:
     if _contains(text, "藏到身后", "藏在身后", "往身后藏"):
@@ -1670,6 +1831,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
     sections = _sections(original)
     text = _scene_trigger_text(scene, original)
     event_text = _current_event_text(scene, original)
+    direction_text = _direction_evidence_text(scene, original)
     visible_names = _visible_character_names(scene, original, script)
     subject = _main_subject(scene, visible_names)
     pov_subject = _pov_subject(scene, visible_names)
@@ -1681,6 +1843,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
     voiceover = _voiceover_text(scene, text)
     beats: list[tuple[str, str]] = []
     special_event = False
+    exit_event_added = False
 
     if _contains(event_text, "延续", "上一镜", "尾帧"):
         beats.append(("continuity", f"延续上一镜画面状态，{camera}，主光方向、雨势、站位和动作起点保持一致。"))
@@ -1830,25 +1993,41 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
             beats.append(("dialogue_two_shot", _dialogue_staging(scene, dialogue, text, visible_names)))
         return beats
 
-    if _has_entrance_cue(event_text):
-        actor = _named_actor_for_event(scene, event_text, ("推开", "走出", "进来"))
+    if _has_entrance_cue(direction_text):
+        actor = _last_named_before(direction_text, "\u8ffd\u4e0a", visible_names)
+        actor = actor or _named_actor_for_event(
+            scene,
+            direction_text,
+            ("\u63a8\u95e8\u8fdb\u5165", "\u63a8\u95e8\u8fdb", "\u5f00\u95e8\u8fdb\u5165", "\u8d70\u8fdb", "\u8d70\u5165", "\u8fdb\u5165", "\u8e0f\u5165", "\u8fdb\u5c4b", "\u8fdb\u5e97", "\u8fdb\u95e8"),
+        )
         companions = [name for name in visible_names if name != actor]
         companion = companions[0] if companions else subject
-        venue = _first_context_token(event_text, ("便利店", "商店", "建筑", "房间"), str(scene.location or "场所"))
-        door = _first_context_token(event_text, ("玻璃门", "木门", "铁门", "门"), "门")
-        umbrella = _first_context_token(event_text, ("黑伞", "雨伞", "伞"), "")
-        umbrella_phrase = f"撑着{umbrella}" if umbrella else ""
-        prop_anchor = _prop_anchor_label(event_text, props)
-        surveillance = "，抬眼看门口监控，再用余光瞥向街对面" if _contains(event_text, "监控", "街对面") else ""
-        bell = "门铃轻响，" if _contains(event_text, "门铃", "玻璃门") else ""
+        venue = _first_context_token(
+            direction_text,
+            ("\u4fbf\u5229\u5e97", "\u5546\u5e97", "\u5efa\u7b51", "\u623f\u95f4", "\u5e97"),
+            str(scene.location or "\u573a\u6240"),
+        )
+        door = _first_context_token(direction_text, ("\u73bb\u7483\u95e8", "\u6728\u95e8", "\u94c1\u95e8", "\u95e8"), "\u95e8")
+        door_open = _contains(direction_text, "\u63a8\u95e8", "\u63a8\u5f00", "\u5f00\u95e8", "\u6253\u5f00\u73bb\u7483\u95e8", "\u6253\u5f00\u6728\u95e8")
+        umbrella = _first_context_token(direction_text, ("\u9ed1\u4f1e", "\u96e8\u4f1e", "\u4f1e"), "")
+        umbrella_phrase = f"\u6491\u7740{umbrella}" if umbrella else ""
+        prop_anchor = _prop_anchor_label(direction_text, props)
+        surveillance = ""
+        if _contains(direction_text, "\u76d1\u63a7") and _contains(direction_text, "\u770b", "\u67e5\u770b", "\u89c2\u5bdf", "\u76ef"):
+            surveillance = "，\u67e5\u770b\u95e8\u53e3\u76d1\u63a7"
+        if _contains(direction_text, "\u8857\u5bf9\u9762"):
+            surveillance += "，\u89c6\u7ebf\u8f6c\u5411\u8857\u5bf9\u9762"
+        bell = "\u95e8\u94c3\u8f7b\u54cd，" if _contains(direction_text, "\u95e8\u94c3") else ""
         hide_phrase = ""
-        if _contains(event_text, "藏到身后", "藏在身后", "往身后藏"):
-            hide_phrase = f"{companion}把{prop_anchor}藏到身后，"
+        if _contains(direction_text, "\u85cf\u5230\u8eab\u540e", "\u85cf\u5728\u8eab\u540e", "\u5f80\u8eab\u540e\u85cf"):
+            hide_phrase = f"{companion}\u628a{prop_anchor}\u85cf\u5230\u8eab\u540e，"
+        door_phrase = f"{venue}{door}\u88ab\u63a8\u5f00，" if door_open else ""
+        gaze_phrase = "\u4e24\u4eba\u77ed\u6682\u5bf9\u89c6，" if _contains(direction_text, "\u5bf9\u89c6", "\u56db\u76ee\u76f8\u5bf9", "\u76ee\u5149\u4ea4\u6c47") else ""
         beats.append((
             "physical_action",
-            f"中近景/侧面固定，{venue}{door}被推开，{bell}{actor}{umbrella_phrase}走出；"
-            f"{hide_phrase}两人短暂对视，{actor}{surveillance}，"
-            f"人物站位、视线方向和{prop_anchor}位置清楚。",
+            f"\u4e2d\u8fd1\u666f/\u4fa7\u9762\u56fa\u5b9a，{door_phrase}{bell}{actor}{umbrella_phrase}\u8fdb\u5165{venue}；"
+            f"{hide_phrase}{gaze_phrase}{actor}{surveillance}，"
+            f"\u4eba\u7269\u7ad9\u4f4d、\u89c6\u7ebf\u65b9\u5411\u548c{prop_anchor}\u4f4d\u7f6e\u6e05\u695a。",
         ))
         special_event = True
 
@@ -1856,6 +2035,17 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
         if dialogue and not any(kind.startswith("dialogue") for kind, _ in beats):
             beats.append(("dialogue_two_shot", _dialogue_staging(scene, dialogue, text, visible_names)))
         return beats
+
+    if detect_entry_exit_direction(direction_text) == "exit":
+        exit_cues = (
+            "\u8ffd\u51fa", "\u8ffd\u51fa\u53bb", "\u8d70\u51fa", "\u8d70\u51fa\u53bb", "\u8dd1\u51fa", "\u8dd1\u51fa\u53bb", "\u51b2\u51fa", "\u51b2\u51fa\u53bb",
+            "\u79bb\u5f00", "\u51fa\u95e8", "\u9000\u51fa", "\u79bb\u5e97", "\u79bb\u5c4b",
+        )
+        exit_clauses = _action_clauses(direction_text, exit_cues)
+        exit_action = "；".join(exit_clauses) or _normalize_prompt_text(action)
+        description = _physical_action_description(scene, "", exit_action, direction_text).lstrip("， ")
+        beats.append(("physical_action", description))
+        exit_event_added = True
 
     if _has_sms_visual_cue(text):
         beats.append((
@@ -1868,7 +2058,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
             "中近景/过肩固定，手机拨号或通话界面投出冷光，接通提示音短促，手部和手机位置稳定；电话内容只用声音表现。",
         ))
 
-    if _contains(event_text, "奔跑", "跑", "逃", "追逐", "冲进", "冲向", "小巷", "开锁", "钥匙", "铁门", "推门", "撞门", "撬锁"):
+    if not exit_event_added and _contains(event_text, "奔跑", "跑", "逃", "追逐", "冲进", "冲向", "小巷", "开锁", "钥匙", "铁门", "推门", "撞门", "撬锁"):
         beats.append((
             "physical_action",
             _physical_action_description(scene, subject, action, " ".join([event_text, scene.action_description or ""])),

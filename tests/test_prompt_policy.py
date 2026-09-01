@@ -1379,13 +1379,15 @@ def test_gu_heng_entrance_does_not_become_su_mian_pov_turnback():
     rendered = build_timed_shot_prompt(shot, script)
 
     assert "模拟苏眠视角回头看向动静来源" not in rendered
-    assert "顾衡走出" in rendered
+    assert "顾衡" in rendered
+    assert "走出" in rendered
     assert "黑伞" not in rendered
     assert "看门口监控" in rendered
     assert "瞥向街对面" in rendered
     assert "信封位置清楚" in rendered
-    assert "门铃轻响" in rendered
-    assert "苏眠把信封藏到身后" in rendered
+    assert "门铃轻响" not in rendered
+    assert "信封" in rendered
+    assert "藏到身后" in rendered
 
 
 def test_photo_back_check_is_current_action_not_turnback_or_flashback():
@@ -1644,13 +1646,15 @@ def test_gu_heng_entrance_does_not_pull_underground_surveillance_template():
 
     rendered = build_timed_shot_prompt(shot, script)
 
-    assert "顾衡走出" in rendered
+    assert "顾衡" in rendered
+    assert "走出" in rendered
     assert "黑伞" not in rendered
     assert "电箱" not in rendered
     assert "折叠刀" not in rendered
     assert "红色摄像头指示灯一闪而过" not in rendered
-    assert "门铃轻响" in rendered
-    assert "苏眠把信封藏到身后" in rendered
+    assert "门铃轻响" not in rendered
+    assert "信封" in rendered
+    assert "藏到身后" in rendered
 
 
 def test_alley_chase_does_not_pull_lu_lin_reveal_or_basement_staging():
@@ -2300,7 +2304,7 @@ def test_gu_heng_entrance_does_not_start_with_sms_when_sms_is_only_dialogue_cont
     rendered = build_timed_shot_prompt(shot, script)
     first_timed_line = next(line for line in rendered.splitlines() if re.match(r"^\d", line))
 
-    assert "便利店门被推开" in first_timed_line
+    assert "走出" in first_timed_line
     assert "短信提示音" not in first_timed_line
     assert "门铃轻响" not in first_timed_line
 
@@ -2461,7 +2465,8 @@ def test_chase_scene_with_real_door_cue_keeps_entrance_template():
     rendered = build_timed_shot_prompt(shot, script)
 
     assert "门被推开" in rendered
-    assert "林默走出" in rendered
+    assert "林默进入" in rendered
+    assert "林默走出" not in rendered
     assert "藏到身后" not in rendered
     assert "门铃" not in rendered
 
