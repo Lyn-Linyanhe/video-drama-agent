@@ -291,6 +291,36 @@ async def test_visual_stage_uses_compact_output_contract_for_non_kimi_provider()
     assert "每个字段最多两句" in agent.llm.calls[0]["system_prompt"]
 
 
+
+def test_split_output_uses_clean_stable_identity_before_assembling_prompts():
+    script = ScriptBreakdown(
+        title="状态隔离", genre="剧情", logline="测试", duration_sec=6,
+        narration_style="无旁白",
+        scenes=[
+            Scene(scene_id=1, duration_sec=3, location="房间", characters=["角色甲"], action_description="角色甲站立。", camera_direction="中景", emotion_tone="平静"),
+            Scene(scene_id=2, duration_sec=3, location="房间", characters=["角色甲"], action_description="角色甲回头。", camera_direction="近景", emotion_tone="平静"),
+        ],
+        asset_manifest=VisualAssetManifest(
+            characters=[VisualCharacterAsset(asset_id="char_a", name="角色甲", appearance_mode="on_screen", description="角色甲：稳定身份锚点。")],
+            locations=[LocationAsset(location_id="loc_room", canonical_name="房间", environment_description="墙面斑驳", representative_scene_id=1, shot_ids=[1, 2])],
+            shot_bindings=[
+                ShotVisualBinding(scene_id=1, location_id="loc_room", on_screen_character_ids=["char_a"]),
+                ShotVisualBinding(scene_id=2, location_id="loc_room", on_screen_character_ids=["char_a"]),
+            ],
+        ),
+    )
+    output = _CompactVisualPromptOutput(
+        overall_style="写实", color_palette="冷色", aspect_ratio="9:16",
+        global_character_descriptions_cn={"角色甲": "成年女性；身形修长；椭圆脸肤色白皙；黑色长发；后来剪成短发；米白色风衣"},
+        shots=[_CompactShotVisualPrompt(scene_id=1, action_timeline="0-3秒站立", duration_sec=3), _CompactShotVisualPrompt(scene_id=2, action_timeline="0-3秒回头", duration_sec=3)],
+    )
+
+    _visual, prompts = VisualPromptAgent(api_provider="mock")._split_output(output, script, None)
+
+    assert all("长发" not in shot.prompt and "短发" not in shot.prompt for shot in prompts.shots)
+    assert "本镜角色状态" in prompts.shots[0].prompt
+
+
 @pytest.mark.asyncio
 async def test_visual_stage_repairs_an_incomplete_character_profile_once():
     script = ScriptBreakdown(

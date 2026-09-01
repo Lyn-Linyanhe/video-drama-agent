@@ -505,3 +505,30 @@ async def test_character_reextract_keeps_asset_anchor_when_repair_remains_incomp
 
     assert chinese["苏眠"] == "苏眠：米白色长风衣。"
     assert agent.character_profile_repair_status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_character_reextract_api_failure_uses_existing_asset_anchor():
+    script = ScriptBreakdown(
+        title="侧写异常降级", genre="悬疑", logline="测试", duration_sec=3,
+        narration_style="无旁白",
+        scenes=[_scene(1, "苏眠站在屋檐下。", ["苏眠"])],
+        asset_manifest=VisualAssetManifest(
+            characters=[VisualCharacterAsset(
+                asset_id="char_su_mian", name="苏眠", appearance_mode="on_screen",
+                description="苏眠：米白色长风衣。",
+            )],
+        ),
+    )
+
+    class _FailingLLM:
+        async def generate_structured(self, **kwargs):
+            raise RuntimeError("temporary profile provider failure")
+
+    agent = VisualPromptAgent(api_provider="mock")
+    agent.llm = _FailingLLM()
+
+    _english, chinese = await agent.reextract_visible_characters(script)
+
+    assert chinese["苏眠"] == "苏眠：米白色长风衣。"
+    assert agent.character_profile_repair_status == "partial"

@@ -112,8 +112,9 @@ def build_shot_environment_context(script, scene_id: int, environment_delta: str
 
 
 _CHARACTER_MUTABLE_STATE_CUES = (
-    "后来", "之后", "此前", "先是", "改成", "换成", "换上", "脱下", "剪成", "剃成",
+    "后来", "之后", "此前", "先是", "改成", "换成", "换上", "脱下", "剪成", "剪发后", "理发后", "换发型后", "剃成",
     "摘下", "戴上", "伪装", "伪装成", "湿透", "沾满", "破损", "撕裂", "恢复", "变回",
+    "告别", "不舍", "期待", "慌乱", "紧张", "愁意", "含泪", "笑意",
 )
 _CHARACTER_STATE_ALTERNATIVES = (
     ("hair_length", ("长发", "中长发"), ("短发",)),
@@ -121,11 +122,75 @@ _CHARACTER_STATE_ALTERNATIVES = (
 )
 
 
+_CHARACTER_STATE_TERMS = (
+    "长发", "中长发", "短发", "卷发", "直发", "马尾", "披散", "盘起",
+    "风衣", "大衣", "外套", "衬衫", "裙", "长裤", "雨衣", "制服",
+    "口罩", "帽子", "鸭舌帽", "围巾", "手套", "眼镜", "妆", "伤口", "疤痕",
+    "血迹", "污渍", "湿透", "伪装", "遮住", "摘下", "戴上",
+)
+
+
+def split_character_identity_and_state(
+    character_name: str,
+    stable_profile: str,
+    scene_state_notes: str,
+    scene_text: str,
+) -> tuple[str, str]:
+    """Separate reusable identity from explicitly supported per-shot appearance state."""
+    stable = _stable_character_identity_description(stable_profile)
+    state_parts: list[str] = []
+    for value in (scene_state_notes, scene_text):
+        for clause in re.split(r"[。；;，,、\n]+", str(value or "")):
+            clause = re.sub(r"\s+", " ", clause).strip(" ，,、")
+            if not clause or not any(term in clause for term in _CHARACTER_STATE_TERMS):
+                continue
+            # Keep only the local appearance/state fragment, not the whole action.
+            matches = []
+            for term in _CHARACTER_STATE_TERMS:
+                matches.extend(re.findall(r"(?:[\u4e00-\u9fffA-Za-z0-9]{0,8}" + re.escape(term) + r"[\u4e00-\u9fffA-Za-z0-9]{0,8})", clause))
+            if matches:
+                state_parts.extend(matches)
+    state = "；".join(dict.fromkeys(item.strip() for item in state_parts if item.strip()))
+    if state and character_name and character_name in state:
+        state = state.replace(character_name, "").strip("； ")
+    return stable, state
+
+
+def find_mutually_exclusive_character_states(script: ScriptBreakdown, character_name: str) -> list[dict]:
+    """Report generic cross-shot appearance conflicts for one visible character."""
+    groups = {
+        "hair_length": (("长发", "中长发"), ("短发",)),
+        "hair_texture": (("卷发", "卷曲"), ("直发",)),
+    }
+    found: list[dict] = []
+    for family, alternatives in groups.items():
+        matched: dict[str, list[int]] = {}
+        for scene in getattr(script, "scenes", []) or []:
+            text = " ".join([
+                str(getattr(scene, "action_description", "") or ""),
+                *[str(getattr(line, "line", "") or "") for line in getattr(scene, "dialogue", []) or []],
+            ])
+            if character_name and character_name not in text and character_name not in (getattr(scene, "characters", []) or []):
+                continue
+            for index, group in enumerate(alternatives):
+                if any(token in text for token in group):
+                    matched.setdefault(str(index), []).append(scene.scene_id)
+        if len(matched) > 1:
+            found.append({
+                "character_name": character_name,
+                "category": family,
+                "scene_ids_by_state": matched,
+            })
+    return found
+
+
 def _stable_character_identity_description(description: str) -> str:
     """Keep stable identity facts separate from mutable plot-state appearance."""
     text = re.sub(r"\s+", " ", str(description or "")).strip("。；; ")
     if not text:
         return ""
+    state_note = "发型、服装等剧情变化以本镜角色状态为准"
+    text = text.replace(state_note, "")
     clauses = [
         re.sub(r"\s+", " ", clause).strip(" ，,、")
         for clause in re.split(r"[。；;，,、\n]+", text)
@@ -616,6 +681,7 @@ COMPACT_SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提�
 - 差异字段保持短小：subject_state、environment_delta、camera_motion、lighting_delta、prop_state 各不超过 80 个汉字，action_timeline 不超过 180 个汉字，negative_prompt 不超过 100 个汉字；每个字段最多两句。
 - 不得新增剧本或资产清单中不存在的角色、地点、道具或剧情事件。
 - 角色外貌描述必须是可直接交给图片模型的完整稳定锚点，每个实际出镜角色写成约 80-180 个汉字，至少覆盖：性别与年龄段、身高或体型、脸型与肤色、眉眼鼻唇等面部特征、发型与发色、服装款式/主色/材质、配饰和一项可辨识标志。剧本没有明确的外貌字段时，可以依据人物身份、情绪和项目风格补充一套克制且稳定的设计，但不得使用“外貌以剧本为准”“未提供外貌”等占位语，也不得把动作、地点、道具或其他角色的特征写进来。 同一角色在所有镜头的外貌描述必须逐字复用同一组锚点，不得改写、缩写或混入其他角色的特征。每个镜头只描述实际出镜角色，绝不把仅配音角色写入画面。
+- 全局角色描述只写跨镜稳定身份；会随剧情改变的发型、服装、妆容、伤口、湿身和伪装不得写入全局稳定锚点。此类变化只能写入对应镜头的角色状态或资产绑定状态，不得把不同时间段的互斥外观合并。
 - 动作时间轴需按镜头时长清晰描述，每个时间戳段落必须同时写出镜头运动与主体动作（禁止只写其一，只写一样模型会自由发挥）；一镜可以推进多个按顺序发生的动作节拍，必须完整保留当前镜头明确的动作链；负面约束使用中文短语并按具体错误品类写（如“人物凭空消失”“道具变形”“服装变色”），不要只写抽象否定。
 - 所有字段使用中文，保持同一地点的空间、陈设、时间天气和主光方向连续。
 - environment_delta 只能写本镜头静态/持续的环境事实（建筑结构、固定陈设、天气、时间、地形、空间关系、整体光线氛围）。严禁写入人物的动作、情绪、心理状态、对白、人物在场、道具交互或剧情结果。若无静态环境差异，environment_delta 必须留空字符串。 也禁止写入本镜头尚未发生的未来状态或属于后续镜头的事件（例如道具被撞倒、暗道开启等提前出现）。
@@ -1187,7 +1253,28 @@ class VisualPromptAgent:
                 and character_profile_missing_fields(chinese.get(character.name, ""))
             }
 
-        output = await request_profiles(user_prompt)
+        def asset_anchor_fallback() -> tuple[dict[str, str], dict[str, str]] | None:
+            visible = [
+                character
+                for character in (script.asset_manifest.characters if script.asset_manifest else [])
+                if character.appearance_mode == "on_screen"
+            ]
+            if not visible or any(not str(character.description or "").strip() for character in visible):
+                return None
+            return (
+                self._canonical_character_registry({}, script, english=True),
+                self._canonical_character_registry({}, script, english=False),
+            )
+
+        try:
+            output = await request_profiles(user_prompt)
+        except Exception:
+            fallback = asset_anchor_fallback()
+            if fallback is None:
+                self.character_profile_repair_status = "failed"
+                raise
+            self.character_profile_repair_status = "partial"
+            return fallback
         english, chinese = canonicalize(output)
         errors = validation_errors(chinese)
         if errors:
@@ -1240,8 +1327,11 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             repaired_entries = await asyncio.gather(*(
                 repair_one(name, fields)
                 for name, fields in errors.items()
-            ))
-            for name, english_description, chinese_description in repaired_entries:
+            ), return_exceptions=True)
+            for entry in repaired_entries:
+                if isinstance(entry, Exception):
+                    continue
+                name, english_description, chinese_description = entry
                 english[name] = english_description
                 chinese[name] = chinese_description
             errors = validation_errors(chinese)
@@ -1348,6 +1438,16 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         creative_profile=None,
     ) -> tuple[VisualDesign, GenerationPrompts]:
         """Split the combined LLM output into VisualDesign and GenerationPrompts."""
+
+        # Canonicalize stable identity registries before any provider prompt is
+        # assembled. Otherwise the saved visual registry may be cleaned after
+        # the prompt already captured a contradictory mutable state.
+        output.global_character_descriptions = self._canonical_character_registry(
+            output.global_character_descriptions or {}, script, english=True
+        )
+        output.global_character_descriptions_cn = self._canonical_character_registry(
+            output.global_character_descriptions_cn or {}, script, english=False
+        )
 
         # Build VisualDesign
         scene_visuals = []
@@ -1551,10 +1651,19 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         ]
         if visible_names:
             appearances = []
+            scene_states: list[str] = []
             for name in visible_names:
                 description = character_registry.get(name) or getattr(characters_by_name.get(name), "description", "")
-                appearances.append(f"{name}：{description}" if description else name)
+                stable_description, inferred_state = split_character_identity_and_state(
+                    name, description, getattr(binding, "visible_state_notes", "") if binding else "",
+                    getattr(scene, "action_description", ""),
+                )
+                appearances.append(f"{name}：{stable_description}" if stable_description else name)
+                if inferred_state:
+                    scene_states.append(f"{name}：{inferred_state}")
             parts.insert(1, f"【出镜角色与身份锚点】{'；'.join(appearances)}。")
+            if scene_states and not (binding and binding.visible_state_notes):
+                parts.insert(2, f"【角色状态】{'；'.join(scene_states)}。")
         if binding and binding.visible_state_notes:
             parts.insert(2, f"【角色状态】{binding.visible_state_notes}。")
         bound_props = props_for_scene(script, scene.scene_id)
