@@ -1,3 +1,4 @@
+import pytest
 from src.schemas.script import Scene, ScriptBreakdown, VisualAssetManifest, VisualCharacterAsset
 from src.schemas.prompt import GenerationPrompts, ShotPrompt
 from src.schemas.visual import SceneVisual, VisualDesign
@@ -8,7 +9,7 @@ from src.api.context import (
     _state_from_json,
     _state_to_json,
 )
-from src.agents.visual_prompt_agent import VisualPromptAgent
+from src.agents.visual_prompt_agent import VisualPromptAgent, _CharacterRegistryOutput, _stable_character_identity_description
 from src.utils.visual_asset_manifest import (
     _character_facts_from_scenes,
     character_profile_missing_fields,
@@ -464,3 +465,43 @@ def test_project_load_recovers_character_profile_from_saved_script_draft():
     for fact in ("二十六岁", "纤细", "脸型偏圆", "肤色白皙", "黑色中长发", "米白色棉质长风衣", "左眼下"):
         assert fact in description
     assert "剧本未提供额外稳定外观细节" not in description
+
+
+
+def test_character_identity_separates_mutually_exclusive_hair_states():
+    profile = "成年女性；身形修长；椭圆脸肤色白皙；黑色长发；剧情后剪成短发；米白色风衣"
+
+    stable = _stable_character_identity_description(profile)
+
+    assert "长发" not in stable
+    assert "短发" not in stable
+    assert "身形修长" in stable
+    assert "米白色风衣" in stable
+    assert "本镜角色状态" in stable
+
+
+@pytest.mark.asyncio
+async def test_character_reextract_keeps_asset_anchor_when_repair_remains_incomplete():
+    script = ScriptBreakdown(
+        title="侧写降级", genre="悬疑", logline="测试", duration_sec=3,
+        narration_style="无旁白",
+        scenes=[_scene(1, "苏眠站在屋檐下。", ["苏眠"])],
+        asset_manifest=VisualAssetManifest(
+            characters=[VisualCharacterAsset(
+                asset_id="char_su_mian", name="苏眠", appearance_mode="on_screen",
+                description="苏眠：米白色长风衣。",
+            )],
+        ),
+    )
+
+    class _AlwaysIncompleteLLM:
+        async def generate_structured(self, **kwargs):
+            return _CharacterRegistryOutput()
+
+    agent = VisualPromptAgent(api_provider="mock")
+    agent.llm = _AlwaysIncompleteLLM()
+
+    _english, chinese = await agent.reextract_visible_characters(script)
+
+    assert chinese["苏眠"] == "苏眠：米白色长风衣。"
+    assert agent.character_profile_repair_status == "partial"

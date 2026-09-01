@@ -111,6 +111,55 @@ def build_shot_environment_context(script, scene_id: int, environment_delta: str
     return _build_shot_environment_context_with_drops(script, scene_id, environment_delta)[0]
 
 
+_CHARACTER_MUTABLE_STATE_CUES = (
+    "后来", "之后", "此前", "先是", "改成", "换成", "换上", "脱下", "剪成", "剃成",
+    "摘下", "戴上", "伪装", "伪装成", "湿透", "沾满", "破损", "撕裂", "恢复", "变回",
+)
+_CHARACTER_STATE_ALTERNATIVES = (
+    ("hair_length", ("长发", "中长发"), ("短发",)),
+    ("hair_texture", ("卷发", "卷曲"), ("直发", "直发")),
+)
+
+
+def _stable_character_identity_description(description: str) -> str:
+    """Keep stable identity facts separate from mutable plot-state appearance."""
+    text = re.sub(r"\s+", " ", str(description or "")).strip("。；; ")
+    if not text:
+        return ""
+    clauses = [
+        re.sub(r"\s+", " ", clause).strip(" ，,、")
+        for clause in re.split(r"[。；;，,、\n]+", text)
+        if clause.strip()
+    ]
+    if not clauses:
+        return text
+    dropped: list[str] = []
+    kept: list[str] = []
+    for clause in clauses:
+        if any(cue in clause for cue in _CHARACTER_MUTABLE_STATE_CUES):
+            dropped.append(clause)
+            continue
+        kept.append(clause)
+    for _family, *alternatives in _CHARACTER_STATE_ALTERNATIVES:
+        matched = [
+            group for group in alternatives
+            if any(any(token in clause for token in group) for clause in clauses)
+        ]
+        if len(matched) > 1:
+            for clause in list(kept):
+                if any(any(token in clause for token in group) for group in alternatives):
+                    kept.remove(clause)
+                    dropped.append(clause)
+    if not dropped:
+        return description
+    if not kept:
+        # Do not erase the only available identity when a model returned one
+        # mixed sentence; preserve it and make the state precedence explicit.
+        return text + "；发型、服装等剧情变化以本镜角色状态为准"
+    note = "发型、服装等剧情变化以本镜角色状态为准"
+    return "；".join(dict.fromkeys(kept + [note]))
+
+
 def _current_prop_anchor(name: str, description: str) -> str:
     """Keep reusable prop identity without leaking future plot states into early shots."""
     text = re.sub(r"\s+", " ", str(description or "")).strip("。；; ")
@@ -629,6 +678,7 @@ class VisualPromptAgent:
     def __init__(self, api_provider: str | None = None):
         self.llm = get_llm_client()
         self.api_provider = api_provider or DEFAULT_API
+        self.character_profile_repair_status = "not_started"
 
     async def run(
         self,
@@ -1077,6 +1127,7 @@ class VisualPromptAgent:
         source_text: str = "",
     ) -> tuple[dict[str, str], dict[str, str]]:
         """Refresh only visible-role appearance registries without rewriting shot prompts."""
+        self.character_profile_repair_status = "generating"
         manifest_text = self._format_manifest(script)
         scenes_text = self._format_scenes(script)
         source_section = (
@@ -1195,11 +1246,34 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 chinese[name] = chinese_description
             errors = validation_errors(chinese)
         if errors:
-            error_text = "；".join(
-                f"{name}缺少{'、'.join(fields)}"
-                for name, fields in errors.items()
-            )
-            raise ValueError(f"人物侧写不完整：{error_text}")
+            visible_characters = {
+                character.name: character
+                for character in (script.asset_manifest.characters if script.asset_manifest else [])
+                if character.appearance_mode == "on_screen"
+            }
+            unresolved_without_identity: list[str] = []
+            for name in errors:
+                character = visible_characters.get(name)
+                asset_description = str(getattr(character, "description", "") or "").strip()
+                current_description = str(chinese.get(name, "") or "").strip()
+                if asset_description or current_description:
+                    # An asset-authored or model-authored visual anchor is enough
+                    # to continue. Keep it, surface partial status, and avoid
+                    # turning a recoverable quality defect into a hard failure.
+                    chinese[name] = asset_description or current_description
+                    english.setdefault(name, getattr(character, "description", "") or name)
+                else:
+                    unresolved_without_identity.append(name)
+            if unresolved_without_identity:
+                self.character_profile_repair_status = "failed"
+                error_text = "；".join(
+                    f"{name}缺少{'、'.join(errors[name])}"
+                    for name in unresolved_without_identity
+                )
+                raise ValueError(f"人物侧写不完整：{error_text}")
+            self.character_profile_repair_status = "partial"
+            return english, chinese
+        self.character_profile_repair_status = "complete"
         return english, chinese
 
     def _registry_needs_profile_repair(
@@ -1553,6 +1627,7 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                     description,
                     script.scenes,
                 )
+                description = _stable_character_identity_description(description)
             canonical[character.name] = description
         return canonical
 
