@@ -545,3 +545,30 @@ def test_character_profile_repair_result_exposes_status_and_legacy_unpacking():
     assert result.status == "partial"
     assert english["角色A"] == "stable"
     assert chinese["角色A"] == "稳定"
+
+
+@pytest.mark.asyncio
+async def test_character_reextract_preserves_existing_profile_on_repair_failure():
+    script = ScriptBreakdown(
+        title="\u4fdd\u7559\u5b8c\u6574\u4fa7\u5199", genre="\u60ac\u7591", logline="\u6d4b\u8bd5", duration_sec=3, narration_style="\u65e0\u65c1\u767d",
+        scenes=[_scene(1, "\u82cf\u7720\u7ad9\u5728\u5c4b\u6a90\u4e0b\u3002", ["\u82cf\u7720"])],
+        asset_manifest=VisualAssetManifest(characters=[VisualCharacterAsset(
+            asset_id="char_su_mian", name="\u82cf\u7720", appearance_mode="on_screen", description="\u82cf\u7720\uff1a\u77ed\u8d44\u4ea7\u951a\u70b9\u3002",
+        )]),
+    )
+    complete = "\u82cf\u7720\uff1a\u6210\u5e74\u5973\u6027\uff0c\u4e8c\u5341\u516d\u5c81\uff0c\u8eab\u6750\u7ea4\u7ec6\uff0c\u5706\u8138\u767d\u7684\uff0c\u9ed1\u8272\u76f4\u53d1\uff0c\u7a7f\u7c73\u767d\u8272\u68c9\u8d28\u98ce\u8863\uff0c\u5de6\u773c\u4e0b\u6709\u5c0f\u75e3\u3002"
+
+    class _RepairFailsLLM:
+        def __init__(self): self.calls = 0
+        async def generate_structured(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _CharacterRegistryOutput(global_character_descriptions_cn={"\u82cf\u7720": complete})
+            raise RuntimeError("repair failed")
+
+    agent = VisualPromptAgent(api_provider="mock")
+    agent.llm = _RepairFailsLLM()
+    result = await agent.reextract_visible_characters(script)
+    assert result.status == "partial"
+    assert result.chinese["\u82cf\u7720"] == complete
+    assert any("repair failed" in error for error in result.errors)

@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from src.schemas.prompt import GenerationPrompts
 from src.schemas.script import ScriptBreakdown
+from src.services.prompt_fidelity_audit import audit_prompt_fidelity
 
 _DYNAMIC_ENVIRONMENT_CUES = (
     "走到", "走向", "走进", "走出", "窜过", "溅出", "落泪", "抬头", "望向", "视线",
@@ -110,6 +111,7 @@ def audit_storyboard_quality(script: ScriptBreakdown, prompts: GenerationPrompts
 
     missing_ids = sorted(set(scenes) - set(shots))
     duplicate_ids = len(prompts.shots) - len(shots)
+    fidelity = audit_prompt_fidelity(script, prompts)
     return {
         "scene_count": len(scenes),
         "shot_count": len(prompts.shots),
@@ -127,6 +129,7 @@ def audit_storyboard_quality(script: ScriptBreakdown, prompts: GenerationPrompts
         "missing_scene_ids": missing_ids,
         "duplicate_shot_ids": duplicate_ids,
         "evidence": evidence,
+        "fidelity": fidelity.model_dump(),
     }
 
 

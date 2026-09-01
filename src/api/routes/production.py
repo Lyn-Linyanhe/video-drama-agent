@@ -93,14 +93,25 @@ async def reextract_project_characters(project_id: str):
         source_text = state.script_draft_text or (
             state.user_input if state.input_mode == "script" else ""
         )
-        english, chinese = await visual_prompt_agent.reextract_visible_characters(
+        repair_result = await visual_prompt_agent.reextract_visible_characters(
             state.script,
             source_text=source_text,
         )
+        if hasattr(repair_result, "english"):
+            english = repair_result.english
+            chinese = repair_result.chinese
+            repair_status = repair_result.status
+            repair_errors = list(repair_result.errors or [])
+        else:
+            english, chinese = repair_result
+            repair_status = "legacy"
+            repair_errors = []
     except Exception as exc:
         raise HTTPException(502, f"Character extraction failed: {exc}") from exc
     state.visual_design.global_character_descriptions = english
     state.visual_design.global_character_descriptions_cn = chinese
+    state.visual_design.profile_repair_status = repair_status
+    state.visual_design.profile_repair_errors = repair_errors
     project_store.set_visual_design(project_id, state.visual_design.model_dump())
     _save_project_state(state)
     return {

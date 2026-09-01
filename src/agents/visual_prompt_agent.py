@@ -19,6 +19,7 @@ from src.utils.visual_asset_manifest import (
     visual_character_names,
 )
 from src.services.timed_prompt_composer import apply_timed_prompt_structure
+from src.services.shot_capacity import analyze_shot_capacity
 from src.config import DEFAULT_API
 
 
@@ -130,21 +131,58 @@ _CHARACTER_STATE_TERMS = (
 )
 
 
+def _character_scoped_clauses(
+    text: str,
+    character_name: str,
+    character_names: tuple[str, ...] | list[str] = (),
+) -> list[str]:
+    """Return only clauses that can be attributed to one named character.
+
+    For a single-character shot, un-named clauses remain usable. For a multi-character
+    shot, an appearance clause without an explicit subject is deliberately ignored rather
+    than copied to every role.
+    """
+    normalized = str(text or "")
+    names = [str(name).strip() for name in character_names if str(name).strip()]
+    if character_name and character_name not in names:
+        names.append(character_name)
+    names = list(dict.fromkeys(names))
+    clauses: list[str] = []
+    for raw in re.split(r"[。；;，,、\n]+", normalized):
+        clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
+        if not clause:
+            continue
+        present = [name for name in names if name and name in clause]
+        if character_name in present:
+            if len(present) == 1:
+                clauses.append(clause)
+            else:
+                # Handle compact clauses such as “甲穿红衣，乙穿蓝衣” after
+                # punctuation normalization or model-generated name runs.
+                pattern = r"(?=(?:" + "|".join(re.escape(name) for name in names) + r"))"
+                fragments = [part.strip(" ，,、") for part in re.split(pattern, clause) if part.strip(" ，,、")]
+                clauses.extend(fragment for fragment in fragments if character_name in fragment and not any(
+                    other != character_name and other in fragment for other in names
+                ))
+        elif len(names) <= 1:
+            clauses.append(clause)
+    return clauses
+
+
 def split_character_identity_and_state(
     character_name: str,
     stable_profile: str,
     scene_state_notes: str,
     scene_text: str,
+    character_names: tuple[str, ...] | list[str] = (),
 ) -> tuple[str, str]:
     """Separate reusable identity from explicitly supported per-shot appearance state."""
     stable = _stable_character_identity_description(stable_profile)
     state_parts: list[str] = []
     for value in (scene_state_notes, scene_text):
-        for clause in re.split(r"[。；;，,、\n]+", str(value or "")):
-            clause = re.sub(r"\s+", " ", clause).strip(" ，,、")
-            if not clause or not any(term in clause for term in _CHARACTER_STATE_TERMS):
+        for clause in _character_scoped_clauses(value, character_name, character_names):
+            if not any(term in clause for term in _CHARACTER_STATE_TERMS):
                 continue
-            # Keep only the local appearance/state fragment, not the whole action.
             matches = []
             for term in _CHARACTER_STATE_TERMS:
                 matches.extend(re.findall(r"(?:[\u4e00-\u9fffA-Za-z0-9]{0,8}" + re.escape(term) + r"[\u4e00-\u9fffA-Za-z0-9]{0,8})", clause))
@@ -166,12 +204,15 @@ def find_mutually_exclusive_character_states(script: ScriptBreakdown, character_
     for family, alternatives in groups.items():
         matched: dict[str, list[int]] = {}
         for scene in getattr(script, "scenes", []) or []:
-            text = " ".join([
-                str(getattr(scene, "action_description", "") or ""),
-                *[str(getattr(line, "line", "") or "") for line in getattr(scene, "dialogue", []) or []],
-            ])
-            if character_name and character_name not in text and character_name not in (getattr(scene, "characters", []) or []):
-                continue
+            names = tuple(str(name).strip() for name in (getattr(scene, "characters", []) or []) if str(name).strip())
+            text = "；".join(_character_scoped_clauses(
+                " ".join([
+                    str(getattr(scene, "action_description", "") or ""),
+                    *[str(getattr(line, "line", "") or "") for line in getattr(scene, "dialogue", []) or []],
+                ]),
+                character_name,
+                names,
+            ))
             for index, group in enumerate(alternatives):
                 if any(token in text for token in group):
                     matched.setdefault(str(index), []).append(scene.scene_id)
@@ -185,7 +226,7 @@ def find_mutually_exclusive_character_states(script: ScriptBreakdown, character_
 
 
 
-def _remove_conflicting_character_state_terms(description: str, script: ScriptBreakdown, character_name: str) -> str:
+def _remove_conflicting_character_state_terms(description: str, script: ScriptBreakdown, character_name: str, *, english: bool = False) -> str:
     """Remove only appearance families proven mutable across this character's scenes."""
     text = str(description or "")
     conflicts = {item.get("category") for item in find_mutually_exclusive_character_states(script, character_name)}
@@ -193,7 +234,14 @@ def _remove_conflicting_character_state_terms(description: str, script: ScriptBr
         text = re.sub(r"(?:黑色|棕色|褐色|深褐色|浅色|金色)?(?:中长|长|短)发", "", text)
     if "hair_texture" in conflicts:
         text = re.sub(r"(?:自然)?(?:卷曲|卷发|直发)", "", text)
-    text = re.sub(r"[；，,、]{2,}", "；", text).strip("； ，,、")
+    if english:
+        if "hair_length" in conflicts:
+            text = re.sub(r"(?i)\b(?:long|medium[- ]length|short)\s+hair\b", "", text)
+        if "hair_texture" in conflicts:
+            text = re.sub(r"(?i)\b(?:curly|straight)\s+hair\b", "", text)
+        text = re.sub(r"\s{2,}", " ", text).strip(" ,;")
+    else:
+        text = re.sub(r"[；，,、]{2,}", "；", text).strip("； ，,、")
     return text
 
 
@@ -868,6 +916,7 @@ class VisualPromptAgent:
 - environment_delta 只允许静态环境差异，禁止写入人物动作、情绪、在场或道具交互；没有静态差异时留空。"""
 
         profile_repair_status = "not_needed"
+        profile_repair_errors: list[str] = []
         output = await self.llm.generate_structured(
             system_prompt=COMPACT_SYSTEM_PROMPT,
             user_prompt=user_prompt,
@@ -887,13 +936,16 @@ class VisualPromptAgent:
             )
             repaired_en, repaired_cn = repair_result
             profile_repair_status = repair_result.status
+            profile_repair_errors = list(repair_result.errors or [])
             output.global_character_descriptions = repaired_en
             output.global_character_descriptions_cn = repaired_cn
         result = self._split_output(output, script, prompt_overrides, creative_profile)
         if hasattr(result[0], "profile_repair_status"):
             result[0].profile_repair_status = profile_repair_status
+            result[0].profile_repair_errors = profile_repair_errors
         if telemetry is not None:
             telemetry["character_profile_repair_status"] = profile_repair_status
+            telemetry["character_profile_repair_errors"] = profile_repair_errors
         return result
 
     async def _generate_global_visual(self, script, manifest_text, profile, telemetry):
@@ -1279,14 +1331,20 @@ class VisualPromptAgent:
 
         def validation_errors(chinese: dict[str, str]) -> dict[str, list[str]]:
             manifest = script.asset_manifest
-            if not manifest:
-                return {}
-            return {
-                character.name: character_profile_missing_fields(chinese.get(character.name, ""))
-                for character in manifest.characters
-                if character.appearance_mode == "on_screen"
-                and character_profile_missing_fields(chinese.get(character.name, ""))
-            }
+            if manifest:
+                names = [character.name for character in manifest.characters if character.appearance_mode == "on_screen"]
+                return {
+                    name: character_profile_missing_fields(chinese.get(name, ""))
+                    for name in names
+                    if character_profile_missing_fields(chinese.get(name, ""))
+                }
+            names = list(dict.fromkeys(
+                str(name).strip()
+                for scene in getattr(script, "scenes", []) or []
+                for name in (getattr(scene, "characters", []) or [])
+                if str(name).strip()
+            ))
+            return {name: ["缺少可用身份锚点"] for name in names if not str(chinese.get(name, "") or "").strip()}
 
         def asset_anchor_fallback() -> tuple[dict[str, str], dict[str, str]] | None:
             visible = [
@@ -1364,13 +1422,19 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 repair_one(name, fields)
                 for name, fields in errors.items()
             ), return_exceptions=True)
+            repair_errors: list[str] = []
             for entry in repaired_entries:
                 if isinstance(entry, Exception):
+                    repair_errors.append(str(entry))
                     continue
                 name, english_description, chinese_description = entry
-                english[name] = english_description
-                chinese[name] = chinese_description
+                if english_description:
+                    english[name] = english_description
+                if chinese_description:
+                    chinese[name] = chinese_description
             errors = validation_errors(chinese)
+        else:
+            repair_errors = []
         if errors:
             visible_characters = {
                 character.name: character
@@ -1383,11 +1447,10 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 asset_description = str(getattr(character, "description", "") or "").strip()
                 current_description = str(chinese.get(name, "") or "").strip()
                 if asset_description or current_description:
-                    # An asset-authored or model-authored visual anchor is enough
-                    # to continue. Keep it, surface partial status, and avoid
-                    # turning a recoverable quality defect into a hard failure.
-                    chinese[name] = asset_description or current_description
-                    english.setdefault(name, getattr(character, "description", "") or name)
+                    # Preserve the richer existing model profile; use the asset only
+                    # when the model returned no usable identity at all.
+                    chinese[name] = current_description or asset_description
+                    english[name] = str(english.get(name) or getattr(character, "description", "") or name).strip()
                 else:
                     unresolved_without_identity.append(name)
             if unresolved_without_identity:
@@ -1398,7 +1461,7 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 )
                 raise ValueError(f"人物侧写不完整：{error_text}")
             self.character_profile_repair_status = "partial"
-            return CharacterProfileRepairResult(english=english, chinese=chinese, status="partial", errors=[f"{name}：{'、'.join(fields)}" for name, fields in errors.items()])
+            return CharacterProfileRepairResult(english=english, chinese=chinese, status="partial", errors=repair_errors + [f"{name}：{'、'.join(fields)}" for name, fields in errors.items()])
         self.character_profile_repair_status = "complete"
         return CharacterProfileRepairResult(english=english, chinese=chinese, status="repaired" if had_validation_errors else "clean", errors=[])
 
@@ -1408,14 +1471,24 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         script: ScriptBreakdown,
     ) -> bool:
         manifest = script.asset_manifest
-        if not manifest:
+        if manifest:
+            names = [character.name for character in manifest.characters if character.appearance_mode == "on_screen"]
+        else:
+            names = list(dict.fromkeys(
+                str(name).strip()
+                for scene in getattr(script, "scenes", []) or []
+                for name in (getattr(scene, "characters", []) or [])
+                if str(name).strip()
+            ))
+        if not names:
             return False
         canonical = self._canonical_character_registry(registry or {}, script, english=False)
-        return any(
-            character_profile_missing_fields(canonical.get(character.name, ""))
-            for character in manifest.characters
-            if character.appearance_mode == "on_screen"
-        )
+        if not manifest:
+            # Legacy/no-manifest projects have no authoritative asset description
+            # against which to validate all profile slots; require an identity anchor
+            # for every visible role, but do not invent a completeness failure.
+            return any(not str(canonical.get(name, "") or "").strip() for name in names)
+        return any(character_profile_missing_fields(canonical.get(name, "")) for name in names)
 
     def _format_scenes(self, script: ScriptBreakdown) -> str:
         lines = []
@@ -1578,9 +1651,8 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         allowed_global_names = visual_character_names(script)
         global_en = output.global_character_descriptions or {}
         global_cn = output.global_character_descriptions_cn or {}
-        if script.asset_manifest:
-            global_en = self._canonical_character_registry(global_en, script, english=True)
-            global_cn = self._canonical_character_registry(global_cn, script, english=False)
+        global_en = self._canonical_character_registry(global_en, script, english=True)
+        global_cn = self._canonical_character_registry(global_cn, script, english=False)
 
         visual = VisualDesign(
             overall_style=getattr(creative_profile, "art_style", "") or output.overall_style,
@@ -1637,6 +1709,13 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                     target.prompt = target.prompt.rstrip() + "\n" + segment
             prev_delta = delta_by_scene.get(scene.scene_id, prev_delta)
 
+        prompts.capacity_diagnostics = [
+            analyze_shot_capacity(
+                scene,
+                next((item for item in prompts.shots if item.scene_id == scene.scene_id), None),
+            )
+            for scene in script.scenes
+        ]
         return visual, prompts
 
     @staticmethod
@@ -1754,9 +1833,10 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 if str(name or "").strip()
             }
             for name, value in (registry or {}).items():
-                cleaned = _stable_character_identity_description(value) if not english else value
-                if not english and name in scene_names:
-                    cleaned = _remove_conflicting_character_state_terms(cleaned, script, name)
+                if name not in scene_names:
+                    continue
+                cleaned = _stable_character_identity_description(value) if not english else str(value or "").strip()
+                cleaned = _remove_conflicting_character_state_terms(cleaned, script, name, english=english)
                 result[name] = cleaned
             return result
         entries = list(registry.items())
@@ -1785,7 +1865,7 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                     script.scenes,
                 )
                 description = _stable_character_identity_description(description)
-                description = _remove_conflicting_character_state_terms(description, script, character.name)
+            description = _remove_conflicting_character_state_terms(description, script, character.name, english=english)
             canonical[character.name] = description
         return canonical
 

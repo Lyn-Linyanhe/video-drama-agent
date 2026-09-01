@@ -45,6 +45,23 @@ class PromptAssemblyDiagnostic(BaseModel):
     status: Literal["clean", "warning", "failed"] = "clean"
 
 
+class ShotCapacityDiagnostic(BaseModel):
+    """Advisory diagnosis for whether one shot can carry its source facts."""
+
+    scene_id: int
+    status: Literal["clean", "warning", "failed"] = "clean"
+    action_units: int = 0
+    dialogue_chars: int = 0
+    prop_state_changes: int = 0
+    camera_changes: int = 0
+    scene_duration_sec: int = 0
+    effective_duration_sec: int = 0
+    provider_max_duration_sec: int | None = None
+    suggested_shot_count: int = 1
+    suggested_duration_sec: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
 class GenerationPrompts(BaseModel):
     """Collection of generation prompts for the entire drama."""
     api_provider: str = Field(description="Target API: kling, runway, pika, mock")
@@ -61,4 +78,8 @@ class GenerationPrompts(BaseModel):
     assembly_diagnostics: list[PromptAssemblyDiagnostic] = Field(
         default_factory=list,
         description="Deterministic diagnostics from final prompt assembly; optional for legacy projects",
+    )
+    capacity_diagnostics: list[ShotCapacityDiagnostic] = Field(
+        default_factory=list,
+        description="Advisory per-shot content capacity diagnostics; optional for legacy projects",
     )

@@ -22,7 +22,7 @@ from src.schemas.script import (
     VisualAssetManifest,
     VisualCharacterAsset,
 )
-from src.schemas.visual import VisualDesign
+from src.schemas.visual import CharacterProfileRepairResult, VisualDesign
 from src.agents.visual_prompt_agent import (
     _CharacterRegistryOutput,
     VisualPromptAgent,
@@ -842,3 +842,30 @@ async def test_repeat_visualize_replaces_previous_run_records(monkeypatch):
     by_id = {r.get("scene_id"): r for r in scenes}
     assert by_id[1]["elapsed_ms"] == 222
     assert by_id[2]["elapsed_ms"] == 333
+
+
+
+@pytest.mark.asyncio
+async def test_character_reextract_endpoint_persists_repair_metadata(monkeypatch):
+    state = DramaState(
+        project_id="m" * 12, input_mode="script", script_draft_text="\u539f\u59cb\u5267\u672c", script=_script("\u6d4b\u8bd5"),
+        visual_design=VisualDesign(overall_style="\u5199\u5b9e", color_palette="\u51b7\u8272", scenes=[]),
+    )
+    state.script.asset_manifest = VisualAssetManifest(characters=[VisualCharacterAsset(
+        asset_id="char_lin", name="\u6797\u6f88", appearance_mode="on_screen", description="\u6797\u6f88\uff1a\u6df1\u8272\u5916\u5957\u3002",
+    )])
+
+    async def fake_reextract(*_args, **_kwargs):
+        return CharacterProfileRepairResult(
+            english={"\u6797\u6f88": "profile"}, chinese={"\u6797\u6f88": "\u5b8c\u6574\u4eba\u7269\u4fa7\u5199"},
+            status="partial", errors=["\u7f3a\u5c11\u53d1\u578b"],
+        )
+
+    monkeypatch.setattr(production, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production.project_store, "set_visual_design", lambda *_args: None)
+    monkeypatch.setattr(production.visual_prompt_agent, "reextract_visible_characters", fake_reextract)
+
+    await production.reextract_project_characters(state.project_id)
+    assert state.visual_design.profile_repair_status == "partial"
+    assert state.visual_design.profile_repair_errors == ["\u7f3a\u5c11\u53d1\u578b"]

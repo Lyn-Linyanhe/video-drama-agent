@@ -50,3 +50,4 @@ class VisualDesign(BaseModel):
     )
     scenes: list[SceneVisual] = Field(description="Visual design per scene")
     profile_repair_status: str | None = Field(default=None, description="Character profile repair status")
+    profile_repair_errors: list[str] = Field(default_factory=list, description="Character profile repair diagnostics")
