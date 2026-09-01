@@ -31,11 +31,17 @@ def _count_prop_changes(text: str) -> int:
 
 
 def _count_camera_changes(scene: Scene, prompt: ShotPrompt | None) -> int:
-    text = " ".join([
-        str(getattr(scene, "camera_direction", "") or ""),
-        str(getattr(prompt, "prompt", "") or "") if prompt else "",
-    ])
-    return len(_CAMERA_CUE_RE.findall(text))
+    # Only inspect the source camera field and the dedicated camera section.
+    # Project-wide style prose often contains words such as “推镜/拉远”;
+    # counting those would inflate every shot and make the warning useless.
+    camera_text = str(getattr(scene, "camera_direction", "") or "")
+    if prompt:
+        match = re.search(r"【镜头语言】(.*?)(?=\n【|$)", str(getattr(prompt, "prompt", "") or ""), re.S)
+        if match:
+            camera_text += " " + match.group(1)
+    cues = list(dict.fromkeys(_CAMERA_CUE_RE.findall(camera_text)))
+    return len(cues)
+
 
 
 def analyze_shot_capacity(

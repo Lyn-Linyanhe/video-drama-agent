@@ -51,3 +51,18 @@ def test_capacity_diagnostic_reports_provider_cap_as_warning():
     assert diagnostic.effective_duration_sec == 10
     assert diagnostic.status == "warning"
     assert any("上限" in item for item in diagnostic.warnings)
+
+
+
+def test_capacity_diagnostic_does_not_count_global_prompt_camera_noise():
+    scene = _scene(duration=8, action="角色A站立")
+    scene.camera_direction = "中景"
+    scene.dialogue = []
+    prompt = ShotPrompt(
+        scene_id=1,
+        duration_sec=8,
+        prompt="【项目视觉】电影镜头、推镜、拉远、摇镜、跟拍、反打\n【镜头语言】中景固定",
+    )
+    diagnostic = analyze_shot_capacity(scene, prompt)
+    assert diagnostic.camera_changes == 1
+    assert diagnostic.status == "clean"
