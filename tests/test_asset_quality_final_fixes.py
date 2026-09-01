@@ -182,6 +182,83 @@ def test_image_history_lists_failed_candidates_without_an_active_asset(tmp_path,
     assert missing_candidate["file_available"] is False
 
 
+def test_accept_candidate_creates_missing_asset_record(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    versions = ImageAssetVersions(api_context.project_store.get_project_dir(project_id))
+    source = _detailed_png(tmp_path / "failed-candidate.png")
+    candidate_id, _ = versions.add_candidate_file(
+        "prop",
+        "old_key",
+        "front",
+        source,
+        "failed candidate prompt",
+        "prop_master_attempt",
+        metadata={"review_decision": "failed_after_retry"},
+    )
+
+    accepted = client.post(
+        f"/api/projects/{project_id}/image-history/candidate/accept",
+        json={
+            "asset_type": "prop",
+            "asset_id": "old_key",
+            "view_type": "front",
+            "version_id": candidate_id,
+        },
+    )
+
+    assert accepted.status_code == 200
+    active = next(item for item in accepted.json()["history"] if item.get("active"))
+    assert active["id"] == candidate_id
+    state = api_context._load_project_state(project_id)
+    assert any(item.prop_id == "old_key" and item.view_type == "front" for item in state.prop_images.props)
+
+
+def test_accept_scene_group_candidate_creates_missing_view_assets(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    state = api_context._load_project_state(project_id)
+    location_id = state.script.asset_manifest.locations[0].location_id
+    versions = ImageAssetVersions(api_context.project_store.get_project_dir(project_id))
+    source = _detailed_png(tmp_path / "failed-scene-candidate.png")
+    group_id = "failed-scene-group"
+    center_id, _ = versions.add_candidate_file(
+        "scene",
+        location_id,
+        "scene_center",
+        source,
+        "failed scene center prompt",
+        "scene_reference_group",
+        metadata={"group_id": group_id, "review_decision": "failed_after_retry"},
+    )
+    versions.add_candidate_file(
+        "scene",
+        location_id,
+        "scene_left_45",
+        source,
+        "failed scene left prompt",
+        "scene_reference_group",
+        metadata={"group_id": group_id, "review_decision": "failed_after_retry"},
+    )
+
+    accepted = client.post(
+        f"/api/projects/{project_id}/image-history/candidate/accept",
+        json={
+            "asset_type": "scene",
+            "asset_id": location_id,
+            "view_type": "scene_center",
+            "version_id": center_id,
+        },
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["accepted_version_id"] == center_id
+    saved_state = api_context._load_project_state(project_id)
+    scene_views = {
+        item.view_type for item in saved_state.scene_images.scenes
+        if item.location_id == location_id
+    }
+    assert {"scene_center", "scene_left_45"}.issubset(scene_views)
+
+
 def test_scene_image_history_preserves_requested_state_id(tmp_path, monkeypatch):
     client, project_id = _client(tmp_path, monkeypatch)
     state = api_context._load_project_state(project_id)

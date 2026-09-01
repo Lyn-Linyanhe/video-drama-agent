@@ -41,13 +41,35 @@ def has_planned_editing(text: str) -> bool:
     """Detect prompts that intentionally describe a timed multi-shot sequence."""
     normalized = (text or "").casefold()
     time_markers = re.findall(r"(?<!\d)\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds|秒)", normalized)
-    if len(time_markers) >= 2:
-        return True
+    # The single-take template intentionally contains negative editorial words
+    # such as “不切镜头/不插入”. Remove the complete negative clause before
+    # detecting a real edit instruction, otherwise the generated guard itself
+    # becomes a false positive on the second composition pass.
+    normalized = re.sub(
+        r"(?:不|不得|禁止)[^。；;\n]{0,40}(?:切镜头|插入|反打)[^。；;\n]*",
+        "",
+        normalized,
+    )
+    for negative_phrase in ("no cuts", "no insert", "no reverse shot"):
+        normalized = normalized.replace(negative_phrase, "")
     has_edit_word = any(token in normalized for token in (
         "flashback", "insert shot", "cutaway", "montage",
         "闪回", "插入", "快速摇摄", "反打", "切到", "切回", "切镜头",
     ))
-    return bool(time_markers and has_edit_word)
+    shot_type_groups = (
+        ("close-up", "close up", "closeup", "大特写", "特写", "近景"),
+        ("two-shot", "two shot", "双人镜头", "双人"),
+        ("wide shot", "远景", "全景"),
+        ("medium shot", "中景"),
+    )
+    shot_type_count = sum(
+        any(token in normalized for token in group)
+        for group in shot_type_groups
+    )
+    # Multiple timestamps can describe ordered beats inside one continuous take.
+    # Only explicit editorial language or multiple distinct shot types should
+    # switch to planned-edit mode.
+    return bool(time_markers and (has_edit_word or shot_type_count >= 2))
 
 
 def video_structure_instruction(shot: ShotPrompt) -> str:
@@ -62,9 +84,9 @@ def video_structure_instruction(shot: ShotPrompt) -> str:
         ])
     return _join([
         "【单镜头连续拍摄规则】",
-        "将本镜头渲染为一个连续长镜头，使用单一机位和一个主要动作节拍。",
+        "将本镜头渲染为一个连续长镜头，使用统一机位连续完成所有按时间顺序列出的动作节拍。",
         "不得使用蒙太奇、正反打、切出、突然切换到其他角度、地点、特写、车辆插入或道具插入。",
-        "如果分镜包含多个动作但没有明确的带时间轴剪辑计划，保持同一机位，只缓慢清晰地完成主要可见动作。",
+        "如果分镜包含多个动作但没有明确的剪辑切换，保持同一机位，按原顺序清晰完成所有主要可见动作，不得静默跳过后续动作。",
     ])
 
 

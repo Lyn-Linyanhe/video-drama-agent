@@ -223,6 +223,29 @@ def test_startup_falls_back_when_active_profile_has_no_llm_key(tmp_path, monkeyp
     assert calls[-1]["llm_key"] == "usable-secret"
 
 
+
+def test_startup_restores_visual_review_disabled_state(tmp_path, monkeypatch):
+    settings_file = tmp_path / "settings_ui.json"
+    settings_file.write_text(json.dumps({
+        "profiles": {
+            "production": {
+                "llm_key": "usable-secret",
+                "llm_provider": "deepseek",
+                "review_llm_enabled": False,
+                "review_llm_model": "qwen-vl-max",
+            },
+        },
+        "active_profile": "production",
+    }), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(settings_routes, "SETTINGS_FILE", settings_file)
+    monkeypatch.setattr(settings_routes, "_write_env", lambda **kwargs: calls.append(kwargs))
+
+    settings_routes._restore_env_from_settings()
+
+    assert calls[-1]["review_llm_enabled"] is False
+    assert calls[-1]["review_llm_model"] == "qwen-vl-max"
+
 def test_connection_profile_lookup_falls_back_to_active_profile(tmp_path, monkeypatch):
     client, _ = _settings_client(
         tmp_path,

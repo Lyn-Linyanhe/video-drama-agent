@@ -29,6 +29,8 @@ const syncSecretInput = (...args) => globalThis.StudioActions.syncSecretInput(..
 // the existing backend contract (`@asset:type:id:view`).
 let productionMentionSelection = null;
 let productionMentionOutsideHandlerInstalled = false;
+let productionVideoPolicySaveChain = Promise.resolve();
+let productionVideoPolicyRevision = 0;
 
 function productionPromptEditor() {
   return document.getElementById('production-prompt');
@@ -963,8 +965,8 @@ function renderProductionWorkspace() {
         </section>
         <section class="production-editor-section production-generation-section">
           <div class="production-section-heading"><div><span class="production-eyebrow">03 · 生成设置</span><h4>生成设置</h4></div><span class="production-section-note">提交前可调整</span></div>
-          <div class="production-settings-grid"><label class="production-field-label">视频服务<select id="production-video-provider" onchange="StudioActions.productionVideoProviderChanged()">${providerOptions}</select></label><label class="production-field-label">模型<select id="production-video-model" onchange="StudioActions.productionVideoModelChanged()">${modelOptions}</select></label><label class="production-field-label">清晰度<select id="production-video-resolution">${resolutionOptions}</select></label></div>
-          <div class="production-capability-note">成本档位：${escapeHtml(current.video_capability?.cost_tier || '未标注')}</div>
+          <div class="production-settings-grid"><label class="production-field-label">视频服务<select id="production-video-provider" onchange="StudioActions.productionVideoProviderChanged()">${providerOptions}</select></label><label class="production-field-label">模型<select id="production-video-model" onchange="StudioActions.productionVideoModelChanged()">${modelOptions}</select></label><label class="production-field-label">清晰度<select id="production-video-resolution" onchange="StudioActions.productionVideoResolutionChanged()">${resolutionOptions}</select></label></div>
+          <div class="production-capability-note">成本档位：${escapeHtml(current.video_capability?.cost_tier || '未标注')} · 未单独设置的后续分镜会继承当前选择</div>
           ${audioModeHtml}
           <div class="production-continuity-row"><label class="production-toggle"><input id="production-continuity" type="checkbox" ${production.continuity_enabled ? 'checked' : ''}><span>承接上一镜尾帧</span></label><span class="production-continuity-state ${production.continuity_stale ? 'is-warning' : ''}">${escapeHtml(continuityHint)}</span><span class="production-chip production-hard-cut-chip">新任务采用硬切</span></div>
         </section>
@@ -1003,7 +1005,62 @@ function renderProductionWorkspace() {
   restoreProductionEditorState(root, editorSnapshot);
 }
 
+function productionHasVideoOverride(item) {
+  const override = item?.production?.video_override || {};
+  return ['provider', 'model', 'resolution'].some(key => Boolean(String(override[key] || '').trim()));
+}
+
+function applyProjectVideoPolicyLocally(policy) {
+  if (!productionData || !policy) return;
+  productionData.video_generation_policy = {
+    ...(productionData.video_generation_policy || {}),
+    ...policy,
+  };
+  const capability = productionData.video_capabilities?.[policy.provider]?.models?.[policy.model] || {};
+  (productionData.productions || []).forEach(item => {
+    if (productionHasVideoOverride(item)) return;
+    item.video_policy = {...(item.video_policy || {}), ...policy};
+    item.video_capability = capability;
+  });
+}
+
+function persistProductionVideoPolicy(policy) {
+  const projectId = appState.projectId;
+  if (!projectId || !productionData) return Promise.resolve(null);
+  const nextPolicy = {
+    provider: String(policy?.provider || '').trim(),
+    model: String(policy?.model || '').trim(),
+    resolution: String(policy?.resolution || '').trim(),
+  };
+  if (Object.values(nextPolicy).some(value => !value)) return Promise.resolve(null);
+  applyProjectVideoPolicyLocally(nextPolicy);
+  const revision = ++productionVideoPolicyRevision;
+  productionVideoPolicySaveChain = productionVideoPolicySaveChain
+    .catch(() => null)
+    .then(async () => {
+      if (projectId !== appState.projectId) return null;
+      const data = await projectJsonRequest(
+        `${API_BASE}/api/projects/${projectId}/video-generation-policy`,
+        {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(nextPolicy)},
+        '保存视频默认设置失败',
+      );
+      if (data && projectId === appState.projectId && revision === productionVideoPolicyRevision) {
+        if (data.providers) productionData.video_capabilities = data.providers;
+        applyProjectVideoPolicyLocally(data.policy || nextPolicy);
+      }
+      return data;
+    })
+    .catch(error => {
+      if (projectId === appState.projectId && revision === productionVideoPolicyRevision) {
+        produceStatus(`<span style="color:#fbbf24">视频默认设置保存失败：${escapeHtml(error.message || '请稍后重试')}</span>`);
+      }
+      return null;
+    });
+  return productionVideoPolicySaveChain;
+}
+
 async function productionSaveCurrent() {
+  await productionVideoPolicySaveChain;
   const current = productionCurrent(); if (!current) return false;
   syncProductionMentionBindings(current);
   const payload = {prompt: productionSyncPromptValue(), negative_prompt: document.getElementById('production-negative').value, duration_sec: Number(document.getElementById('production-duration').value), references: current.production.references.map(item => ({reference_id:item.reference_id,source:item.source || 'asset',reference_token:item.reference_token || '',token:item.reference_token || '',version_id:item.asset_version_id || '',explicit_base_source:item.source === 'explicit' ? (item.explicit_base_source || '') : ''})), video_override:{provider:document.getElementById('production-video-provider').value,model:document.getElementById('production-video-model').value,resolution:document.getElementById('production-video-resolution').value}, continuity_enabled:document.getElementById('production-continuity').checked};
@@ -1089,8 +1146,16 @@ function updateProductionVideoSelection({resetModel = false} = {}) {
     if (Number.isFinite(currentDuration) && currentDuration > maximum) duration.value = String(maximum);
   }
 }
-function productionVideoProviderChanged() { updateProductionVideoSelection({resetModel: true}); }
-function productionVideoModelChanged() { updateProductionVideoSelection(); }
+function persistSelectedProductionVideoPolicy() {
+  return persistProductionVideoPolicy({
+    provider: document.getElementById('production-video-provider')?.value,
+    model: document.getElementById('production-video-model')?.value,
+    resolution: document.getElementById('production-video-resolution')?.value,
+  });
+}
+function productionVideoProviderChanged() { updateProductionVideoSelection({resetModel: true}); void persistSelectedProductionVideoPolicy(); }
+function productionVideoModelChanged() { updateProductionVideoSelection(); void persistSelectedProductionVideoPolicy(); }
+function productionVideoResolutionChanged() { updateProductionVideoSelection(); void persistSelectedProductionVideoPolicy(); }
 async function productionGenerateCurrent() {
   const active = activeProjectJobs(job => job.job_type === 'video.generate' && job.target_id === String(productionSceneId));
   if (active.length) return cancelMatchingJobs(active);
@@ -1277,6 +1342,7 @@ const __moduleActions = {
   productionSelectScene,
   productionVideoProviderChanged,
   productionVideoModelChanged,
+  productionVideoResolutionChanged,
   productionGenerateCurrent,
   productionGeneratePending,
   productionSetSubtitle,

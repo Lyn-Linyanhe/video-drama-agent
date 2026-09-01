@@ -9,7 +9,11 @@ from src.schemas.project import CreativeProfile
 from src.schemas.script import DialogueLine, Scene, ScriptBreakdown
 from src.schemas.visual import VisualDesign
 from src.services.prompt_composer import compose_video_prompt
-from src.services.timed_prompt_composer import build_timed_shot_prompt
+from src.services.timed_prompt_composer import (
+    _fit_beats_to_duration,
+    _timeline_from_text,
+    build_timed_shot_prompt,
+)
 from src.agents.image_gen_agent import build_character_image_prompt, build_character_negative_prompt
 from src.agents.visual_prompt_agent import (
     SYSTEM_PROMPT as VISUAL_PROMPT_SYSTEM,
@@ -1153,7 +1157,7 @@ def test_wet_street_envelope_closeup_does_not_become_map_reveal():
     assert "火漆印章完整" in rendered
 
 
-def test_short_image_to_video_prompt_limits_automatic_cut_count():
+def test_short_image_to_video_prompt_preserves_all_action_beats():
     script = ScriptBreakdown(
         title="雨夜第七封信",
         genre="悬疑",
@@ -1187,8 +1191,10 @@ def test_short_image_to_video_prompt_limits_automatic_cut_count():
         if line.startswith("切镜头，") or re.match(r"^\d+(?:\.\d+)?s，", line)
     ]
 
-    assert len(timed_lines) <= 3
-    assert "对上一动作结果产生明确反应" not in rendered
+    assert len(timed_lines) >= 4
+    assert "看手机短信" in rendered
+    assert "回头看向动静来源" in rendered
+    assert "左手信封" in rendered
 
 
 def test_finalized_prompt_repairs_envelope_map_reveal_when_core_intent_is_holding_phone():
@@ -2490,3 +2496,415 @@ def test_plain_exit_scene_does_not_trigger_entrance_template():
     assert "门被推开" not in rendered
     assert "门铃" not in rendered
     assert "藏到身后" not in rendered
+
+
+
+def test_timed_prompt_preserves_all_script_fact_beats_when_over_limit():
+    beats = [("script_required", f"必需剧情动作{i}") for i in range(1, 7)]
+
+    result = _fit_beats_to_duration(beats, 8)
+
+    assert result == beats
+
+
+def test_timed_prompt_does_not_truncate_scene_dialogue_to_three_lines():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=10,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=10,
+                location="室内",
+                characters=["甲", "乙"],
+                action_description="甲与乙在桌边交谈。",
+                camera_direction="中景双人固定",
+                emotion_tone="克制",
+                dialogue=[
+                    DialogueLine(character="甲", line="第一句台词。"),
+                    DialogueLine(character="乙", line="第二句台词。"),
+                    DialogueLine(character="甲", line="第三句台词。"),
+                    DialogueLine(character="乙", line="第四句关键台词。"),
+                ],
+            )
+        ],
+    )
+
+    rendered = build_timed_shot_prompt(
+        ShotPrompt(scene_id=1, prompt="甲与乙在桌边交谈。", duration_sec=10),
+        script,
+    )
+
+    assert "乙：“第四句关键台词。”" in rendered
+
+
+def test_timed_prompt_does_not_silently_truncate_timeline_after_four_segments():
+    timeline = (
+        "0-2秒，动作一；2-4秒，动作二；4-6秒，动作三；"
+        "6-8秒，动作四；8-10秒，动作五。"
+    )
+
+    result = _timeline_from_text(timeline, 10)
+
+    assert len(result) == 5
+    assert result[-1][1] == "动作五"
+
+
+def test_single_take_prompt_allows_multiple_ordered_action_beats():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=10,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=10,
+                location="室内",
+                characters=["甲"],
+                action_description="甲拿起信封，拆开信封，读完内容后抬头。",
+                camera_direction="中景固定",
+                emotion_tone="紧张",
+            )
+        ],
+    )
+    prompt = (
+        "【主体状态】甲坐在桌边。\n"
+        "【动作时间轴】0-3秒，甲拿起信封；3-7秒，甲拆开信封并阅读；"
+        "7-10秒，甲读完内容后抬头。\n"
+        "【环境】安静室内。"
+    )
+
+    rendered = build_timed_shot_prompt(
+        ShotPrompt(scene_id=1, prompt=prompt, duration_sec=10),
+        script,
+    )
+
+    assert "拿起信封" in rendered
+    assert "拆开信封并阅读" in rendered
+    assert "读完内容后抬头" in rendered
+    assert "只表现一个主要动作节拍" not in rendered
+
+
+
+def test_timed_prompt_uses_full_scene_duration_above_fifteen_seconds():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=20,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=20,
+                location="室内",
+                characters=["甲"],
+                action_description="甲先整理桌面，再打开盒子检查里面的物品。",
+                camera_direction="中景固定",
+                emotion_tone="专注",
+            )
+        ],
+    )
+    prompt = (
+        "【主体状态】甲站在桌边。\n"
+        "【动作时间轴】0-10秒，甲整理桌面；10-20秒，甲打开盒子检查物品。\n"
+        "【环境】安静室内。"
+    )
+
+    rendered = build_timed_shot_prompt(
+        ShotPrompt(scene_id=1, prompt=prompt, duration_sec=20),
+        script,
+    )
+
+    assert "10s-20s" in rendered
+    assert "总时长约20s" in rendered
+
+
+
+def test_dense_authored_timeline_keeps_every_segment_within_total_duration():
+    timeline = (
+        "0-0.5秒，动作一；0.5-1秒，动作二；1-1.5秒，动作三；"
+        "1.5-2秒，动作四；2-2.5秒，动作五；2.5-3秒，动作六。"
+    )
+
+    result = _timeline_from_text(timeline, 3)
+
+    assert len(result) == 6
+    assert all(duration > 0 for duration, _ in result)
+    assert round(sum(duration for duration, _ in result), 1) == 3.0
+
+
+def test_authored_timeline_accepts_units_on_start_and_ignores_action_numeric_ranges():
+    timeline = "0s-3s，人物跑过10-20米；3s-5s，人物停下并观察2-4秒。"
+
+    result = _timeline_from_text(timeline, 5)
+
+    assert len(result) == 2
+    assert "跑过10-20米" in result[0][1]
+    assert "停下并观察2-4秒" in result[1][1]
+    assert round(sum(duration for duration, _ in result), 1) == 5.0
+
+
+def test_single_take_action_timeline_is_not_planned_editing():
+    from src.services.prompt_composer import has_planned_editing
+
+    timeline = "【动作时间轴】0-3秒，甲拿起信封；3-6秒，甲拆开并阅读；6-8秒，甲抬头。"
+
+    assert not has_planned_editing(timeline)
+
+
+def test_weighted_durations_always_match_short_total_without_dropping_beats():
+    from src.services.timed_prompt_composer import _weighted_durations
+
+    beats = [
+        ("physical_action", "跑向门口"),
+        ("prop_emphasis", "看清钥匙"),
+        ("reaction_pan", "回头确认"),
+    ]
+
+    durations = _weighted_durations(2.0, beats, "")
+
+    assert len(durations) == len(beats)
+    assert all(duration > 0 for duration in durations)
+    assert round(sum(durations), 1) == 2.0
+
+
+def test_authored_timeline_rebalances_dense_segments_to_exact_total():
+    timeline = "0-1秒，动作一；1-2秒，动作二；2-3秒，动作三。"
+
+    result = _timeline_from_text(timeline, 2)
+
+    assert len(result) == 3
+    assert round(sum(duration for duration, _ in result), 1) == 2.0
+
+
+def test_provider_prompt_can_use_provider_duration_cap_without_changing_shot_duration():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=20,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=20,
+                location="室内",
+                characters=["甲"],
+                action_description="甲整理桌面，再打开盒子。",
+                camera_direction="中景固定",
+                emotion_tone="专注",
+            )
+        ],
+    )
+    shot = ShotPrompt(scene_id=1, prompt="甲整理桌面，再打开盒子。", duration_sec=20)
+
+    rendered = build_timed_shot_prompt(shot, script, duration_cap_sec=15)
+
+    assert "总时长约15s" in rendered
+    assert shot.duration_sec == 20
+
+
+def test_finalized_prompt_applies_provider_duration_cap():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=20,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=20,
+                location="室内",
+                characters=["甲"],
+                action_description="甲连续完成两个动作。",
+                camera_direction="中景固定",
+                emotion_tone="专注",
+            )
+        ],
+    )
+    prompt = (
+        "【单镜头时间轴】\n"
+        "总时长约20s\n"
+        "10s，甲整理桌面；10s，甲打开盒子。\n"
+        "【连续锁定】"
+    )
+
+    rendered = build_timed_shot_prompt(
+        ShotPrompt(scene_id=1, prompt=prompt, duration_sec=20),
+        script,
+        duration_cap_sec=15,
+    )
+
+    assert "总时长约15s" in rendered
+    assert "总时长约20s" not in rendered
+    assert "7.5s" in rendered
+
+
+def test_authored_timeline_accepts_period_delimited_segments():
+    result = _timeline_from_text("0-3秒，人物走到门口。3-6秒，人物停下观察。", 6)
+
+    assert len(result) == 2
+    assert "走到门口" in result[0][1]
+    assert "停下观察" in result[1][1]
+    assert round(sum(duration for duration, _ in result), 1) == 6.0
+
+
+def test_overdense_beats_never_render_zero_duration_slices():
+    from src.services.timed_prompt_composer import _weighted_durations
+
+    beats = [("continuity", f"节拍{i}") for i in range(3)]
+
+    durations = _weighted_durations(0.2, beats, "")
+
+    assert all(duration > 0 for duration in durations)
+    assert round(sum(durations), 2) == 0.2
+
+
+def test_final_single_take_prompt_stays_single_take_after_quality_composition():
+    from src.services.prompt_composer import compose_video_prompt
+
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=10,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=10,
+                location="室内",
+                characters=["甲"],
+                action_description="甲拿起信封，拆开后抬头。",
+                camera_direction="中景固定",
+                emotion_tone="紧张",
+            )
+        ],
+    )
+    raw = (
+        "【主体状态】甲坐在桌边。\n"
+        "【动作时间轴】0-3秒，甲拿起信封；3-6秒，甲拆开；6-8秒，甲抬头。\n"
+        "【环境】安静室内。"
+    )
+    finalized = build_timed_shot_prompt(ShotPrompt(scene_id=1, prompt=raw, duration_sec=10), script)
+    result = compose_video_prompt(
+        "mock",
+        GenerationPrompts(api_provider="mock", shots=[ShotPrompt(scene_id=1, prompt=finalized)]),
+        ShotPrompt(scene_id=1, prompt=finalized),
+        PromptPolicy(),
+    )
+
+    assert "【单镜头连续拍摄规则】" in result["provider_prompt"]
+    assert "【计划剪辑规则】" not in result["provider_prompt"]
+
+
+def test_complex_authored_timeline_keeps_every_authored_action_beat():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=8,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=8,
+                location="室内",
+                characters=["甲"],
+                action_description="甲拿起信，回忆母亲，随后哭泣。",
+                camera_direction="中景固定",
+                emotion_tone="悲伤",
+            )
+        ],
+    )
+    raw = (
+        "【主体状态】甲坐在桌边。\n"
+        "【动作时间轴】0-2秒，甲拿起信；2-4秒，闪回母亲在海边；"
+        "4-6秒，甲读完信后哭泣。"
+    )
+
+    rendered = build_timed_shot_prompt(ShotPrompt(scene_id=1, prompt=raw, duration_sec=8), script)
+
+    assert "甲拿起信" in rendered
+    assert "闪回母亲在海边" in rendered
+    assert "甲读完信后哭泣" in rendered
+
+
+def test_provider_duration_cap_rewrites_range_timeline_endpoints():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=20,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=20,
+                location="室内",
+                characters=["甲"],
+                action_description="甲连续完成两个动作。",
+                camera_direction="中景固定",
+                emotion_tone="专注",
+            )
+        ],
+    )
+    prompt = (
+        "【单镜头时间轴】\n总时长约20s\n"
+        "0s-10s，甲整理桌面。\n10s-20s，甲打开盒子。\n【连续锁定】"
+    )
+
+    rendered = build_timed_shot_prompt(
+        ShotPrompt(scene_id=1, prompt=prompt, duration_sec=20),
+        script,
+        duration_cap_sec=15,
+    )
+
+    assert "总时长约15s" in rendered
+    assert "0s-7.5s" in rendered
+    assert "7.5s-15s" in rendered
+    assert "20s" not in rendered
+
+
+def test_provider_cap_for_kling_uses_ten_second_prompt_limit():
+    script = ScriptBreakdown(
+        title="test",
+        genre="test",
+        logline="test",
+        duration_sec=15,
+        narration_style="none",
+        scenes=[
+            Scene(
+                scene_id=1,
+                duration_sec=15,
+                location="室内",
+                characters=["甲"],
+                action_description="甲完成动作。",
+                camera_direction="中景",
+                emotion_tone="专注",
+            )
+        ],
+    )
+    shot = ShotPrompt(scene_id=1, prompt="甲完成动作。", duration_sec=15)
+
+    class _Kling:
+        provider_name = "kling"
+
+    agent = VideoGenerationAgent.__new__(VideoGenerationAgent)
+    agent.api_client = _Kling()
+    prepared, _ = agent.prepare_shot_request(
+        shot,
+        generation_prompts=GenerationPrompts(api_provider="kling", shots=[shot]),
+        prompt_policy=PromptPolicy(),
+        script=script,
+    )
+
+    assert "总时长约10s" in prepared.prompt
+    assert prepared.duration_sec == 10

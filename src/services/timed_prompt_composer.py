@@ -124,10 +124,10 @@ def _dedupe_sentences(*values: str) -> str:
 
 
 def _fmt_seconds(value: float) -> str:
-    rounded = round(max(0.5, value), 1)
+    rounded = round(max(0.0, value), 2)
     if abs(rounded - int(rounded)) < 0.01:
         return f"{int(rounded)}s"
-    return f"{rounded:.1f}s"
+    return f"{rounded:.2f}".rstrip("0").rstrip(".") + "s"
 
 
 def _fmt_timepoint(value: float) -> str:
@@ -455,7 +455,7 @@ def _dialogue_text(lines: list[DialogueLine]) -> str:
     if not lines:
         return ""
     rendered = []
-    for line in lines[:3]:
+    for line in lines:
         emotion = f"（{line.emotion}）" if line.emotion else ""
         rendered.append(f"{line.character}：“{line.line}”{emotion}")
     return " / ".join(rendered)
@@ -572,35 +572,76 @@ def _has_complex_edit_need(text: str, scene: Scene | None) -> bool:
     )
 
 
+def _rebalance_positive_durations(total: float, values: list[float]) -> list[float]:
+    """Round durations proportionally while keeping beats positive and exact."""
+    if not values:
+        return []
+    precision = 100
+    target_units = max(len(values), round(float(total) * precision))
+    minimum_units = 1
+    available_units = target_units - minimum_units * len(values)
+    weights = [max(0.0, float(value)) for value in values]
+    weight_total = sum(weights)
+    if weight_total <= 0:
+        weights = [1.0] * len(values)
+        weight_total = float(len(values))
+
+    raw_extras = [available_units * weight / weight_total for weight in weights]
+    extra_units = [int(value) for value in raw_extras]
+    remaining = available_units - sum(extra_units)
+    order = sorted(
+        range(len(values)),
+        key=lambda index: (raw_extras[index] - extra_units[index], weights[index]),
+        reverse=True,
+    )
+    for index in order[:remaining]:
+        extra_units[index] += 1
+
+    units = [minimum_units + extra for extra in extra_units]
+    return [round(unit / precision, 2) for unit in units]
+
+
 def _timeline_from_text(timeline: str, total: float) -> list[tuple[float, str]]:
+    """Parse only explicit, unit-bearing ranges at segment boundaries."""
     timeline = _normalize_prompt_text(timeline)
-    matches = list(re.finditer(
-        r"(\d+(?:\.\d+)?)\s*[-到]\s*(\d+(?:\.\d+)?)\s*(?:s|秒)?[：:，,、\s]*(.*?)(?=(?:；|;|\n|$|\d+(?:\.\d+)?\s*[-到]\s*\d))",
-        timeline,
-    ))
-    segments: list[tuple[float, str]] = []
+    range_pattern = re.compile(
+        r"^\s*(?:动作时间轴\s*[：:]\s*)?(?:切镜头\s*[，,:：]\s*)?"
+        r"(?P<start>\d+(?:\.\d+)?)\s*(?P<start_unit>s|秒)?\s*"
+        r"(?:-|到)\s*"
+        r"(?P<end>\d+(?:\.\d+)?)\s*(?P<end_unit>s|秒)?\s*"
+        r"[：:，,、\s]*(?P<description>.*?)\s*$",
+        re.IGNORECASE,
+    )
+    raw_segments: list[tuple[float, str]] = []
     previous_end = 0.0
-    for match in matches[:4]:
-        start = float(match.group(1))
-        end = float(match.group(2))
+    for chunk in re.split(r"[；;\n]+|(?<=。)(?=\s*(?:动作时间轴\s*[：:]\s*)?(?:切镜头\s*[，,:：]\s*)?\d)", timeline):
+        chunk = chunk.strip("。；; ")
+        if not chunk:
+            continue
+        match = range_pattern.match(chunk)
+        if not match or not (match.group("start_unit") or match.group("end_unit")):
+            continue
+        start = float(match.group("start"))
+        end = float(match.group("end"))
         if abs(start - previous_end) > 0.25:
             start = previous_end
-        duration = max(0.8, min(total - previous_end, end - start))
-        description = _normalize_prompt_text(match.group(3)).strip("。；; ，,")
-        if duration > 0 and description:
-            segments.append((duration, description))
-            previous_end = round(previous_end + duration, 1)
-    if segments and previous_end < total - 0.4:
-        if len(segments) > 1 and previous_end > 0:
-            scale = total / previous_end
-            scaled = [(round(max(0.8, duration * scale), 1), description) for duration, description in segments]
-            diff = round(total - sum(duration for duration, _ in scaled), 1)
-            duration, description = scaled[-1]
-            scaled[-1] = (round(max(0.8, duration + diff), 1), description)
-            return scaled
-        duration, description = segments[-1]
-        segments[-1] = (round(duration + total - previous_end, 1), description)
-    return segments
+        description = _normalize_prompt_text(match.group("description")).strip("。；; ，,")
+        if end > start and description:
+            raw_segments.append((end - start, description))
+            previous_end = end
+    if not raw_segments:
+        return []
+
+    declared_total = sum(duration for duration, _ in raw_segments)
+    scale = total / declared_total if declared_total > 0 else 1.0
+    durations = _rebalance_positive_durations(
+        total,
+        [duration * scale for duration, _ in raw_segments],
+    )
+    return [
+        (duration, description)
+        for duration, (_, description) in zip(durations, raw_segments)
+    ]
 
 
 def _single_take_segments(scene: Scene, original: str, total: float, script: ScriptBreakdown | None = None) -> list[str]:
@@ -1391,12 +1432,99 @@ def _repair_timed_duration_coverage(lines: list[str], total: float | None) -> li
     return repaired
 
 
-def _lint_and_repair_prompt(text: str, scene: Scene | None) -> str:
+def _apply_duration_cap_to_prompt(text: str, cap: float | None) -> str:
+    """Keep a finalized prompt's timed segments aligned with a provider cap."""
+    if cap is None:
+        return text
+    cap = max(2.0, float(cap))
+    range_pattern = re.compile(
+        r"(?P<boundary>^|[；;\n。])(?P<spacing>\s*)"
+        r"(?P<cut>切镜头[，,:：]\s*)?"
+        r"(?P<start>\d+(?:\.\d+)?)s\s*(?:-|到)\s*"
+        r"(?P<end>\d+(?:\.\d+)?)s(?P<comma>[，,])",
+        re.MULTILINE,
+    )
+    range_matches = list(range_pattern.finditer(text))
+    if range_matches:
+        range_durations = [
+            max(0.0, float(match.group("end")) - float(match.group("start")))
+            for match in range_matches
+        ]
+        current_total = sum(range_durations)
+        declared_total = _total_duration_from_prompt(text)
+        if current_total <= cap and (declared_total is None or declared_total <= cap):
+            return text
+        scaled = _rebalance_positive_durations(cap, range_durations)
+        cursor = 0.0
+        replacement_index = 0
+
+        def replace_range(match: re.Match[str]) -> str:
+            nonlocal cursor, replacement_index
+            duration = scaled[replacement_index]
+            replacement_index += 1
+            start = cursor
+            cursor = round(cursor + duration, 2)
+            return (
+                f"{match.group('boundary')}{match.group('spacing')}"
+                f"{match.group('cut') or ''}{_fmt_seconds(start)}-"
+                f"{_fmt_seconds(cursor)}{match.group('comma')}"
+            )
+
+        rendered = range_pattern.sub(replace_range, text)
+        return re.sub(
+            r"总时长约\d+(?:\.\d+)?s",
+            f"总时长约{_fmt_seconds(cap)}",
+            rendered,
+            count=1,
+        )
+
+    timed_pattern = re.compile(
+        r"(?P<boundary>^|[；;\n。])(?P<spacing>\s*)"
+        r"(?P<cut>切镜头[，,:：]\s*)?"
+        r"(?P<duration>\d+(?:\.\d+)?)s(?P<comma>[，,])",
+        re.MULTILINE,
+    )
+    matches = list(timed_pattern.finditer(text))
+    durations = [float(match.group("duration")) for match in matches]
+    declared_total = _total_duration_from_prompt(text)
+    if not durations and (declared_total is None or declared_total <= cap):
+        return text
+    current_total = sum(durations)
+    if current_total <= cap and (declared_total is None or declared_total <= cap):
+        return text
+    scaled = _rebalance_positive_durations(cap, durations) if durations else []
+    replacement_index = 0
+
+    def replace_timed_prefix(match: re.Match[str]) -> str:
+        nonlocal replacement_index
+        duration = scaled[replacement_index]
+        replacement_index += 1
+        return (
+            f"{match.group('boundary')}{match.group('spacing')}"
+            f"{match.group('cut') or ''}{_fmt_seconds(duration)}{match.group('comma')}"
+        )
+
+    rendered = timed_pattern.sub(replace_timed_prefix, text) if durations else text
+    return re.sub(
+        r"总时长约\d+(?:\.\d+)?s",
+        f"总时长约{_fmt_seconds(cap)}",
+        rendered,
+        count=1,
+    )
+
+
+def _lint_and_repair_prompt(
+    text: str,
+    scene: Scene | None,
+    *,
+    preserve_authored_timeline: bool = False,
+) -> str:
     text = re.sub(r"(?m)^时间轴分镜】", "【时间轴分镜】", text)
     text = re.sub(r"(?m)^单镜头时间轴】", "【单镜头时间轴】", text)
     core_intent = _core_intent_from_finalized(text)
     scene_text = _scene_source_text(scene)
-    source_text = " ".join([core_intent, scene_text])
+    authored_timeline = _section_value(_sections(text), "动作时间轴")
+    source_text = " ".join([core_intent, authored_timeline, scene_text])
     lines: list[str] = []
     for line in text.splitlines():
         line = _repair_conflicting_envelope_reveal(line, source_text, scene)
@@ -1405,7 +1533,8 @@ def _lint_and_repair_prompt(text: str, scene: Scene | None) -> str:
         line = _repair_voice_only_sources(line, scene)
         line = _repair_false_reaction_pan(line, source_text, scene)
         line = _repair_unmentioned_prop_insert(line, source_text, scene)
-        line = _repair_stale_flashback(line, source_text, scene)
+        if not preserve_authored_timeline:
+            line = _repair_stale_flashback(line, source_text, scene)
         if not line:
             continue
         if "完成情绪落点" in line:
@@ -1452,6 +1581,11 @@ def _lint_and_repair_prompt(text: str, scene: Scene | None) -> str:
 def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
     text = re.sub(r"(?m)^时间轴分镜】", "【时间轴分镜】", text)
     text = re.sub(r"(?m)^单镜头时间轴】", "【单镜头时间轴】", text)
+    text = re.sub(
+        r"[；;](?=\s*(?:切镜头[，,:：]\s*)?\d+(?:\.\d+)?s[，,])",
+        "\n",
+        text,
+    )
     core_intent = _core_intent_from_finalized(text)
     scene_text = _scene_source_text(scene)
     source_text = " ".join([core_intent, scene_text])
@@ -1694,7 +1828,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
     if special_event:
         if dialogue and not any(kind.startswith("dialogue") for kind, _ in beats):
             beats.append(("dialogue_two_shot", _dialogue_staging(scene, dialogue, text, visible_names)))
-        return beats[:5]
+        return beats
 
     if _has_entrance_cue(event_text):
         actor = _named_actor_for_event(scene, event_text, ("推开", "走出", "进来"))
@@ -1721,7 +1855,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
     if special_event:
         if dialogue and not any(kind.startswith("dialogue") for kind, _ in beats):
             beats.append(("dialogue_two_shot", _dialogue_staging(scene, dialogue, text, visible_names)))
-        return beats[:5]
+        return beats
 
     if _has_sms_visual_cue(text):
         beats.append((
@@ -1792,7 +1926,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
 
     if not beats:
         beats.append(("establish", f"{camera}，固定镜头或缓慢推近，建立{scene.location}中的{subject}。"))
-        beats.append(("action", f"中近景，{subject}{action}，动作只做一个主要节拍。"))
+        beats.append(("action", f"中近景，{subject}{action}，动作按顺序完成所有明确节拍。"))
     elif not any(kind.startswith("dialogue") for kind, _ in beats):
         beats.append((
             "emotion_landing",
@@ -1800,7 +1934,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
             f"{scene.emotion_tone or '情绪'}从内收推进，不新增剧情事件。",
         ))
 
-    return beats[:5]
+    return beats
 
 
 def _durations(total: float, count: int) -> list[float]:
@@ -1812,11 +1946,13 @@ def _durations(total: float, count: int) -> list[float]:
         ratios = [0.25, 0.35, 0.40]
     elif count == 4:
         ratios = [0.20, 0.25, 0.22, 0.33]
-    else:
+    elif count == 5:
         ratios = [0.18, 0.20, 0.18, 0.20, 0.24]
-    durations = [max(0.8, round(total * ratio, 1)) for ratio in ratios[:count]]
+    else:
+        ratios = [1.0 / count] * count
+    durations = [max(0.1, round(total * ratio, 1)) for ratio in ratios]
     diff = round(total - sum(durations), 1)
-    durations[-1] = max(0.8, round(durations[-1] + diff, 1))
+    durations[-1] = max(0.1, round(durations[-1] + diff, 1))
     return durations
 
 
@@ -1927,38 +2063,10 @@ def _sync_duration_targets(
         script.duration_sec = max(current_total, sum(int(item.duration_sec or 0) for item in script.scenes))
 
 
-def _max_beats_for_duration(total: float) -> int:
-    if total <= 5.5:
-        return 2
-    if total <= 8.0:
-        return 3
-    if total <= 11.0:
-        return 4
-    return 5
-
-
 def _fit_beats_to_duration(beats: list[tuple[str, str]], total: float) -> list[tuple[str, str]]:
-    limit = _max_beats_for_duration(total)
-    if len(beats) <= limit:
-        return beats
-
-    trimmed = list(beats)
-    removal_priority = [
-        "emotion_landing",
-        "prop_emphasis",
-        "reaction_pan",
-        "flashback",
-        "continuity",
-    ]
-    for kind_to_remove in removal_priority:
-        while len(trimmed) > limit:
-            index = next((idx for idx, (kind, _) in enumerate(trimmed) if kind == kind_to_remove), None)
-            if index is None:
-                break
-            trimmed.pop(index)
-        if len(trimmed) <= limit:
-            return trimmed
-    return trimmed[:limit]
+    """Keep every beat; duration pressure must never delete story content."""
+    del total  # Kept in the signature for callers and compatibility.
+    return list(beats)
 
 
 def _weighted_durations(total: float, beats: list[tuple[str, str]], source_text: str) -> list[float]:
@@ -1972,26 +2080,58 @@ def _weighted_durations(total: float, beats: list[tuple[str, str]], source_text:
     fixed_total = sum(value for value in requested if value is not None)
     missing = [index for index, value in enumerate(requested) if value is None]
     if not missing:
-        scale = total / fixed_total if fixed_total > total and fixed_total > 0 else 1.0
-        return [_fit_duration((value or 0.8) * scale, beats[index][0], total) for index, value in enumerate(requested)]
+        return _rebalance_positive_durations(
+            total,
+            [value if value is not None else 0.1 for value in requested],
+        )
 
     remaining = max(0.0, total - fixed_total)
     weights = [_duration_weight(beats[index][0], beats[index][1], source_text) for index in missing]
-    weight_total = sum(weights) or 1.0
+    minimums = [_duration_bounds(beats[index][0], total)[0] for index in missing]
+    uppers = [_duration_bounds(beats[index][0], total)[1] for index in missing]
     durations = [0.0] * len(beats)
     for index, value in enumerate(requested):
         if value is not None:
             durations[index] = value
-    for index, weight in zip(missing, weights):
-        durations[index] = _fit_duration(remaining * weight / weight_total, beats[index][0], total)
 
-    diff = round(total - sum(durations), 1)
-    adjustable = next(
-        (index for index in reversed(range(len(beats))) if beats[index][0] in {"physical_action", "dialogue_two_shot", "dialogue_close", "action", "emotion_landing"}),
-        len(beats) - 1,
-    )
-    durations[adjustable] = round(max(0.8, durations[adjustable] + diff), 1)
-    return durations
+    minimum_total = sum(minimums)
+    if fixed_total >= total or minimum_total > remaining:
+        # Bounds are advisory when the shot is overloaded. Allocate a positive
+        # slice to every authored beat, then enforce the exact shot total.
+        overloaded_weights = [
+            max(0.1, requested[index] or weights[missing.index(index)])
+            if index in missing else max(0.1, requested[index] or 0.1)
+            for index in range(len(beats))
+        ]
+        weight_total = sum(overloaded_weights) or float(len(beats))
+        return _rebalance_positive_durations(
+            total,
+            [total * weight / weight_total for weight in overloaded_weights],
+        )
+
+    for index, minimum in zip(missing, minimums):
+        durations[index] = minimum
+    extra = max(0.0, remaining - minimum_total)
+    active = list(range(len(missing)))
+    while extra > 0.01 and active:
+        weight_total = sum(weights[pos] for pos in active) or float(len(active))
+        consumed = 0.0
+        next_active: list[int] = []
+        for pos in active:
+            index = missing[pos]
+            capacity = max(0.0, uppers[pos] - durations[index])
+            share = extra * weights[pos] / weight_total
+            addition = min(capacity, share)
+            durations[index] = round(durations[index] + addition, 1)
+            consumed += addition
+            if capacity - addition > 0.01:
+                next_active.append(pos)
+        if consumed <= 0.01:
+            break
+        extra = max(0.0, extra - consumed)
+        active = next_active
+
+    return _rebalance_positive_durations(total, durations)
 
 
 def build_timed_shot_prompt(
@@ -1999,6 +2139,7 @@ def build_timed_shot_prompt(
     script: ScriptBreakdown | None = None,
     *,
     sync_script_duration: bool = True,
+    duration_cap_sec: float | None = None,
 ) -> str:
     """Return a Tapnow-style timed prompt without increasing the shot duration."""
     original = _normalize_prompt_text(shot.prompt or "")
@@ -2008,7 +2149,8 @@ def build_timed_shot_prompt(
 
     scene = _scene_for_shot(script, shot.scene_id)
     if "【单镜头时间轴】" in original or "【时间轴分镜】" in original:
-        return _repair_finalized_timed_prompt(original, scene)
+        finalized = _repair_finalized_timed_prompt(original, scene)
+        return _apply_duration_cap_to_prompt(finalized, duration_cap_sec)
     if has_planned_editing(original) and "【动作时间轴】" not in original:
         if scene is not None and "核心分镜意图" in original:
             return _lint_and_repair_prompt(original, scene)
@@ -2017,7 +2159,8 @@ def build_timed_shot_prompt(
     if scene is None:
         return original
 
-    total = max(2.0, min(float(shot.duration_sec or scene.duration_sec or 5), 15.0))
+    cap = 60.0 if duration_cap_sec is None else max(2.0, float(duration_cap_sec))
+    total = max(2.0, min(float(shot.duration_sec or scene.duration_sec or 5), cap))
     if not _has_complex_edit_need(original, scene):
         sections = _sections(original)
         visual = _section_value(sections, "项目视觉")
@@ -2038,7 +2181,7 @@ def build_timed_shot_prompt(
         segments = _single_take_segments(scene, original, total, script)
         locks = [
             f"总时长约{_fmt_seconds(total)}，单镜头连续完成，不切镜头，不插入额外特写或反打。",
-            "只表现一个主要动作节拍；禁止新增人物、车辆、黑影、监控画面、回忆画面、新地点或新道具。",
+            "按时间轴依次完成所有明确动作节拍；禁止跳过剧本动作。不得新增人物、车辆、黑影、监控画面、回忆画面、新地点或新道具。",
             "人物外貌、服装、发型、道具状态、手机屏幕亮度、主光方向、雨势/天气和场景空间关系保持连续。",
             TEXT_OVERLAY_NOTE,
         ]
@@ -2072,13 +2215,50 @@ def build_timed_shot_prompt(
     )
     total = elastic_total
     beats = _fit_beats_to_duration(beats, total)
-    durations = _weighted_durations(total, beats, source_text)
-    segments = []
-    for index, ((kind, description), duration) in enumerate(zip(beats, durations), start=1):
-        prefix = "" if index == 1 else "切镜头，"
-        if kind == "flashback":
-            prefix = "切镜头，"
-        segments.append(f"{prefix}{_fmt_seconds(duration)}，{description}")
+    authored_timeline = _section_value(_sections(original), "动作时间轴")
+    authored_segments = _timeline_from_text(authored_timeline, total) if authored_timeline else []
+    if authored_segments:
+        authored_text = " ".join(description for _, description in authored_segments)
+        missing_canonical_beats: list[tuple[str, str]] = []
+        for kind, description in beats:
+            if kind in {"continuity", "establish", "emotion_landing"}:
+                continue
+            clauses = [
+                clause.strip()
+                for clause in re.split(r"[，,；;。]", description)
+                if len(clause.strip()) >= 4
+            ]
+            if clauses and not any(clause in authored_text for clause in clauses):
+                missing_canonical_beats.append((kind, description))
+        if missing_canonical_beats:
+            if len(authored_segments) == 1:
+                duration, description = authored_segments[0]
+                authored_segments[0] = (
+                    duration,
+                    f"{description}；补足剧本动作：{'；'.join(item[1] for item in missing_canonical_beats)}",
+                )
+            else:
+                authored_segments.extend((1.0, description) for _, description in missing_canonical_beats)
+                durations = _rebalance_positive_durations(
+                    total,
+                    [duration for duration, _ in authored_segments],
+                )
+                authored_segments = [
+                    (duration, description)
+                    for duration, (_, description) in zip(durations, authored_segments)
+                ]
+        segments = [
+            f"{('' if index == 1 else '切镜头，')}{_fmt_seconds(duration)}，{description}"
+            for index, (duration, description) in enumerate(authored_segments, start=1)
+        ]
+    else:
+        durations = _weighted_durations(total, beats, source_text)
+        segments = []
+        for index, ((kind, description), duration) in enumerate(zip(beats, durations), start=1):
+            prefix = "" if index == 1 else "切镜头，"
+            if kind == "flashback":
+                prefix = "切镜头，"
+            segments.append(f"{prefix}{_fmt_seconds(duration)}，{description}")
 
     original_line = ""
     sections = _sections(original)
@@ -2105,7 +2285,7 @@ def build_timed_shot_prompt(
             *locks,
         ] if part
     )
-    return _lint_and_repair_prompt(rendered, scene)
+    return _lint_and_repair_prompt(rendered, scene, preserve_authored_timeline=bool(authored_segments))
 
 
 def apply_timed_prompt_structure(

@@ -257,10 +257,15 @@ class VideoGenerationAgent:
             scene_vision_descriptions,
             script,
         )
+        provider = (self.api_client.provider_name or "").lower()
+        provider_duration_cap = {"happyhorse": 15.0, "wan": 15.0, "kling": 10.0}.get(provider)
+        if provider_duration_cap is not None:
+            isolated.duration_sec = int(min(isolated.duration_sec, provider_duration_cap))
         isolated.prompt = build_timed_shot_prompt(
             isolated,
             script,
             sync_script_duration=False,
+            duration_cap_sec=provider_duration_cap,
         )
         effective = compose_video_prompt(
             self.api_client.provider_name,

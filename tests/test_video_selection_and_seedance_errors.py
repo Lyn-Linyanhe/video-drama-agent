@@ -10,6 +10,19 @@ def test_production_model_selection_has_a_separate_change_path():
     assert "const selectedModel = model.value" in source
 
 
+def test_video_selection_persists_as_project_default_for_following_shots():
+    source = Path("web/js/pages/production-actions.js").read_text(encoding="utf-8")
+
+    assert 'id="production-video-resolution" onchange="StudioActions.productionVideoResolutionChanged()"' in source
+    assert "function persistProductionVideoPolicy" in source
+    assert "/video-generation-policy" in source
+    assert "productionData.video_generation_policy" in source
+
+    provider_handler = source[source.index("function productionVideoProviderChanged") : source.index("async function productionGenerateCurrent")]
+    assert "persistSelectedProductionVideoPolicy" in provider_handler
+    assert "productionVideoResolutionChanged" in provider_handler
+
+
 def test_video_generation_stops_when_shot_save_fails():
     source = Path("web/js/pages/production-actions.js").read_text(encoding="utf-8")
 

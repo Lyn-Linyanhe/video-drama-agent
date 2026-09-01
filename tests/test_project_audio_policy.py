@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -147,14 +148,21 @@ def test_application_default_video_provider_is_happyhorse():
     """Verify the import-time default without reloading shared config in pytest."""
     env = os.environ.copy()
     env.pop("DEFAULT_VIDEO_API", None)
-    result = subprocess.run(
-        [sys.executable, "-c", "import src.config as config; print(config.DEFAULT_API)"],
-        cwd=Path(__file__).resolve().parents[1],
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
+    project_root = Path(__file__).resolve().parents[1]
+    script = (
+        "import sys; "
+        f"sys.path.insert(0, {str(project_root)!r}); "
+        "import src.config as config; print(config.DEFAULT_API)"
     )
+    with tempfile.TemporaryDirectory() as isolated_cwd:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=isolated_cwd,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     assert result.stdout.strip() == "happyhorse"
 

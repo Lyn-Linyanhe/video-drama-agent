@@ -634,7 +634,10 @@ async def review_image_history(project_id: str, req: ImageHistoryReviewRequest):
 async def accept_image_candidate(project_id: str, req: ActivateImageVersionRequest):
     """Accept a warning/unreviewed candidate as the active image version."""
     try:
-        state, asset, versions, _ = _resolve_image_asset(project_id, req)
+        # A failed first generation can leave a persisted history candidate
+        # without a current state asset. Accepting that candidate should use
+        # the same draft-asset path as the history endpoint.
+        state, asset, versions, _ = _resolve_image_asset(project_id, req, create_missing=True)
         selected = versions.find_version(req.asset_type, req.asset_id, req.view_type, req.version_id)
         group_id = str((selected or {}).get("group_id") or "")
         if group_id:
@@ -648,7 +651,9 @@ async def accept_image_candidate(project_id: str, req: ActivateImageVersionReque
                 for view_type, history in group_histories.items():
                     active_version = next((item for item in history if item.get("active")), {})
                     view_request = req.model_copy(update={"view_type": view_type})
-                    view_state, view_asset, _view_versions, _ = _resolve_image_asset(project_id, view_request)
+                    view_state, view_asset, _view_versions, _ = _resolve_image_asset(
+                        project_id, view_request, create_missing=True,
+                    )
                     _save_image_asset_state(
                         project_id,
                         view_state,

@@ -1113,6 +1113,11 @@ def _restore_env_from_settings() -> None:
         kimi_prompt_review_key=profile.get("kimi_prompt_review_api_key", ""),
         kimi_prompt_review_model=profile.get("kimi_prompt_review_model", "kimi-k2.6"),
         kimi_prompt_review_base_url=profile.get("kimi_prompt_review_base_url", "https://api.moonshot.cn/v1"),
+        review_llm_enabled=profile.get("review_llm_enabled", True),
+        review_llm_provider=profile.get("review_llm_provider", ""),
+        review_llm_model=profile.get("review_llm_model", "qwen-vl-max"),
+        review_llm_key=profile.get("review_llm_api_key", ""),
+        review_llm_base_url=profile.get("review_llm_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     )
         print(f"[启动] 已从档案 '{active}' 恢复配置")
     except Exception as exc:

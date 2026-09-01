@@ -716,7 +716,7 @@ def test_compact_prompt_requires_same_segment_camera_and_subject_action():
 
     sys_ = COMPACT_SYSTEM_PROMPT
     assert "每个时间戳段落必须同时写出镜头运动与主体动作" in sys_
-    assert "一镜只推进一个主要动作" in sys_
+    assert "一镜可以推进多个按顺序发生的动作节拍" in sys_
 
 
 def test_compact_prompt_forbids_future_environment_state():
