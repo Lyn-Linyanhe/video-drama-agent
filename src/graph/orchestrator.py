@@ -194,6 +194,7 @@ Modern convenience store interior, late night with cool white fluorescent light 
         audio = await audio_agent.run(
             state.script, state.generated_assets, state.project_id, state.audio_assets,
             native_scene_audio=native_scene_audio,
+            audio_mode=getattr(state.creative_profile, "audio_mode", "external_tts"),
         )
         state.log(f"   配音场景: {len(audio.scenes)} | BGM: {audio.bgm_mood}")
         return {"audio_assets": audio}
@@ -207,6 +208,7 @@ Modern convenience store interior, late night with cool white fluorescent light 
             state.project_id,
             state.subtitle_enabled,
             state.subtitle_mode,
+            state.assembly_audio_override,
         )
         state.log(f"   输出: {path}")
         return {"output_video_path": path}
@@ -382,6 +384,7 @@ def create_stage5_graph(audio_agent):
         audio = await audio_agent.run(
             state.script, state.generated_assets, state.project_id, state.audio_assets,
             native_scene_audio=native_scene_audio,
+            audio_mode=getattr(state.creative_profile, "audio_mode", "external_tts"),
         )
         state.log(f"   配音场景: {len(audio.scenes)} | BGM: {audio.bgm_mood}")
         return {"audio_assets": audio}
@@ -400,7 +403,7 @@ def create_stage6_graph(assembly_agent):
         state.log("🎞️ 合成 Agent: 拼接视频 + 字幕...")
         path = await assembly_agent.run(
             state.script, state.generated_assets, state.audio_assets, state.project_id,
-            state.subtitle_enabled, state.subtitle_mode,
+            state.subtitle_enabled, state.subtitle_mode, state.assembly_audio_override,
         )
         state.log(f"   输出: {path}")
         return {"output_video_path": path}

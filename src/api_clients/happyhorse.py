@@ -108,6 +108,7 @@ class HappyHorseVideoClient(VideoAPIClient):
         motion_strength: float = 0.7,
         image_reference: str | None = None,
         image_references: list[str] | None = None,
+        generate_audio: bool | None = None,
     ) -> VideoGenResult:
         """Submit an image/reference-to-video task and download the result.
 
@@ -145,16 +146,21 @@ class HappyHorseVideoClient(VideoAPIClient):
             # 3. Download to local
             hooks.progress("downloading", 0, 1, "正在下载视频")
             hooks.check_cancelled()
-            local_path = await self._download_video(video_url, task_id, duration_sec)
+            local_path = await self._download_video(video_url, task_id, duration)
             hooks.progress("downloading", 1, 1, "视频下载完成")
 
+            audio_present = bool(generate_audio) and self._has_audio_stream(local_path)
             return VideoGenResult(
                 success=True,
                 video_url=video_url,
                 local_path=local_path,
-                duration_sec=float(duration_sec),
-                api_cost=self._estimate_cost(duration_sec, bool(reference_paths)),
+                duration_sec=float(duration),
+                api_cost=self._estimate_cost(duration, bool(reference_paths)),
                 reference_image_used=";".join(reference_paths),
+                audio_source="native" if audio_present else "none",
+                native_audio_enabled=audio_present,
+                native_audio_path=local_path if audio_present else None,
+                audio_present=audio_present,
             )
 
         except Exception as e:
@@ -169,6 +175,21 @@ class HappyHorseVideoClient(VideoAPIClient):
 
     async def get_cost_estimate(self, duration_sec: int) -> float:
         return self._estimate_cost(duration_sec)
+
+    @staticmethod
+    def _has_audio_stream(path: str) -> bool:
+        """Detect an embedded audio stream in the downloaded MP4."""
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            return bool(result.returncode == 0 and result.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            return False
 
     # ---- Auth -------------------------------------------------------
 

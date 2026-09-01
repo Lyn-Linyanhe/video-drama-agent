@@ -48,6 +48,12 @@ class VideoGenerationAgent:
         self.max_retries = max_retries
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
+    @staticmethod
+    def _native_audio_requested_for_profile(creative_profile) -> bool:
+        """Resolve the project audio choice for providers with native audio."""
+        mode = str(getattr(creative_profile, "audio_mode", "auto") or "auto").strip().lower()
+        return mode != "external_tts"
+
     async def run(
         self,
         prompts: GenerationPrompts,
@@ -97,6 +103,7 @@ class VideoGenerationAgent:
                     visual_design=visual_design,
                     scene_vision_descriptions=scene_vision_descriptions,
                     script=script,
+                    generate_audio=self._native_audio_requested_for_profile(creative_profile),
                 )
 
         shot_assets = await asyncio.gather(
@@ -185,6 +192,8 @@ class VideoGenerationAgent:
         creative_profile=None,
     ) -> ShotAsset:
         """Generate one storyboard shot with an explicit ordered reference bundle."""
+        if generate_audio is None and creative_profile is not None:
+            generate_audio = self._native_audio_requested_for_profile(creative_profile)
         if not request_is_prepared:
             shot, _ = self.prepare_shot_request(
                 shot,
@@ -498,6 +507,8 @@ class VideoGenerationAgent:
                         "return_last_frame": return_last_frame,
                         "generate_audio": True if generate_audio is None else bool(generate_audio),
                     })
+                elif self.api_client.provider_name == "happyhorse":
+                    request["generate_audio"] = True if generate_audio is None else bool(generate_audio)
                 result = await asyncio.wait_for(
                     self.api_client.generate_video(**request),
                     timeout=GENERATION_TIMEOUT,

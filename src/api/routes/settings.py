@@ -239,7 +239,7 @@ class SettingsRequest(BaseModel):
     bgm_duration: str = Field(default="", exclude=True)
     bgm_timeout: str = Field(default="", exclude=True)
     # ── 视频 ──
-    default_video_api: str = "mock"
+    default_video_api: str = "happyhorse"
     video_base_url: str = ""
     kling_api_key: str = ""
     kling_access_key: str = ""
@@ -813,7 +813,7 @@ async def test_bgm(req: TestConnectionRequest):
     return {"success": False, "status": 0, "detail": "当前版本暂未接入在线 BGM 服务"}
 
 def _write_env(llm_provider="", llm_model="", llm_key="", llm_base="",
-               default_video_api="mock", kling_api_key="", kling_ak="", kling_sk="",
+               default_video_api="happyhorse", kling_api_key="", kling_ak="", kling_sk="",
                kling_model="kling-v2-6", kling_mode="std",
                happyhorse_key="", happyhorse_url="", happyhorse_model="", happyhorse_res="",
                ark_key="", ark_url="", ark_model="", ark_resolution="1080p",
@@ -958,7 +958,7 @@ def _reload_env_and_config():
     else:
         os.environ.pop('HTTPS_PROXY', None)
         os.environ.pop('HTTP_PROXY', None)
-    cfg.DEFAULT_API = os.getenv("DEFAULT_VIDEO_API", "mock")
+    cfg.DEFAULT_API = os.getenv("DEFAULT_VIDEO_API", "happyhorse")
     cfg.KLING_API_KEY = os.getenv("KLING_API_KEY", "")
     cfg.KLING_ACCESS_KEY = os.getenv("KLING_ACCESS_KEY", "")
     cfg.KLING_SECRET_KEY = os.getenv("KLING_SECRET_KEY", "")
@@ -1079,7 +1079,7 @@ def _restore_env_from_settings() -> None:
             llm_model=profile.get("llm_model", ""),
             llm_key=profile.get("llm_key", ""),
             llm_base=profile.get("llm_base_url", ""),
-            default_video_api=profile.get("default_video_api", "mock"),
+            default_video_api=profile.get("default_video_api", "happyhorse"),
             kling_api_key=profile.get("kling_api_key", ""),
             kling_ak=profile.get("kling_access_key", ""),
             kling_sk=profile.get("kling_secret_key", ""),

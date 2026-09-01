@@ -283,6 +283,7 @@ class ProductionSettingsRequest(BaseModel):
     subtitle_mode: str | None = Field(default=None, pattern="^(off|dialogue|speaker)$")
     asr_enabled: bool | None = None
     asr_model: str | None = Field(default=None, max_length=80)
+    audio_mode: Literal["native_dialogue", "external_tts"] | None = None
 
 
 class VideoGenerationPolicyRequest(BaseModel):
@@ -416,6 +417,7 @@ def _state_to_json(state: DramaState) -> str:
         "output_video_path": state.output_video_path,
         "subtitle_enabled": state.subtitle_enabled,
         "subtitle_mode": state.subtitle_mode,
+        "assembly_audio_override": state.assembly_audio_override,
         "prompt_overrides": state.prompt_overrides,
         "prompt_policy": state.prompt_policy.model_dump(),
         "image_generation_policy": state.image_generation_policy,
@@ -813,6 +815,7 @@ def _state_from_json(json_str: str) -> DramaState:
             if data.get("subtitle_mode") in {"off", "dialogue", "speaker"}
             else ("dialogue" if bool(data.get("subtitle_enabled", True)) else "off")
         ),
+        assembly_audio_override=str(data.get("assembly_audio_override") or ""),
         prompt_overrides=data.get("prompt_overrides", {}),
         user_feedback=data.get("user_feedback", ""),
         scene_vision_descriptions=data.get("scene_vision_descriptions", {}),
@@ -1932,7 +1935,7 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
     """Freeze the exact prompt and ordered image references for one video task."""
     from src.services.video_capabilities import video_agent_for_policy
     from src.services.video_continuity import continuity_reference
-    from src.services.native_audio import append_native_dialogue_prompt
+    from src.services.native_audio import append_native_dialogue_prompt, build_dialogue_plan
 
     raw_prompt = _shot_prompt(state, scene_id).model_copy(deep=True)
     raw_prompt.duration_sec = _duration_for_video_policy(raw_prompt.duration_sec, policy)
@@ -2132,16 +2135,30 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
             state.scene_vision_descriptions,
             state.script,
         )
-    dialogue_plan: list[dict] = []
+    scene = _script_scene(state, scene_id)
+    dialogue_plan = build_dialogue_plan(scene)
     audio_mode_requested = str(getattr(state.creative_profile, "audio_mode", "auto") or "auto").lower()
     if audio_mode_requested not in {"auto", "native_dialogue", "external_tts"}:
         audio_mode_requested = "auto"
-    provider_supports_native = str(policy.get("provider") or "").lower() == "seedance"
-    native_audio_requested = provider_supports_native and audio_mode_requested != "external_tts"
+    capability = policy.get("capability") or {}
+    provider_name = str(policy.get("provider") or "").lower()
+    provider_supports_native = (
+        bool(capability.get("supports_native_dialogue"))
+        if "supports_native_dialogue" in capability
+        else provider_name == "seedance"
+    )
+    if audio_mode_requested == "native_dialogue" and not provider_supports_native:
+        model_name = str(policy.get("model") or policy.get("provider") or "当前模型")
+        raise ValueError(
+            f"{model_name} 不支持视频模型原生对白，请切换为外部 TTS 配音"
+        )
+    native_audio_requested = (
+        audio_mode_requested == "native_dialogue"
+        or (audio_mode_requested == "auto" and provider_supports_native)
+    )
     audio_mode_effective = "native_dialogue" if native_audio_requested else "external_tts"
     if native_audio_requested:
-        scene = _script_scene(state, scene_id)
-        final_provider_prompt, dialogue_plan = append_native_dialogue_prompt(
+        final_provider_prompt, _native_lines = append_native_dialogue_prompt(
             final_provider_prompt, scene,
         )
         prepared = prepared.model_copy(update={"prompt": final_provider_prompt})
@@ -2182,6 +2199,8 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         "native_audio_requested": native_audio_requested,
         "audio_mode_requested": audio_mode_requested,
         "audio_mode_effective": audio_mode_effective,
+        "audio_capability_status": str(capability.get("native_audio_status") or "unsupported"),
+        "audio_capability_reason": str(capability.get("native_audio_reason") or ""),
         "audio_policy": "native_dialogue_post_mix_bgm" if native_audio_requested else "external_tts_post_mix_bgm",
         "dialogue_plan": dialogue_plan,
     }
@@ -2319,7 +2338,7 @@ async def _prepare_auto_references(state: DramaState) -> None:
 
 
 def _production_payload(state: DramaState) -> dict:
-    from src.services.video_capabilities import normalize_video_policy, public_video_capabilities
+    from src.services.video_capabilities import audio_capability, normalize_video_policy, public_video_capabilities
     from src.services.audio_timeline import audio_summary
 
     # Legacy projects may not have a persisted project video policy yet.  The
@@ -2378,6 +2397,7 @@ def _production_payload(state: DramaState) -> dict:
         "audio": state.audio_assets.model_dump() if state.audio_assets else None,
         "audio_summary": audio_summary(state),
         "audio_mode": getattr(state.creative_profile, "audio_mode", "auto"),
+        "audio_capability": audio_capability(normalized_project_policy),
         "prompt_policy": state.prompt_policy.model_dump(),
         "image_generation_policy": state.image_generation_policy,
         "video_generation_policy": state.video_generation_policy,
@@ -2424,6 +2444,7 @@ async def _run_shot_video_job(project_id: str, scene_id: int, version_id: str) -
             version_id=version_id,
             generation_prompts=state.generation_prompts,
             prompt_policy=state.prompt_policy,
+            creative_profile=state.creative_profile,
         )
 
         latest = _load_project_state(project_id)

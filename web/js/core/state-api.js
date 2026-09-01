@@ -24,7 +24,7 @@ const API_BASE = window.location.origin;
 function defaultAppState() {
   return {
     projectId: '', projectName: '', videoRatio: '9:16', genreTags: [], artStyle: '',
-    visualStyleId: 'cinematic_cel', styleModifiers: [], visualStyles: [], audioMode: 'auto',
+    visualStyleId: 'cinematic_cel', styleModifiers: [], visualStyles: [], audioMode: 'native_dialogue',
     scriptInputMode: 'idea', sourceFilename: '', currentScript: null,
     scriptPhase: 'source_required', scriptDraftText: '', scriptDraftInstruction: '', draftJobId: '',
     stateJson: '', scriptText: '', roles: [], scenes: [], props: [], shots: [],

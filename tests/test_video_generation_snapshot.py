@@ -11,7 +11,7 @@ from src.agents.video_gen_agent import VideoGenerationAgent
 from src.graph.state import DramaState
 from src.schemas.assets import ShotAsset, ShotProductionState, ShotReference
 from src.schemas.prompt import GenerationPrompts, ShotPrompt
-from src.schemas.script import Scene, ScriptBreakdown
+from src.schemas.script import DialogueLine, Scene, ScriptBreakdown
 from src.schemas.project import CreativeProfile
 from src.services.video_capabilities import normalize_video_policy
 
@@ -107,9 +107,8 @@ def test_video_snapshot_respects_project_audio_mode(tmp_path, monkeypatch):
     assert external_seedance["native_audio_requested"] is False
 
     state.creative_profile = CreativeProfile(audio_mode="native_dialogue")
-    native_mock = api_context._build_video_generation_snapshot(state, 1, mock)
-    assert native_mock["audio_mode_effective"] == "external_tts"
-    assert native_mock["native_audio_requested"] is False
+    with pytest.raises(ValueError, match="不支持视频模型原生对白"):
+        api_context._build_video_generation_snapshot(state, 1, mock)
 
 
 def test_multi_reference_prompt_preserves_full_authored_timeline():
@@ -338,6 +337,7 @@ def test_wan_t2v_snapshot_marks_all_reference_images_as_ignored(tmp_path, monkey
     )
     reference.image_path and Path(reference.image_path).write_bytes(b"image")
     monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: [reference])
+    monkeypatch.setattr("src.services.video_capabilities.dashscope_available", lambda: True)
     policy = normalize_video_policy({"provider": "wan", "model": "wan2.6-t2v", "resolution": "1080p"})
 
     snapshot = api_context._build_video_generation_snapshot(state, 1, policy)
@@ -479,3 +479,48 @@ async def test_video_job_rejects_snapshot_when_a_frozen_reference_file_is_missin
             _JobContext(state.project_id),
             {"scene_id": 1, "generation_snapshot": snapshot},
         )
+
+
+def test_video_snapshot_keeps_dialogue_plan_for_external_tts(tmp_path, monkeypatch):
+    state = _state(tmp_path / "missing.png")
+    state.script.scenes[0].dialogue = [
+        DialogueLine(character="Hero", line="Do not forget me.", emotion="quiet"),
+    ]
+    state.creative_profile = CreativeProfile(audio_mode="external_tts")
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_: [])
+    policy = normalize_video_policy({
+        "provider": "seedance",
+        "model": "doubao-seedance-2-0-fast-260128",
+        "resolution": "720p",
+    })
+
+    snapshot = api_context._build_video_generation_snapshot(state, 1, policy)
+
+    assert snapshot["native_audio_requested"] is False
+    assert snapshot["audio_mode_effective"] == "external_tts"
+    assert snapshot["dialogue_plan"] == [{
+        "line_id": "1:1",
+        "character": "Hero",
+        "text": "Do not forget me.",
+        "emotion": "quiet",
+    }]
+    assert "【对白】" not in snapshot["provider_prompt"]
+
+
+def test_happyhorse_native_audio_mode_is_best_effort_not_rejected(tmp_path):
+    from src.api import context as api_context
+    from src.schemas.project import CreativeProfile
+    from src.services.video_capabilities import normalize_video_policy
+
+    test_state = _state(tmp_path / 'reference.png')
+    test_state.creative_profile = CreativeProfile(audio_mode='native_dialogue')
+    test_state.script.scenes[0].dialogue = [DialogueLine(character='Hero', line='Hello')]
+    policy = normalize_video_policy({
+        'provider': 'happyhorse', 'model': 'happyhorse-1.1-r2v', 'resolution': '1080p',
+    })
+    snapshot = api_context._build_video_generation_snapshot(test_state, 1, policy)
+
+    assert snapshot['audio_mode_effective'] == 'native_dialogue'
+    assert snapshot['native_audio_requested'] is True
+    assert snapshot['audio_capability_status'] == 'best_effort'
+    assert '【对白】' in snapshot['provider_prompt']

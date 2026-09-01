@@ -117,6 +117,7 @@ def audio_summary(state: Any) -> dict[str, Any]:
     return {
         "confirmed_voice_count": confirmed,
         "voice_count": voice_count,
+        "dialogue_count": len(expected_ids),
         "pending_line_count": pending,
         "failed_line_count": failed,
         "timing_conflict_count": conflicts,
@@ -125,6 +126,41 @@ def audio_summary(state: Any) -> dict[str, Any]:
         "timing_conflict_line_ids": timing_conflict_line_ids,
         "unresolved_line_count": len(unresolved_line_ids),
         "can_assemble": bool(script and confirmed == voice_count and not pending and not failed and not conflicts),
+    }
+
+
+def final_assembly_audio_preflight(state: Any, override: str = "") -> dict[str, Any]:
+    """Describe whether final assembly has usable dialogue audio.
+
+    Missing dialogue audio is intentionally a confirmation gate rather than an
+    unconditional failure: the caller may either generate/fix the audio or
+    explicitly choose a silent/no-dialogue assembly.
+    """
+
+    script = getattr(state, "script", None)
+    dialogue_count = sum(
+        len(getattr(scene, "dialogue", []) or [])
+        for scene in (script.scenes if script else [])
+    )
+    summary = audio_summary(state)
+    no_dialogue = dialogue_count == 0
+    explicitly_silent = override == "no_dialogue_confirmed"
+    ready = no_dialogue or explicitly_silent or bool(summary["can_assemble"])
+    requires_confirmation = bool(dialogue_count and not ready)
+    return {
+        "ready": ready,
+        "requires_confirmation": requires_confirmation,
+        "no_dialogue": explicitly_silent,
+        "dialogue_count": dialogue_count,
+        "unresolved_line_count": int(summary.get("unresolved_line_count") or 0),
+        "pending_line_ids": list(summary.get("pending_line_ids") or []),
+        "failed_line_ids": list(summary.get("failed_line_ids") or []),
+        "timing_conflict_line_ids": list(summary.get("timing_conflict_line_ids") or []),
+        "override": override if explicitly_silent else "",
+        "message": (
+            "\u5f53\u524d\u5bf9\u767d\u97f3\u9891\u4e0d\u5b8c\u6574\uff0c\u8bf7\u5148\u751f\u6210\u6216\u4fee\u590d\u5bf9\u767d\u97f3\u9891\uff1b\u4e5f\u53ef\u4ee5\u786e\u8ba4\u7ee7\u7eed\u751f\u6210\u65e0\u5bf9\u767d\u7248\u672c\u3002"
+            if requires_confirmation else ""
+        ),
     }
 
 

@@ -242,7 +242,7 @@ async function saveManualAsset() {
 // ═══════════════════════════════════════════════════════════════
 function openNewProjectModal() {
   const audioMode = document.getElementById('proj-audio-mode');
-  if (audioMode) audioMode.value = 'auto';
+  if (audioMode) audioMode.value = 'native_dialogue';
   appState.styleModifiers = [];
   document.querySelectorAll('#style-modifier-tags .selected').forEach(tag => tag.classList.remove('selected'));
   if (!appState.visualStyles.length) appState.visualStyles = mergeVisualStyleCatalog([]);
@@ -272,7 +272,7 @@ async function createProject() {
   const videoRatio = document.querySelector('[data-ratio].selected')?.dataset?.ratio || '9:16';
   appState.visualStyleId = visualStyleId;
   appState.artStyle = artStyle;
-  const audioMode = document.getElementById('proj-audio-mode')?.value || 'auto';
+  const audioMode = document.getElementById('proj-audio-mode')?.value || 'native_dialogue';
   const source = 'idea';
   resetProjectSession({ projectName: name, genreTags: genres, artStyle, visualStyleId, styleModifiers, videoRatio, audioMode });
   appState.scriptInputMode = source;

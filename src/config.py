@@ -91,7 +91,7 @@ ARK_MODEL = os.getenv("ARK_MODEL", "doubao-seedance-2-0-fast-260128")
 ARK_RESOLUTION = os.getenv("ARK_RESOLUTION", "1080p")
 
 # Default video generation settings
-DEFAULT_API = os.getenv("DEFAULT_VIDEO_API", "mock")  # "kling", "runway", "pika", "happyhorse", "seedance", "mock"
+DEFAULT_API = os.getenv("DEFAULT_VIDEO_API", "happyhorse")  # "kling", "runway", "pika", "happyhorse", "seedance", "mock"
 DEFAULT_ASPECT_RATIO = "9:16"  # Vertical video for short drama
 DEFAULT_DURATION_PER_SHOT = 5  # seconds
 MAX_RETRIES = 5
