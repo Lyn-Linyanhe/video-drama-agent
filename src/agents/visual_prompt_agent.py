@@ -7,7 +7,7 @@ import re
 import hashlib
 from src.schemas.script import ScriptBreakdown
 from src.schemas.visual import VisualDesign, SceneVisual
-from src.schemas.prompt import GenerationPrompts, ShotPrompt
+from src.schemas.prompt import GenerationPrompts, PromptAssemblyDiagnostic, ShotPrompt
 from src.utils.llm import get_llm_client
 from src.utils.visual_asset_manifest import (
     binding_for_scene,
@@ -35,28 +35,80 @@ _ENV_ACTION_CUES = (
     "怕", "担心", "紧张", "不安", "屏息", "颤抖", "发抖", "浸透", "被雨水",
     "发梢滴落", "从身上滴落", "顺着发梢", "衣角滴落", "从下巴滴落", "从额头滴落",
     "望向", "抬眼", "视线", "目光", "瞥向", "凝视", "盯着", "神色", "神情", "害怕", "心里",
+    "走到", "窜过", "泪痕", "泪水",
     "看着", "张望", "遥望", "低头", "抬头", "回头", "撞倒", "被撞倒", "门铃响", "铃响", "门铃轻响",
 )
 
 
-def _sanitize_environment(env: str) -> str:
-    """去掉环境文本中的人物动作/在场/交互/心理子句，保留静态环境事实并去重。"""
+def _environment_clause_is_dynamic(clause: str) -> bool:
+    """Detect narrative environment clauses without rejecting static location phrases."""
+    text = str(clause or "")
+    for cue in _ENV_ACTION_CUES:
+        if cue.casefold() not in text.casefold():
+            continue
+        # ``走到尽头的走廊`` is a spatial noun phrase, not a character action.
+        if cue == "走到" and re.search(r"走到(?:了)?(?:[^，；。]*的)?(?:走廊|通道|街道|巷道|楼梯)", text):
+            continue
+        return True
+    return False
+
+
+def _sanitize_environment_with_drops(env: str) -> tuple[str, list[str]]:
+    """Return stable environment clauses and the dynamic facts removed from them."""
     if not env:
-        return ""
+        return "", []
     kept: list[str] = []
+    dropped: list[str] = []
     seen: set[str] = set()
-    for raw in re.split(r"[。；;，,、\n]+", env):
+    seen_dropped: set[str] = set()
+    for raw in re.split(r"[。；;，,、\n]+", str(env)):
         clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
         if not clause:
             continue
-        if any(cue in clause for cue in _ENV_ACTION_CUES):
+        if _environment_clause_is_dynamic(clause):
+            key = clause.casefold()
+            if key not in seen_dropped:
+                seen_dropped.add(key)
+                dropped.append(clause)
             continue
         key = clause.casefold()
         if key in seen:
             continue
         seen.add(key)
         kept.append(clause)
-    return "；".join(kept)
+    return "；".join(kept), dropped
+
+
+def _sanitize_environment(env: str) -> str:
+    """去掉环境文本中的人物动作/在场/交互/心理子句，保留静态环境事实并去重。"""
+    return _sanitize_environment_with_drops(env)[0]
+
+
+def _build_shot_environment_context_with_drops(script, scene_id: int, environment_delta: str) -> tuple[str, list[str]]:
+    """Build one shot's environment from reusable location facts and this shot's static delta."""
+    scene = next((item for item in getattr(script, "scenes", []) if item.scene_id == scene_id), None)
+    location = location_for_scene(script, scene_id)
+    canonical = str(getattr(location, "canonical_name", "") or getattr(scene, "location", "") or "").strip()
+    stable_environment = str(getattr(location, "environment_description", "") or "").strip()
+    raw = "；".join(value for value in (canonical, stable_environment, str(environment_delta or "").strip()) if value)
+    clean, dropped = _sanitize_environment_with_drops(raw)
+    # A location identity is useful once, but must not be repeated in the
+    # environment body when the asset description already contains it.
+    clauses = [part for part in clean.split("；") if part]
+    if canonical:
+        canonical_key = canonical.casefold()
+        clauses = [part for part in clauses if part.casefold() != canonical_key]
+        has_canonical_context = any(
+            canonical_key in part.casefold() for part in clauses
+        )
+        if not has_canonical_context:
+            clauses.insert(0, canonical)
+    return "；".join(dict.fromkeys(clauses)), dropped
+
+
+def build_shot_environment_context(script, scene_id: int, environment_delta: str = "") -> str:
+    """Public deterministic environment context builder used by assembly and tests."""
+    return _build_shot_environment_context_with_drops(script, scene_id, environment_delta)[0]
 
 
 def _current_prop_anchor(name: str, description: str) -> str:
@@ -930,6 +982,7 @@ class VisualPromptAgent:
         merged_shots: list[ShotPrompt] = []
         global_en: dict[str, str] = {}
         global_cn: dict[str, str] = {}
+        merged_assembly_diagnostics: list[PromptAssemblyDiagnostic] = []
         overall_style = getattr(creative_profile, "art_style", "") or ""
         color_palette = ""
         aspect_ratio = getattr(creative_profile, "video_ratio", "") or "9:16"
@@ -968,6 +1021,7 @@ class VisualPromptAgent:
                 global_negative_prompt = prompts.global_negative_prompt
             merged_scene_visuals.extend(visual.scenes)
             merged_shots.extend(prompts.shots)
+            merged_assembly_diagnostics.extend(prompts.assembly_diagnostics)
             if prompts.shots:
                 scene.duration_sec = prompts.shots[0].duration_sec
 
@@ -1012,6 +1066,7 @@ class VisualPromptAgent:
                 needs_refresh=False,
                 global_negative_prompt=global_negative_prompt,
                 shots=merged_shots,
+                assembly_diagnostics=merged_assembly_diagnostics,
             ),
         )
 
@@ -1294,6 +1349,20 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 batch_size=getattr(shot, 'batch_size', 2) if shot else 2,
             ))
 
+        assembly_diagnostics: list[PromptAssemblyDiagnostic] = []
+        for scene in script.scenes:
+            shot = shot_by_scene.get(scene.scene_id)
+            environment_delta = getattr(shot, "environment_delta", "") if shot else ""
+            _environment, dropped = _build_shot_environment_context_with_drops(
+                script, scene.scene_id, environment_delta
+            )
+            assembly_diagnostics.append(PromptAssemblyDiagnostic(
+                scene_id=scene.scene_id,
+                added_sections=["environment"],
+                dropped_facts=dropped,
+                status="warning" if dropped else "clean",
+            ))
+
         _fit_duration_budget(prompt_shots, script, source_scene_durations, source_total)
 
         allowed_global_names = visual_character_names(script)
@@ -1322,6 +1391,7 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 "错误肢体，动作抖动，道具变形"
             ),
             shots=prompt_shots,
+            assembly_diagnostics=assembly_diagnostics,
         )
         if source_total <= 0:
             script.duration_sec = sum(int(scene.duration_sec or 0) for scene in script.scenes)
@@ -1348,7 +1418,11 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         for scene in script.scenes:
             if getattr(scene, "continuity_from_prev", False) and prev_delta is not None:
                 target = next((sp for sp in prompts.shots if sp.scene_id == scene.scene_id), None)
-                if target is not None and "【顺承上一镜】" not in target.prompt:
+                if (
+                    target is not None
+                    and scene.scene_id not in protected_scene_ids
+                    and "【顺承上一镜】" not in target.prompt
+                ):
                     segment = _build_continuity_segment(prev_delta)
                     target.prompt = target.prompt.rstrip() + "\n" + segment
             prev_delta = delta_by_scene.get(scene.scene_id, prev_delta)
@@ -1392,10 +1466,10 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             f"【主体状态】{getattr(shot, 'subject_state', '') or scene.action_description}。",
             f"【动作时间轴】{getattr(shot, 'action_timeline', '') or scene.action_description}。",
             (
-                "【环境】" + _sanitize_environment(
-                    f"{location.canonical_name if location else scene.location}。"
-                    f"{getattr(location, 'environment_description', '') or ''}。"
-                    f"{getattr(shot, 'environment_delta', '')}"
+                "【环境】" + build_shot_environment_context(
+                    script,
+                    scene.scene_id,
+                    getattr(shot, "environment_delta", ""),
                 )
             ).strip(),
             f"【镜头语言】{getattr(shot, 'camera_motion', '') or getattr(shot, 'composition', '') or scene.camera_direction}。",

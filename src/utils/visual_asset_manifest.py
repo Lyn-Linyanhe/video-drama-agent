@@ -97,6 +97,8 @@ DYNAMIC_ENVIRONMENT_CUES = {
     "被水泡", "泡开", "映出", "黑影", "发出", "涌出", "一闪而过", "水声", "放大", "扫过",
     "晃动", "裂开", "碎片", "突然", "画面缓缓停", "火漆", "印章",
     "发丝", "头发", "黑色中长发", "风衣", "大衣", "雨伞", "口罩", "鸭舌帽", "车窗", "轿车",
+    "望向", "抬眼", "视线", "目光", "瞥向", "盯着", "凝视", "神色", "神情",
+    "走到", "走向", "窜过", "泪痕", "泪水", "害怕", "担心", "心里",
     # Movement variants that commonly appear between a fixed fixture and a
     # destination (for example, "推开铁门并走入地下室").  They describe a
     # shot action and must never be persisted as reusable set dressing.
@@ -995,9 +997,14 @@ def _has_voice_or_action_cue(value: str) -> bool:
         "背靠", "站立", "站起", "靠墙", "瘫坐", "坐下", "躺着", "跪", "蜷缩", "斜靠", "倚",
         "抬手", "举手", "伸手", "挥手", "摆手", "抵住", "按住", "握住", "轻叩", "猛击", "敲门",
         "拍门", "拍打", "探头", "侧身", "俯身", "弯腰", "直起身", "打量", "扫视", "踮脚",
-        "望向", "抬眼", "瞥向", "凝视", "盯着", "神色", "神情",
+        "望向", "抬眼", "视线", "目光", "瞥向", "凝视", "盯着", "神色", "神情",
+        "走到", "走向", "窜过", "泪痕", "泪水", "害怕", "担心", "心里",
     }
-    if any(cue in text for cue in _ENVIRONMENT_DYNAMIC_CUES | person_action_cues):
+    for cue in _ENVIRONMENT_DYNAMIC_CUES | person_action_cues:
+        if cue not in text:
+            continue
+        if cue == "走到" and re.search(r"走到(?:了)?(?:[^，；。]*的)?(?:走廊|通道|街道|巷道|楼梯)", text):
+            continue
         return True
     return bool(re.search(r"(?:是|这是|那是).{0,8}(?:摄像头|声音|录音|脚步)", text))
 

@@ -1,7 +1,7 @@
 """Schema for generation prompts — output of Prompt Engineering Agent."""
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 
 
 class PromptPolicy(BaseModel):
@@ -34,6 +34,17 @@ class ShotPrompt(BaseModel):
     )
 
 
+class PromptAssemblyDiagnostic(BaseModel):
+    """Deterministic diagnostics emitted while assembling a shot prompt."""
+
+    scene_id: int
+    added_sections: list[str] = Field(default_factory=list)
+    dropped_facts: list[str] = Field(default_factory=list)
+    forbidden_conflicts: list[str] = Field(default_factory=list)
+    template_triggers: list[str] = Field(default_factory=list)
+    status: Literal["clean", "warning", "failed"] = "clean"
+
+
 class GenerationPrompts(BaseModel):
     """Collection of generation prompts for the entire drama."""
     api_provider: str = Field(description="Target API: kling, runway, pika, mock")
@@ -47,3 +58,7 @@ class GenerationPrompts(BaseModel):
     prompt_language: str = Field(default="zh-CN")
     needs_refresh: bool = Field(default=False, description="旧项目提示词未满足当前中文模板时为真")
     shots: list[ShotPrompt] = Field(description="One prompt per scene/shot")
+    assembly_diagnostics: list[PromptAssemblyDiagnostic] = Field(
+        default_factory=list,
+        description="Deterministic diagnostics from final prompt assembly; optional for legacy projects",
+    )
