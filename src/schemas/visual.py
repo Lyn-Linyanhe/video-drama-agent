@@ -1,6 +1,21 @@
 """Schema for visual design — output of Visual Design Agent."""
 
 from pydantic import BaseModel, Field
+from typing import Literal
+
+
+class CharacterProfileRepairResult(BaseModel):
+    """Outcome of optional character profile repair, with legacy unpacking support."""
+
+    english: dict[str, str] = Field(default_factory=dict)
+    chinese: dict[str, str] = Field(default_factory=dict)
+    status: Literal["clean", "repaired", "partial", "failed"]
+    errors: list[str] = Field(default_factory=list)
+
+    def __iter__(self):
+        # Existing callers historically unpacked ``(english, chinese)``.
+        yield self.english
+        yield self.chinese
 
 
 class SceneVisual(BaseModel):
@@ -34,3 +49,4 @@ class VisualDesign(BaseModel):
         description="中文版本的角色外貌描述（供前端展示使用）"
     )
     scenes: list[SceneVisual] = Field(description="Visual design per scene")
+    profile_repair_status: str | None = Field(default=None, description="Character profile repair status")

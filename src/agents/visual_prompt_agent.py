@@ -6,7 +6,7 @@ import random
 import re
 import hashlib
 from src.schemas.script import ScriptBreakdown
-from src.schemas.visual import VisualDesign, SceneVisual
+from src.schemas.visual import CharacterProfileRepairResult, VisualDesign, SceneVisual
 from src.schemas.prompt import GenerationPrompts, PromptAssemblyDiagnostic, ShotPrompt
 from src.utils.llm import get_llm_client
 from src.utils.visual_asset_manifest import (
@@ -182,6 +182,19 @@ def find_mutually_exclusive_character_states(script: ScriptBreakdown, character_
                 "scene_ids_by_state": matched,
             })
     return found
+
+
+
+def _remove_conflicting_character_state_terms(description: str, script: ScriptBreakdown, character_name: str) -> str:
+    """Remove only appearance families proven mutable across this character's scenes."""
+    text = str(description or "")
+    conflicts = {item.get("category") for item in find_mutually_exclusive_character_states(script, character_name)}
+    if "hair_length" in conflicts:
+        text = re.sub(r"(?:黑色|棕色|褐色|深褐色|浅色|金色)?(?:中长|长|短)发", "", text)
+    if "hair_texture" in conflicts:
+        text = re.sub(r"(?:自然)?(?:卷曲|卷发|直发)", "", text)
+    text = re.sub(r"[；，,、]{2,}", "；", text).strip("； ，,、")
+    return text
 
 
 def _stable_character_identity_description(description: str) -> str:
@@ -854,6 +867,7 @@ class VisualPromptAgent:
 - 每个镜头必须包含绑定 prop_ids 对应道具。道具是画面资产而非背景泛称：写清它在画面中的位置、形态或材质、与人物的交互和镜头结束状态；未绑定道具不得凭空新增。
 - environment_delta 只允许静态环境差异，禁止写入人物动作、情绪、在场或道具交互；没有静态差异时留空。"""
 
+        profile_repair_status = "not_needed"
         output = await self.llm.generate_structured(
             system_prompt=COMPACT_SYSTEM_PROMPT,
             user_prompt=user_prompt,
@@ -867,13 +881,20 @@ class VisualPromptAgent:
             output.global_character_descriptions_cn,
             script,
         ):
-            repaired_en, repaired_cn = await self.reextract_visible_characters(
+            repair_result = await self.reextract_visible_characters(
                 script,
                 source_text=source_text,
             )
+            repaired_en, repaired_cn = repair_result
+            profile_repair_status = repair_result.status
             output.global_character_descriptions = repaired_en
             output.global_character_descriptions_cn = repaired_cn
-        return self._split_output(output, script, prompt_overrides, creative_profile)
+        result = self._split_output(output, script, prompt_overrides, creative_profile)
+        if hasattr(result[0], "profile_repair_status"):
+            result[0].profile_repair_status = profile_repair_status
+        if telemetry is not None:
+            telemetry["character_profile_repair_status"] = profile_repair_status
+        return result
 
     async def _generate_global_visual(self, script, manifest_text, profile, telemetry):
         """Phase 1: one call for global visual design + all on-screen character profiles."""
@@ -1021,6 +1042,7 @@ class VisualPromptAgent:
             shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry, progress_callback=progress_callback)
             if telemetry is not None:
                 _merge_visualize_telemetry(telemetry, gmetrics)
+            profile_repair_status = "not_needed"
             output = _CompactVisualPromptOutput(
                 overall_style=global_out.overall_style,
                 color_palette=global_out.color_palette,
@@ -1033,12 +1055,19 @@ class VisualPromptAgent:
             if _repair_character_profiles and self._registry_needs_profile_repair(
                 output.global_character_descriptions_cn, script
             ):
-                repaired_en, repaired_cn = await self.reextract_visible_characters(
+                repair_result = await self.reextract_visible_characters(
                     script, source_text=source_text
                 )
+                repaired_en, repaired_cn = repair_result
+                profile_repair_status = repair_result.status
                 output.global_character_descriptions = repaired_en
                 output.global_character_descriptions_cn = repaired_cn
-            return self._split_output(output, script, prompt_overrides, creative_profile)
+            result = self._split_output(output, script, prompt_overrides, creative_profile)
+            if hasattr(result[0], "profile_repair_status"):
+                result[0].profile_repair_status = profile_repair_status
+            if telemetry is not None:
+                telemetry["character_profile_repair_status"] = profile_repair_status
+            return result
         except _job_canceled_type():
             raise
         except Exception:
@@ -1099,6 +1128,7 @@ class VisualPromptAgent:
         global_en: dict[str, str] = {}
         global_cn: dict[str, str] = {}
         merged_assembly_diagnostics: list[PromptAssemblyDiagnostic] = []
+        profile_repair_status = "not_needed"
         overall_style = getattr(creative_profile, "art_style", "") or ""
         color_palette = ""
         aspect_ratio = getattr(creative_profile, "video_ratio", "") or "9:16"
@@ -1135,6 +1165,8 @@ class VisualPromptAgent:
             global_cn.update(visual.global_character_descriptions_cn or {})
             if prompts.global_negative_prompt and not global_negative_prompt:
                 global_negative_prompt = prompts.global_negative_prompt
+            if getattr(visual, "profile_repair_status", None) not in (None, "not_needed"):
+                profile_repair_status = visual.profile_repair_status
             merged_scene_visuals.extend(visual.scenes)
             merged_shots.extend(prompts.shots)
             merged_assembly_diagnostics.extend(prompts.assembly_diagnostics)
@@ -1158,10 +1190,12 @@ class VisualPromptAgent:
                 })
 
         if _repair_character_profiles and self._registry_needs_profile_repair(global_cn, script):
-            repaired_en, repaired_cn = await self.reextract_visible_characters(
+            repair_result = await self.reextract_visible_characters(
                 script,
                 source_text=source_text,
             )
+            repaired_en, repaired_cn = repair_result
+            profile_repair_status = repair_result.status
             global_en.update(repaired_en)
             global_cn.update(repaired_cn)
 
@@ -1174,6 +1208,7 @@ class VisualPromptAgent:
                 global_character_descriptions=global_en,
                 global_character_descriptions_cn=global_cn,
                 scenes=merged_scene_visuals,
+                profile_repair_status=profile_repair_status,
             ),
             GenerationPrompts(
                 api_provider=self.api_provider,
@@ -1191,8 +1226,8 @@ class VisualPromptAgent:
         script: ScriptBreakdown,
         *,
         source_text: str = "",
-    ) -> tuple[dict[str, str], dict[str, str]]:
-        """Refresh only visible-role appearance registries without rewriting shot prompts."""
+    ) -> CharacterProfileRepairResult:
+        """Refresh visible-role appearance registries without rewriting shot prompts."""
         self.character_profile_repair_status = "generating"
         manifest_text = self._format_manifest(script)
         scenes_text = self._format_scenes(script)
@@ -1274,9 +1309,10 @@ class VisualPromptAgent:
                 self.character_profile_repair_status = "failed"
                 raise
             self.character_profile_repair_status = "partial"
-            return fallback
+            return CharacterProfileRepairResult(english=fallback[0], chinese=fallback[1], status="partial", errors=["角色侧写补偿请求失败，已保留资产清单描述"])
         english, chinese = canonicalize(output)
         errors = validation_errors(chinese)
+        had_validation_errors = bool(errors)
         if errors:
             visible_characters = {
                 character.name: character
@@ -1362,9 +1398,9 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 )
                 raise ValueError(f"人物侧写不完整：{error_text}")
             self.character_profile_repair_status = "partial"
-            return english, chinese
+            return CharacterProfileRepairResult(english=english, chinese=chinese, status="partial", errors=[f"{name}：{'、'.join(fields)}" for name, fields in errors.items()])
         self.character_profile_repair_status = "complete"
-        return english, chinese
+        return CharacterProfileRepairResult(english=english, chinese=chinese, status="repaired" if had_validation_errors else "clean", errors=[])
 
     def _registry_needs_profile_repair(
         self,
@@ -1710,7 +1746,19 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         """Map LLM aliases back to manifest names and never drop visible roles."""
         manifest = script.asset_manifest
         if not manifest:
-            return registry
+            result = {}
+            scene_names = {
+                str(name or "").strip()
+                for scene in getattr(script, "scenes", []) or []
+                for name in (getattr(scene, "characters", []) or [])
+                if str(name or "").strip()
+            }
+            for name, value in (registry or {}).items():
+                cleaned = _stable_character_identity_description(value) if not english else value
+                if not english and name in scene_names:
+                    cleaned = _remove_conflicting_character_state_terms(cleaned, script, name)
+                result[name] = cleaned
+            return result
         entries = list(registry.items())
         canonical: dict[str, str] = {}
         for character in manifest.characters:
@@ -1737,6 +1785,7 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                     script.scenes,
                 )
                 description = _stable_character_identity_description(description)
+                description = _remove_conflicting_character_state_terms(description, script, character.name)
             canonical[character.name] = description
         return canonical
 

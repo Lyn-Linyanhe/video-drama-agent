@@ -1,7 +1,7 @@
 import pytest
 from src.schemas.script import Scene, ScriptBreakdown, VisualAssetManifest, VisualCharacterAsset
 from src.schemas.prompt import GenerationPrompts, ShotPrompt
-from src.schemas.visual import SceneVisual, VisualDesign
+from src.schemas.visual import CharacterProfileRepairResult, SceneVisual, VisualDesign
 from src.schemas.character import CharacterImage, CharacterImageAssets
 from src.graph.state import DramaState
 from src.api.context import (
@@ -532,3 +532,16 @@ async def test_character_reextract_api_failure_uses_existing_asset_anchor():
 
     assert chinese["苏眠"] == "苏眠：米白色长风衣。"
     assert agent.character_profile_repair_status == "partial"
+
+
+
+def test_character_profile_repair_result_exposes_status_and_legacy_unpacking():
+    result = CharacterProfileRepairResult(
+        english={"角色A": "stable"}, chinese={"角色A": "稳定"},
+        status="partial", errors=["缺少发型"],
+    )
+
+    english, chinese = result
+    assert result.status == "partial"
+    assert english["角色A"] == "stable"
+    assert chinese["角色A"] == "稳定"
