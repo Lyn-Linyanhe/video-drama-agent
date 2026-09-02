@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/plans/2026-09-01-storyboard-fidelity-and-capacity.md`；真实测试证据：`tmp/real_magi_deepseek_e2e_20260901.json`。
 
+## 执行状态（2026-09-02）
+
+- Task 1–7 的代码、测试和本地验证已完成，已合并到本分支提交 `52e0445`。
+- 最新验证结果：`1013 passed, 2 skipped`；`compileall`、`git diff --check`、前端 UI 测试均通过。
+- 离线复检证据：`tmp/magi_storyboard_quality_after_current_fix_20260902.json`；对比报告：`tmp/magi_storyboard_quality_comparison_20260902.md`。
+- 当前复检结果：动态环境泄漏 `30 → 0`、角色状态冲突 `1 → 0`、对白覆盖率 `100%`、跨镜动态泄漏 `0`、时间轴冲突 `0`。
+- Task 8 的官方 DeepSeek 新线上复测已实际发起，但于 2026-09-02 在 `script.analyze` 阶段返回 HTTP 402 `Insufficient Balance`；失败证据保存于 `tmp/real_magi_deepseek_after_fix_20260902.json`，未伪装成质量通过，也未重复消耗请求。
+- 因此“代码/本地回归”已完成；“同一剧本的新线上模型输出对比”仍等待官方账户余额恢复后才能验收。Kimi、本轮视频生成和原始剧本均未改动。
+
 ## Global Constraints
 
 - 不修改用户原始剧本正文，不自动改写 `script_draft_text`。
