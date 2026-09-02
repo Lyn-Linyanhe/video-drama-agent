@@ -13,11 +13,14 @@
 ## 执行状态（2026-09-02）
 
 - Task 1–7 的代码、测试和本地验证已完成，已合并到本分支提交 `52e0445`。
-- 最新验证结果：`1013 passed, 2 skipped`；`compileall`、`git diff --check`、前端 UI 测试均通过。
-- 离线复检证据：`tmp/magi_storyboard_quality_after_current_fix_20260902.json`；对比报告：`tmp/magi_storyboard_quality_comparison_20260902.md`。
+- 最新验证结果：`1014 passed, 2 skipped`；`compileall`、`git diff --check`、前端 UI 测试均通过。
+- 离线复检证据：`tmp/magi_storyboard_quality_after_current_fix_20260902.json`；对比报告：`tmp/magi_storyboard_quality_comparison_20260902_rerun.md`。
 - 当前复检结果：动态环境泄漏 `30 → 0`、角色状态冲突 `1 → 0`、对白覆盖率 `100%`、跨镜动态泄漏 `0`、时间轴冲突 `0`。
-- Task 8 的官方 DeepSeek 新线上复测已实际发起，但于 2026-09-02 在 `script.analyze` 阶段返回 HTTP 402 `Insufficient Balance`；失败证据保存于 `tmp/real_magi_deepseek_after_fix_20260902.json`，未伪装成质量通过，也未重复消耗请求。
-- 因此“代码/本地回归”已完成；“同一剧本的新线上模型输出对比”仍等待官方账户余额恢复后才能验收。Kimi、本轮视频生成和原始剧本均未改动。
+- Task 8 的首次官方 DeepSeek 尝试于 2026-09-02 在 `script.analyze` 阶段返回 HTTP 402 `Insufficient Balance`；失败证据保存在 `tmp/real_magi_deepseek_after_fix_20260902.json`，未伪装成质量通过。
+- 余额恢复后已使用同一输入成功完成官方 DeepSeek 真实链路：`deepseek-v4-flash`、`reasoning_effort=high`、总耗时 `666.22s`，输出 12 镜头 / 111 秒；复审结果 `clean`，对白覆盖率 100%，环境/角色状态/方向/跨镜/时间轴/承载量指标均为 0。证据目录：`tmp/deepseek_rerun_20260902/`。
+- 复测还暴露出审计器把“打开/离开”的合法同义改写误报为缺失动作；已在提交 `529c214` 中收紧为仅检查高置信词，并新增回归测试。修复后全量回归为 `1014 passed, 2 skipped`。
+- 角色侧写修复状态为 `partial`（仅“发型与发色”补偿未完成），但已降级为可追踪 warning，不再阻断分镜生成；这是后续可优化项。
+- 因此 Task 1–8 的代码、测试和真实 DeepSeek 复测均已有证据；Kimi、本轮视频生成和原始剧本均未改动。
 
 ## Global Constraints
 
@@ -775,8 +778,3 @@ git commit -m "fix: improve storyboard fidelity from real DeepSeek evidence"
 - **质量闭环：** Task 1 固定指标，Task 2-7 修复与审计，Task 8 重新真实调用 DeepSeek，避免只靠单元测试宣称改善。
 - **范围边界：** 没有改变 DeepSeek 配置、Kimi 逻辑、原始剧本或视频模型调用；后续修改门禁仍遵守“首次 Kimi 强制，后续改动只提示”的既定决策。
 - **可回归性：** 所有核心问题都有失败测试、实现测试和真实复测指标；不依赖固定镜头编号，不会因解析拆分而误判。
-
-
-
-
-
