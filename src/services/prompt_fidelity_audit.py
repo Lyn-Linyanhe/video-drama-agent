@@ -63,7 +63,11 @@ def _positive_prompt_evidence(prompt: str) -> str:
 
 def _action_tokens(action: str) -> list[str]:
     # Only extract unambiguous, observable anchors; semantic paraphrases stay with Kimi.
-    terms = ("推门", "开门", "走出", "冲出", "离开", "拿起", "放下", "打开", "关闭", "锁上", "递给", "接过", "拔出", "塞进", "藏到身后", "监控", "猫眼")
+    # These are intentionally high-confidence lexical anchors only. Actions such as
+    # “打开” and “离开” have many valid context-dependent paraphrases (e.g.
+    # “撕开包装纸” / “转身离柜”), so semantic coverage belongs to Kimi or
+    # human review rather than a deterministic exact-token warning.
+    terms = ("推门", "开门", "走出", "冲出", "拿起", "放下", "关闭", "锁上", "递给", "接过", "拔出", "塞进", "藏到身后", "监控", "猫眼")
     return list(dict.fromkeys(term for term in terms if term in str(action or "")))
 
 

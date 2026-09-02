@@ -40,3 +40,34 @@ def test_asset_audit_uses_location_and_prop_ids():
     report = audit_prompt_fidelity(script, prompts)
     assert {item.issue_code for item in report.issues} >= {"invalid_asset_reference"}
     assert report.status == "blocked"
+from src.schemas.prompt import GenerationPrompts, ShotPrompt
+from src.schemas.script import Scene, ScriptBreakdown
+from src.services.prompt_fidelity_audit import audit_prompt_fidelity
+
+
+def test_semantic_action_paraphrases_do_not_create_deterministic_missing_anchor_false_positive():
+    script = ScriptBreakdown(
+        title="动作同义改写", genre="测试", logline="测试", duration_sec=7,
+        narration_style="无旁白",
+        scenes=[Scene(
+            scene_id=1,
+            duration_sec=7,
+            location="珠宝柜台",
+            characters=["德拉"],
+            action_description="德拉打开包装并离开柜台。",
+            camera_direction="中近景",
+            emotion_tone="期待",
+        )],
+    )
+    prompts = GenerationPrompts(
+        api_provider="mock",
+        shots=[ShotPrompt(
+            scene_id=1,
+            duration_sec=7,
+            prompt="【动作时间轴】德拉撕开包装纸，露出物品，随后转身离柜。",
+        )],
+    )
+
+    report = audit_prompt_fidelity(script, prompts)
+
+    assert not any(item.issue_code == "action_anchor_missing" for item in report.issues)
