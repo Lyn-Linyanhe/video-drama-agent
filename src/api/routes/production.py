@@ -290,6 +290,12 @@ def _schedule_shot_video_job(state: DramaState, scene_id: int) -> str:
 @router.post("/api/projects/{project_id}/production/shots/{scene_id}/generate", status_code=202)
 async def generate_project_production_shot(project_id: str, scene_id: int):
     state = _load_project_state(project_id)
+    fidelity_report = audit_current_prompt_fidelity(state)
+    state.prompt_fidelity = fidelity_report.model_dump()
+    fidelity_detail = prompt_fidelity_gate_detail(fidelity_report)
+    if fidelity_detail:
+        _save_project_state(state)
+        raise HTTPException(409, detail=fidelity_detail)
     _shot_prompt(state, scene_id)
     await _prepare_auto_references(state)
     production = _ensure_shot_production(state, scene_id)
@@ -325,6 +331,12 @@ async def generate_project_production_shot(project_id: str, scene_id: int):
 @router.post("/api/projects/{project_id}/production/generate-pending", status_code=202)
 async def generate_project_pending_shots(project_id: str):
     state = _load_project_state(project_id)
+    fidelity_report = audit_current_prompt_fidelity(state)
+    state.prompt_fidelity = fidelity_report.model_dump()
+    fidelity_detail = prompt_fidelity_gate_detail(fidelity_report)
+    if fidelity_detail:
+        _save_project_state(state)
+        raise HTTPException(409, detail=fidelity_detail)
     await _prepare_auto_references(state)
     scheduled: list[int] = []
     specs: list[dict] = []

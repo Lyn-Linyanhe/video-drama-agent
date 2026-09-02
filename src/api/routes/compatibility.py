@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 from ..context import *
+from src.services.prompt_fidelity_gate import prompt_fidelity_gate_detail
 
 router = APIRouter()
 
@@ -9,6 +10,15 @@ router = APIRouter()
 async def generate_videos(req: StageRequest):
     """第 4 步：生成视频片段。"""
     state = _state_from_json(req.state_json)
+    fidelity_report = audit_current_prompt_fidelity(state)
+    state.prompt_fidelity = fidelity_report.model_dump()
+    if fidelity_report.blocked:
+        detail = prompt_fidelity_gate_detail(fidelity_report) or {}
+        return StageResponse(
+            state_json=_state_to_json(state),
+            log=[],
+            error=json.dumps(detail, ensure_ascii=False),
+        )
     try:
         result = await orchestrator.run_stage(4, state)
     except Exception as e:

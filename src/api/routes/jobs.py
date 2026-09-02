@@ -45,6 +45,7 @@ from src.schemas.prompt_review import PromptReviewIssue
 from src.agents.prompt_review_agent import PromptReviewAgent
 from src.config import MAX_PROMPT_REVISION_ROUNDS
 from src.services.job_manager import JobCanceled
+from src.services.prompt_fidelity_gate import audit_current_prompt_fidelity, audit_generation_snapshot, prompt_fidelity_gate_detail
 from src.services.prompt_review_facts import (
     audit_snapshot_signature as _audit_snapshot_signature,
     build_audit_snapshot as _build_prompt_review_snapshot,
@@ -60,6 +61,26 @@ def _job_hooks(context) -> GenerationHooks:
         provider_task_callback=context.provider_task,
         cancel_callback=context.check_cancelled,
     )
+
+
+def _validate_video_job_target(context, scene_id: int) -> None:
+    """Bind a video payload to the persisted job target before provider work."""
+    manager = getattr(context, "manager", None)
+    store = getattr(manager, "store", None)
+    getter = getattr(store, "get_job_by_id", None)
+    if not callable(getter):
+        return
+    job = getter(getattr(context, "job_id", "")) or {}
+    if job.get("target_type") != "shot" or not str(job.get("target_id") or "").strip():
+        return
+    try:
+        target_scene_id = int(job["target_id"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("视频任务持久化目标镜头编号无效") from exc
+    if target_scene_id != int(scene_id):
+        raise ValueError(
+            f"视频任务目标镜头与请求镜头不一致：任务目标为 {target_scene_id}，请求为 {scene_id}"
+        )
 
 
 def _organize_provider_tail_frame(project_id: str, scene_id: int, version_id: str, path: str | None) -> str:
@@ -674,6 +695,7 @@ async def _job_prompt_revise(context, payload: dict) -> dict:
     async with context.project_lock:
         latest = _load_project_state(context.project_id, require_visual=False, require_script=False)
         latest.generation_prompts = revised
+        latest.prompt_fidelity = audit_current_prompt_fidelity(latest).model_dump()
         latest.prompt_review = {
             **dict(latest.prompt_review or {}),
             "status": "revised",
@@ -777,6 +799,7 @@ async def _job_script_visualize(context, payload: dict) -> dict:
         latest.visual_script_signature = latest_signature
         latest.visual_design = visual
         latest.generation_prompts = generation_prompts
+        latest.prompt_fidelity = audit_current_prompt_fidelity(latest).model_dump()
         latest.visual_stage = "ready"
         latest.visual_stage_error = ""
         latest.visual_job_id = context.job_id
@@ -1037,10 +1060,21 @@ async def _mark_video_job_stopped(project_id: str, scene_id: int, message: str) 
 
 async def _job_video_generate(context, payload: dict) -> dict:
     scene_id = int(payload.get("scene_id") or 0)
+    _validate_video_job_target(context, scene_id)
     context.progress("preparing", 0, 1, "正在准备分镜参考图")
     snapshot = payload.get("generation_snapshot") or {}
     async with context.project_lock:
         state = _load_project_state(context.project_id)
+        fidelity_report = (
+            audit_generation_snapshot(state, snapshot, scene_id)
+            if snapshot and not snapshot.get("references_pending")
+            else audit_current_prompt_fidelity(state)
+        )
+        state.prompt_fidelity = fidelity_report.model_dump()
+        fidelity_detail = prompt_fidelity_gate_detail(fidelity_report)
+        if fidelity_detail:
+            _save_project_state(state)
+            raise ValueError(json.dumps(fidelity_detail, ensure_ascii=False))
         production = _ensure_shot_production(state, scene_id)
         if not snapshot:
             await _prepare_auto_references(state)
@@ -1055,18 +1089,19 @@ async def _job_video_generate(context, payload: dict) -> dict:
             if snapshot.get("references_pending"):
                 # The toolbar submits one job before references exist.
                 # Prepare them here, then freeze a fresh provider snapshot.
-                submitted_snapshot = dict(snapshot)
                 await _prepare_auto_references(state)
-                refreshed_snapshot = _build_video_generation_snapshot(state, scene_id, policy)
-                for key in (
-                    "raw_prompt", "raw_negative_prompt", "prepared_shot", "provider",
-                    "effective_prompt", "effective_negative_prompt", "provider_prompt",
-                    "provider_negative_prompt", "negative_prompt_mode", "policy",
-                ):
-                    if key in submitted_snapshot:
-                        refreshed_snapshot[key] = submitted_snapshot[key]
-                snapshot = refreshed_snapshot
+                # Prompt, duration, policy and provider payload are rebuilt from
+                # the current state.  Only the pending-reference marker is
+                # trusted from the queued request; otherwise a forged/old
+                # prepared_shot could survive the refresh.
+                snapshot = _build_video_generation_snapshot(state, scene_id, policy)
                 snapshot["references_pending"] = False
+                refreshed_report = audit_generation_snapshot(state, snapshot, scene_id)
+                refreshed_detail = prompt_fidelity_gate_detail(refreshed_report)
+                if refreshed_detail:
+                    state.prompt_fidelity = refreshed_report.model_dump()
+                    _save_project_state(state)
+                    raise ValueError(json.dumps(refreshed_detail, ensure_ascii=False))
                 production.last_generation_snapshot = snapshot
                 _save_project_state(state)
             if snapshot.get("references_pending"):
@@ -1074,6 +1109,10 @@ async def _job_video_generate(context, payload: dict) -> dict:
     context.check_cancelled()
     state = _load_project_state(context.project_id)
     production = _ensure_shot_production(state, scene_id)
+    snapshot_report = audit_generation_snapshot(state, snapshot, scene_id)
+    snapshot_detail = prompt_fidelity_gate_detail(snapshot_report)
+    if snapshot_detail:
+        raise ValueError(json.dumps(snapshot_detail, ensure_ascii=False))
     prompt = ShotPrompt.model_validate(snapshot.get("prepared_shot") or {
         "scene_id": scene_id,
         "prompt": snapshot.get("provider_prompt") or snapshot.get("raw_prompt") or "",
@@ -1794,6 +1833,12 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
         })
     elif req.job_type == "video.generate":
         state = _load_project_state(project_id)
+        fidelity_report = audit_current_prompt_fidelity(state)
+        state.prompt_fidelity = fidelity_report.model_dump()
+        _save_project_state(state)
+        fidelity_detail = prompt_fidelity_gate_detail(fidelity_report)
+        if fidelity_detail:
+            raise HTTPException(409, detail=fidelity_detail)
         if _prompt_review_blocks_generation(state):
             raise HTTPException(409, "Kimi 审核发现确定性结构错误；请修复后重新审核再生成视频")
         scene_id = int(req.payload.get("scene_id") or req.target_id or 0)

@@ -37,3 +37,24 @@ def test_quality_audit_reports_dialogue_coverage_and_evidence():
     result = audit_storyboard_quality(script, prompts)
     assert result["dialogue_total"] == 0
     assert isinstance(result["evidence"], list)
+
+def test_quality_audit_reports_direction_and_cross_shot_metrics_from_fidelity_rules():
+    from src.schemas.prompt import GenerationPrompts, ShotPrompt
+    from src.schemas.script import Scene, ScriptBreakdown
+    from scripts.run_storyboard_quality_check import audit_storyboard_quality
+
+    script = ScriptBreakdown(
+        title="metrics", genre="测试", logline="测试", duration_sec=10,
+        narration_style="无旁白",
+        scenes=[
+            Scene(scene_id=1, duration_sec=5, location="门内", characters=["甲"], action_description="甲进入房间。雨水持续冲刷窗户", camera_direction="近景", emotion_tone="紧张"),
+            Scene(scene_id=2, duration_sec=5, location="室内", characters=["甲"], action_description="甲抬头观察", camera_direction="近景", emotion_tone="紧张", continuity_from_prev=False),
+        ],
+    )
+    prompts = GenerationPrompts(api_provider="mock", shots=[
+        ShotPrompt(scene_id=1, duration_sec=5, prompt="【动作时间轴】甲走出房间。"),
+        ShotPrompt(scene_id=2, duration_sec=5, prompt="【动作时间轴】甲抬头观察。\n【环境】上一镜动作：雨水持续冲刷窗户。"),
+    ])
+    result = audit_storyboard_quality(script, prompts)
+    assert result["direction_conflicts"] >= 1
+    assert result["cross_shot_leaks"] >= 1

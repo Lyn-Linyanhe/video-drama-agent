@@ -386,15 +386,12 @@ async def test_video_job_uses_and_persists_frozen_snapshot(tmp_path, monkeypatch
     monkeypatch.setattr(jobs, "extract_tail_frame", lambda *_args: None)
     monkeypatch.setattr(jobs, "mark_dependents_stale", lambda *_args: None)
 
-    result = await jobs._job_video_generate(
-        _JobContext(state.project_id),
-        {"scene_id": 1, "generation_snapshot": snapshot},
-    )
-
-    assert captured["provider_prompt"] == snapshot["provider_prompt"]
-    assert captured["references"] == [str(reference_path)]
-    assert state.shot_productions[1].video_versions[-1].generation_snapshot == snapshot
-    assert result["generation_snapshot"] == snapshot
+    with pytest.raises(ValueError, match="snapshot_prompt_mismatch"):
+        await jobs._job_video_generate(
+            _JobContext(state.project_id),
+            {"scene_id": 1, "generation_snapshot": snapshot},
+        )
+    assert captured == {}
 
 
 @pytest.mark.asyncio
@@ -413,13 +410,7 @@ async def test_video_job_prepares_references_for_pending_snapshot(tmp_path, monk
     }
     refreshed = api_context._build_video_generation_snapshot(state, 1, policy)
     refreshed["references_pending"] = False
-    pending["prepared_shot"] = {**refreshed["prepared_shot"], "prompt": "frozen prompt"}
-    pending["provider_prompt"] = "frozen provider prompt"
-    expected = {
-        **refreshed,
-        "prepared_shot": pending["prepared_shot"],
-        "provider_prompt": pending["provider_prompt"],
-    }
+    expected = {**refreshed}
     calls = []
     captured = {}
 
@@ -448,8 +439,8 @@ async def test_video_job_prepares_references_for_pending_snapshot(tmp_path, monk
 
     assert calls == [True]
     assert captured["references"] == [str(reference_path)]
-    assert result["generation_snapshot"]["prepared_shot"]["prompt"] == "frozen prompt"
-    assert result["generation_snapshot"]["provider_prompt"] == "frozen provider prompt"
+    assert result["generation_snapshot"]["prepared_shot"]["prompt"] == refreshed["prepared_shot"]["prompt"]
+    assert result["generation_snapshot"]["provider_prompt"] == refreshed["provider_prompt"]
     assert result["generation_snapshot"] == expected
 
 
@@ -459,8 +450,12 @@ async def test_video_job_rejects_snapshot_when_a_frozen_reference_file_is_missin
     state = _state(reference_path)
     snapshot = {
         "scene_id": 1,
-        "prepared_shot": ShotPrompt(scene_id=1, prompt="submitted", duration_sec=5).model_dump(),
-        "provider_prompt": "submitted",
+        "source_prompt": "submitted prompt",
+        "source_duration_sec": 5,
+        "effective_duration_sec": 5,
+        "raw_prompt": "submitted prompt",
+        "prepared_shot": ShotPrompt(scene_id=1, prompt="submitted prompt", duration_sec=5).model_dump(),
+        "provider_prompt": "submitted prompt",
         "provider_negative_prompt": "",
         "references": [{
             "reference_id": "character|Hero|front_full",
@@ -471,6 +466,8 @@ async def test_video_job_rejects_snapshot_when_a_frozen_reference_file_is_missin
         }],
         "policy": {"provider": "mock", "model": "mock", "resolution": "720p", "unit_price_rmb_per_sec": 0.0},
     }
+    from src.services.prompt_fidelity_gate import generation_snapshot_digest
+    snapshot["prompt_snapshot_digest"] = generation_snapshot_digest(snapshot)
     monkeypatch.setattr(jobs, "_load_project_state", lambda _project_id: state)
     monkeypatch.setattr(jobs, "_save_project_state", lambda _state: None)
 

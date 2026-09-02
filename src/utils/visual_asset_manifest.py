@@ -1009,6 +1009,58 @@ def _has_voice_or_action_cue(value: str) -> bool:
     return bool(re.search(r"(?:是|这是|那是).{0,8}(?:摄像头|声音|录音|脚步)", text))
 
 
+def extract_static_environment_facts(text: str) -> list[str]:
+    """Extract reusable physical environment facts from mixed narrative text.
+
+    This is intentionally conservative: clauses that describe a person, a
+    temporary interaction, dialogue, or a plot event are omitted. Continuous
+    weather/light and fixed spatial nouns remain reusable even when they use a
+    dynamic verb such as ``滴落``.
+    """
+    generic_static_terms = (
+        "室内", "室外", "内部", "外部", "房间", "公寓", "客厅", "起居室",
+        "卧室", "大厅", "走廊", "街", "巷", "楼道", "门口", "入口",
+        "雨", "风", "雪", "雾", "天色", "光线", "冷光", "暖光",
+    )
+    continuous_subjects = (
+        "灯光", "光线", "雨水", "雨幕", "雨", "风", "雪", "雾", "水汽",
+        "积水", "水痕", "尘雾", "尘土", "烟雾", "天色",
+    )
+    transient_person_cues = (
+        "望向", "抬眼", "视线", "目光", "瞥向", "凝视", "盯着", "神色", "神情",
+        "走到", "走向", "走进", "走出", "窜过", "蹲", "站在", "坐在", "拿着",
+        "握住", "抬手", "转身", "泪痕", "泪水", "害怕", "担心", "心里",
+    )
+    facts: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[。！？!?；;，,、\n]+", str(text or "")):
+        clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
+        if not clause:
+            continue
+        if _has_voice_or_action_cue(clause):
+            is_continuous_environment = (
+                any(term in clause for term in continuous_subjects)
+                and not any(term in clause for term in transient_person_cues)
+                and not re.search(r"(?:发梢|衣角|身上|下巴|额头|猫|人物|角色)", clause)
+            )
+            if not is_continuous_environment:
+                continue
+        if re.search(r"(?:对白|说话|声音|脚步声|旁白|台词)", clause):
+            continue
+        if not any(term in clause for term in STATIC_ENVIRONMENT_TERMS | set(generic_static_terms)):
+            # A caller may provide a project-specific static noun phrase that
+            # is not in the shared vocabulary.  Once action/voice/transient
+            # cues have been excluded, retaining it is safer than silently
+            # deleting a legitimate set detail.
+            if any(term in clause for term in TRANSIENT_ENVIRONMENT_TERMS):
+                continue
+        key = clause.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(clause)
+    return facts
+
 def _static_fragment_from_clause(clause: str) -> str:
     """Return the legacy noun-only fragment formerly recovered from an action."""
     found = [

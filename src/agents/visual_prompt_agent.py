@@ -17,6 +17,7 @@ from src.utils.visual_asset_manifest import (
     on_screen_character_names,
     props_for_scene,
     visual_character_names,
+    extract_static_environment_facts,
 )
 from src.services.timed_prompt_composer import apply_timed_prompt_structure
 from src.services.shot_capacity import analyze_shot_capacity
@@ -26,6 +27,17 @@ from src.config import DEFAULT_API
 def _job_canceled_type():
     from src.services.job_manager import JobCanceled
     return JobCanceled
+
+
+def _apply_profile_repair_metadata(visual_design, telemetry: dict | None, status: str, errors: list[str] | None = None) -> None:
+    """Persist character-profile repair outcome on both result and telemetry."""
+    normalized_errors = [str(item) for item in (errors or []) if str(item).strip()]
+    if hasattr(visual_design, "profile_repair_status"):
+        visual_design.profile_repair_status = status
+        visual_design.profile_repair_errors = normalized_errors
+    if telemetry is not None:
+        telemetry["character_profile_repair_status"] = status
+        telemetry["character_profile_repair_errors"] = normalized_errors
 
 
 _ENV_ACTION_CUES = (
@@ -85,13 +97,45 @@ def _sanitize_environment(env: str) -> str:
     return _sanitize_environment_with_drops(env)[0]
 
 
+def _build_prompt_assembly_diagnostic(
+    scene_id: int,
+    prompt: str,
+    *,
+    dropped_facts: list[str] | None = None,
+) -> PromptAssemblyDiagnostic:
+    """Diagnose the final assembled prompt, not only the model's compact output."""
+    environment_match = re.search(r"【环境】(.*?)(?=\n【|$)", str(prompt or ""), re.S)
+    environment = environment_match.group(1).strip() if environment_match else ""
+    remaining_dynamic = []
+    for raw in re.split(r"[。；;，,、\n]+", environment):
+        clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
+        if clause and _environment_clause_is_dynamic(clause) and clause not in remaining_dynamic:
+            remaining_dynamic.append(clause)
+    sections = [match.group(1) for match in re.finditer(r"【([^】]+)】", str(prompt or ""))]
+    return PromptAssemblyDiagnostic(
+        scene_id=int(scene_id),
+        added_sections=sections,
+        dropped_facts=list(dropped_facts or []),
+        forbidden_conflicts=remaining_dynamic,
+        status="failed" if remaining_dynamic else ("warning" if dropped_facts else "clean"),
+    )
+
+
 def _build_shot_environment_context_with_drops(script, scene_id: int, environment_delta: str) -> tuple[str, list[str]]:
     """Build one shot's environment from reusable location facts and this shot's static delta."""
     scene = next((item for item in getattr(script, "scenes", []) if item.scene_id == scene_id), None)
     location = location_for_scene(script, scene_id)
     canonical = str(getattr(location, "canonical_name", "") or getattr(scene, "location", "") or "").strip()
-    stable_environment = str(getattr(location, "environment_description", "") or "").strip()
-    raw = "；".join(value for value in (canonical, stable_environment, str(environment_delta or "").strip()) if value)
+    stable_source = "；".join(
+        value for value in (
+            getattr(location, "identity_description", "") if location else "",
+            getattr(location, "fixed_dressing", "") if location else "",
+            getattr(location, "environment_description", "") if location else "",
+        ) if str(value or "").strip()
+    )
+    stable_environment = "；".join(extract_static_environment_facts(stable_source))
+    shot_static_delta = "；".join(extract_static_environment_facts(str(environment_delta or "")))
+    raw = "；".join(value for value in (canonical, stable_environment, shot_static_delta) if value)
     clean, dropped = _sanitize_environment_with_drops(raw)
     # A location identity is useful once, but must not be repeated in the
     # environment body when the asset description already contains it.
@@ -940,12 +984,9 @@ class VisualPromptAgent:
             output.global_character_descriptions = repaired_en
             output.global_character_descriptions_cn = repaired_cn
         result = self._split_output(output, script, prompt_overrides, creative_profile)
-        if hasattr(result[0], "profile_repair_status"):
-            result[0].profile_repair_status = profile_repair_status
-            result[0].profile_repair_errors = profile_repair_errors
-        if telemetry is not None:
-            telemetry["character_profile_repair_status"] = profile_repair_status
-            telemetry["character_profile_repair_errors"] = profile_repair_errors
+        _apply_profile_repair_metadata(
+            result[0], telemetry, profile_repair_status, profile_repair_errors
+        )
         return result
 
     async def _generate_global_visual(self, script, manifest_text, profile, telemetry):
@@ -1095,6 +1136,7 @@ class VisualPromptAgent:
             if telemetry is not None:
                 _merge_visualize_telemetry(telemetry, gmetrics)
             profile_repair_status = "not_needed"
+            profile_repair_errors: list[str] = []
             output = _CompactVisualPromptOutput(
                 overall_style=global_out.overall_style,
                 color_palette=global_out.color_palette,
@@ -1112,13 +1154,13 @@ class VisualPromptAgent:
                 )
                 repaired_en, repaired_cn = repair_result
                 profile_repair_status = repair_result.status
+                profile_repair_errors = list(repair_result.errors or [])
                 output.global_character_descriptions = repaired_en
                 output.global_character_descriptions_cn = repaired_cn
             result = self._split_output(output, script, prompt_overrides, creative_profile)
-            if hasattr(result[0], "profile_repair_status"):
-                result[0].profile_repair_status = profile_repair_status
-            if telemetry is not None:
-                telemetry["character_profile_repair_status"] = profile_repair_status
+            _apply_profile_repair_metadata(
+                result[0], telemetry, profile_repair_status, profile_repair_errors
+            )
             return result
         except _job_canceled_type():
             raise
@@ -1460,8 +1502,14 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                     for name in unresolved_without_identity
                 )
                 raise ValueError(f"人物侧写不完整：{error_text}")
-            self.character_profile_repair_status = "partial"
-            return CharacterProfileRepairResult(english=english, chinese=chinese, status="partial", errors=repair_errors + [f"{name}：{'、'.join(fields)}" for name, fields in errors.items()])
+            status = "failed" if repair_errors else "partial"
+            self.character_profile_repair_status = status
+            return CharacterProfileRepairResult(
+                english=english,
+                chinese=chinese,
+                status=status,
+                errors=repair_errors + [f"{name}：{'、'.join(fields)}" for name, fields in errors.items()],
+            )
         self.character_profile_repair_status = "complete"
         return CharacterProfileRepairResult(english=english, chinese=chinese, status="repaired" if had_validation_errors else "clean", errors=[])
 
@@ -1633,18 +1681,6 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             ))
 
         assembly_diagnostics: list[PromptAssemblyDiagnostic] = []
-        for scene in script.scenes:
-            shot = shot_by_scene.get(scene.scene_id)
-            environment_delta = getattr(shot, "environment_delta", "") if shot else ""
-            _environment, dropped = _build_shot_environment_context_with_drops(
-                script, scene.scene_id, environment_delta
-            )
-            assembly_diagnostics.append(PromptAssemblyDiagnostic(
-                scene_id=scene.scene_id,
-                added_sections=["environment"],
-                dropped_facts=dropped,
-                status="warning" if dropped else "clean",
-            ))
 
         _fit_duration_budget(prompt_shots, script, source_scene_durations, source_total)
 
@@ -1708,6 +1744,22 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                     segment = _build_continuity_segment(prev_delta)
                     target.prompt = target.prompt.rstrip() + "\n" + segment
             prev_delta = delta_by_scene.get(scene.scene_id, prev_delta)
+
+        # Recompute diagnostics after overrides, timeline normalization, and
+        # continuity carry-over: these are the exact prompts sent downstream.
+        for scene in script.scenes:
+            shot = shot_by_scene.get(scene.scene_id)
+            environment_delta = getattr(shot, "environment_delta", "") if shot else ""
+            _environment, dropped = _build_shot_environment_context_with_drops(
+                script, scene.scene_id, environment_delta
+            )
+            final_shot = next((item for item in prompts.shots if item.scene_id == scene.scene_id), None)
+            assembly_diagnostics.append(_build_prompt_assembly_diagnostic(
+                scene.scene_id,
+                final_shot.prompt if final_shot else "",
+                dropped_facts=dropped,
+            ))
+        prompts.assembly_diagnostics = assembly_diagnostics
 
         prompts.capacity_diagnostics = [
             analyze_shot_capacity(

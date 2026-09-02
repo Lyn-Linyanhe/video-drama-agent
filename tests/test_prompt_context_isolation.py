@@ -93,3 +93,15 @@ def test_generation_prompts_persist_assembly_diagnostics_with_legacy_default():
     )
     assert diagnostic.status == "warning"
     assert diagnostic.dropped_facts == ["走到窗前"]
+from src.agents.visual_prompt_agent import _build_prompt_assembly_diagnostic
+
+
+def test_final_assembly_diagnostic_marks_remaining_dynamic_environment_as_failed():
+    diagnostic = _build_prompt_assembly_diagnostic(
+        7,
+        "【环境】室内；她望向巷口\n【动作时间轴】0-5s，人物站立",
+        dropped_facts=["望向巷口"],
+    )
+    assert diagnostic.status == "failed"
+    assert diagnostic.scene_id == 7
+    assert any("望向巷口" in item for item in diagnostic.forbidden_conflicts)

@@ -667,7 +667,7 @@ def _rebalance_positive_durations(total: float, values: list[float]) -> list[flo
 
 
 def _timeline_from_text(timeline: str, total: float) -> list[tuple[float, str]]:
-    """Parse only explicit, unit-bearing ranges at segment boundaries."""
+    """Parse explicit range or duration-only segments at segment boundaries."""
     timeline = _normalize_prompt_text(timeline)
     range_pattern = re.compile(
         r"^\s*(?:动作时间轴\s*[：:]\s*)?(?:切镜头\s*[，,:：]\s*)?"
@@ -677,23 +677,41 @@ def _timeline_from_text(timeline: str, total: float) -> list[tuple[float, str]]:
         r"[：:，,、\s]*(?P<description>.*?)\s*$",
         re.IGNORECASE,
     )
+    duration_pattern = re.compile(
+        r"^\s*(?:动作时间轴\s*[：:]\s*)?(?:切镜头\s*[，,:：]\s*)?"
+        r"(?P<duration>\d+(?:\.\d+)?)\s*(?P<unit>s|秒)\s*"
+        r"[：:，,、\s]+(?P<description>.*?)\s*$",
+        re.IGNORECASE,
+    )
     raw_segments: list[tuple[float, str]] = []
     previous_end = 0.0
-    for chunk in re.split(r"[；;\n]+|(?<=。)(?=\s*(?:动作时间轴\s*[：:]\s*)?(?:切镜头\s*[，,:：]\s*)?\d)", timeline):
+    chunks = re.split(
+        r"[；;\n]+|(?<=。)(?=\s*(?:动作时间轴\s*[：:]\s*)?(?:切镜头\s*[，,:：]\s*)?\d)"
+        r"|(?<=[，,])\s*(?=(?:切镜头\s*[，,:：]\s*)?(?:\d+(?:\.\d+)?\s*(?:s|秒)?\s*(?:-|到)\s*\d+(?:\.\d+)?(?:s|秒)|\d+(?:\.\d+)?(?:s|秒))[：:，,、\s])",
+        timeline,
+    )
+    for chunk in chunks:
         chunk = chunk.strip("。；; ")
         if not chunk:
             continue
         match = range_pattern.match(chunk)
-        if not match or not (match.group("start_unit") or match.group("end_unit")):
+        if match and (match.group("start_unit") or match.group("end_unit")):
+            start = float(match.group("start"))
+            end = float(match.group("end"))
+            if abs(start - previous_end) > 0.25:
+                start = previous_end
+            description = _normalize_prompt_text(match.group("description")).strip("。；; ，,")
+            if end > start and description:
+                raw_segments.append((end - start, description))
+                previous_end = end
             continue
-        start = float(match.group("start"))
-        end = float(match.group("end"))
-        if abs(start - previous_end) > 0.25:
-            start = previous_end
-        description = _normalize_prompt_text(match.group("description")).strip("。；; ，,")
-        if end > start and description:
-            raw_segments.append((end - start, description))
-            previous_end = end
+        match = duration_pattern.match(chunk)
+        if match:
+            duration = float(match.group("duration"))
+            description = _normalize_prompt_text(match.group("description")).strip("。；; ，,")
+            if duration > 0 and description:
+                raw_segments.append((duration, description))
+                previous_end += duration
     if not raw_segments:
         return []
 
@@ -707,6 +725,79 @@ def _timeline_from_text(timeline: str, total: float) -> list[tuple[float, str]]:
         (duration, description)
         for duration, (_, description) in zip(durations, raw_segments)
     ]
+
+
+def _render_timed_segments(
+    segments: list[tuple[float, str]],
+    *,
+    total: float | None = None,
+    cut_after_first: bool = False,
+    cut_flags: list[bool] | None = None,
+) -> list[str]:
+    """Render every timed beat as one contiguous cumulative start-end range."""
+    if not segments:
+        return []
+    durations = [max(0.01, float(duration)) for duration, _ in segments]
+    target = float(total) if total is not None and float(total) > 0 else sum(durations)
+    if abs(sum(durations) - target) > 0.01:
+        durations = _rebalance_positive_durations(target, durations)
+    rendered: list[str] = []
+    cursor = 0.0
+    for index, ((_, description), duration) in enumerate(zip(segments, durations)):
+        start = round(cursor, 2)
+        end = round(target if index == len(segments) - 1 else cursor + duration, 2)
+        cursor = end
+        cut = (cut_flags[index] if cut_flags and index < len(cut_flags) else False)
+        if cut_after_first and index > 0:
+            cut = True
+        prefix = "切镜头，" if cut else ""
+        rendered.append(f"{prefix}{_fmt_seconds(start)}-{_fmt_seconds(end)}，{description}")
+    return rendered
+
+
+def _timed_line_parts(line: str) -> tuple[bool, float, str] | None:
+    """Extract a leading timed segment without treating action numbers as timing."""
+    stripped = line.strip()
+    range_match = re.match(
+        r"^(?P<cut>切镜头[，,:：]\s*)?(?P<start>\d+(?:\.\d+)?)s?\s*(?:-|到)\s*"
+        r"(?P<end>\d+(?:\.\d+)?)(?:s|秒)(?P<comma>[，,：:])(?P<description>.*)$",
+        stripped, re.IGNORECASE,
+    )
+    if range_match:
+        start = float(range_match.group("start"))
+        end = float(range_match.group("end"))
+        if end > start:
+            return bool(range_match.group("cut")), end - start, range_match.group("description").strip()
+        return None
+    duration_match = re.match(
+        r"^(?P<cut>切镜头[，,:：]\s*)?(?P<duration>\d+(?:\.\d+)?)(?:s|秒)(?P<comma>[，,：:])(?P<description>.*)$",
+        stripped, re.IGNORECASE,
+    )
+    if duration_match:
+        duration = float(duration_match.group("duration"))
+        if duration > 0:
+            return bool(duration_match.group("cut")), duration, duration_match.group("description").strip()
+    return None
+
+
+def _canonicalize_timed_prompt(text: str, total: float | None = None) -> str:
+    """Normalize legacy duration-only timed lines while preserving their text/cuts."""
+    lines = text.splitlines()
+    indexes: list[int] = []
+    parts: list[tuple[bool, float, str]] = []
+    for index, line in enumerate(lines):
+        parsed = _timed_line_parts(line)
+        if parsed:
+            indexes.append(index)
+            parts.append(parsed)
+    if not parts:
+        return text
+    target = total if total is not None and total > 0 else sum(item[1] for item in parts)
+    segments = [(duration, description) for _, duration, description in parts]
+    rendered = _render_timed_segments(segments, total=target, cut_flags=[item[0] for item in parts])
+    for index, replacement in zip(indexes, rendered):
+        lines[index] = replacement
+    return "\n".join(lines)
 
 
 def _single_take_segments(scene: Scene, original: str, total: float, script: ScriptBreakdown | None = None) -> list[str]:
@@ -1087,7 +1178,7 @@ def _repair_conflicting_envelope_reveal(
 
 def _timed_line_signature(line: str) -> str:
     clean = re.sub(r"^切镜头，", "", line.strip())
-    clean = re.sub(r"^\d+(?:\.\d+)?s[，,]", "", clean)
+    clean = re.sub(r"^\d+(?:\.\d+)?s(?:-\d+(?:\.\d+)?s)?[，,]", "", clean)
     clean = clean.replace(TEXT_OVERLAY_NOTE, "")
     clean = re.sub(r"[。；;，,\s]", "", clean)
     return clean
@@ -1099,7 +1190,7 @@ def _repair_duplicate_timed_segments(lines: list[str], scene: Scene | None) -> l
     subject = _main_subject(scene)
     seen_envelope_water_reveal = False
     for line in lines:
-        is_timed_segment = re.match(r"^(?:切镜头，)?\d+(?:\.\d+)?s[，,]", line.strip()) is not None
+        is_timed_segment = _timed_line_parts(line) is not None
         signature = _timed_line_signature(line) if is_timed_segment else ""
         repeated_envelope_water_reveal = (
             is_timed_segment
@@ -1108,8 +1199,8 @@ def _repair_duplicate_timed_segments(lines: list[str], scene: Scene | None) -> l
         )
         if is_timed_segment and ((signature and signature == previous_signature) or repeated_envelope_water_reveal):
             prefix = "切镜头，" if line.startswith("切镜头，") else ""
-            duration_match = re.search(r"(\d+(?:\.\d+)?s)[，,]", line)
-            duration = f"{duration_match.group(1)}，" if duration_match else ""
+            timed_parts = _timed_line_parts(line)
+            duration = f"{_fmt_seconds(timed_parts[1])}，" if timed_parts else ""
             line = (
                 f"{prefix}{duration}近景/正面固定，{subject}对上一动作结果产生明确反应，"
                 "手部、视线和道具位置保持连续，不新增剧情事件。"
@@ -1460,10 +1551,10 @@ def _repair_timed_duration_coverage(lines: list[str], total: float | None) -> li
     timed_indexes: list[int] = []
     durations: list[float] = []
     for index, line in enumerate(lines):
-        match = re.match(r"^(切镜头，)?(\d+(?:\.\d+)?)s[，,]", line.strip())
-        if match:
+        parsed = _timed_line_parts(line)
+        if parsed:
             timed_indexes.append(index)
-            durations.append(float(match.group(2)))
+            durations.append(parsed[1])
     if not timed_indexes:
         return lines
 
@@ -1518,7 +1609,7 @@ def _apply_duration_cap_to_prompt(text: str, cap: float | None) -> str:
         current_total = sum(range_durations)
         declared_total = _total_duration_from_prompt(text)
         if current_total <= cap and (declared_total is None or declared_total <= cap):
-            return text
+            return _canonicalize_timed_prompt(text, declared_total or current_total)
         scaled = _rebalance_positive_durations(cap, range_durations)
         cursor = 0.0
         replacement_index = 0
@@ -1556,7 +1647,7 @@ def _apply_duration_cap_to_prompt(text: str, cap: float | None) -> str:
         return text
     current_total = sum(durations)
     if current_total <= cap and (declared_total is None or declared_total <= cap):
-        return text
+        return _canonicalize_timed_prompt(text, declared_total or current_total)
     scaled = _rebalance_positive_durations(cap, durations) if durations else []
     replacement_index = 0
 
@@ -1570,12 +1661,13 @@ def _apply_duration_cap_to_prompt(text: str, cap: float | None) -> str:
         )
 
     rendered = timed_pattern.sub(replace_timed_prefix, text) if durations else text
-    return re.sub(
+    rendered = re.sub(
         r"总时长约\d+(?:\.\d+)?s",
         f"总时长约{_fmt_seconds(cap)}",
         rendered,
         count=1,
     )
+    return _canonicalize_timed_prompt(rendered, cap)
 
 
 def _lint_and_repair_prompt(
@@ -1643,6 +1735,7 @@ def _lint_and_repair_prompt(
     additions = [item for item in (coverage, dialogue_addendum) if item]
     if additions:
         repaired = "\n".join([repaired, *additions])
+    repaired = _canonicalize_timed_prompt(repaired, _total_duration_from_prompt(repaired) or (float(scene.duration_sec) if scene else None))
     return _normalize_prompt_text(repaired)
 
 
@@ -2437,18 +2530,14 @@ def build_timed_shot_prompt(
                     (duration, description)
                     for duration, (_, description) in zip(durations, authored_segments)
                 ]
-        segments = [
-            f"{('' if index == 1 else '切镜头，')}{_fmt_seconds(duration)}，{description}"
-            for index, (duration, description) in enumerate(authored_segments, start=1)
-        ]
+        segments = _render_timed_segments(authored_segments, total=total, cut_after_first=True)
     else:
         durations = _weighted_durations(total, beats, source_text)
-        segments = []
-        for index, ((kind, description), duration) in enumerate(zip(beats, durations), start=1):
-            prefix = "" if index == 1 else "切镜头，"
-            if kind == "flashback":
-                prefix = "切镜头，"
-            segments.append(f"{prefix}{_fmt_seconds(duration)}，{description}")
+        segments = _render_timed_segments(
+            [(duration, description) for (kind, description), duration in zip(beats, durations)],
+            total=total,
+            cut_after_first=True,
+        )
 
     original_line = ""
     sections = _sections(original)

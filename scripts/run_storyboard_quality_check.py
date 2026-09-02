@@ -112,6 +112,28 @@ def audit_storyboard_quality(script: ScriptBreakdown, prompts: GenerationPrompts
     missing_ids = sorted(set(scenes) - set(shots))
     duplicate_ids = len(prompts.shots) - len(shots)
     fidelity = audit_prompt_fidelity(script, prompts)
+    fidelity_issues = list(fidelity.issues or [])
+    direction_conflicts = sum(
+        1 for issue in fidelity_issues if issue.issue_code == "entry_exit_conflict"
+    )
+    cross_shot_leaks = sum(
+        1 for issue in fidelity_issues if issue.issue_code == "cross_shot_dynamic_leak"
+    )
+    timeline_conflict_keys = {
+        (issue.scene_id, issue.issue_code)
+        for issue in fidelity_issues
+        if issue.issue_code in {"timeline_overflow", "duration_mismatch"}
+    }
+    timeline_conflicts = len(timeline_conflict_keys)
+    for issue in fidelity_issues:
+        evidence.append({
+            "scene_id": issue.scene_id,
+            "issue_code": issue.issue_code,
+            "expected": issue.evidence.expected_excerpt,
+            "actual_excerpt": issue.evidence.prompt_excerpt,
+            "prompt_section": issue.evidence.prompt_section,
+            "fact_id": issue.evidence.fact_id,
+        })
     return {
         "scene_count": len(scenes),
         "shot_count": len(prompts.shots),
@@ -122,8 +144,8 @@ def audit_storyboard_quality(script: ScriptBreakdown, prompts: GenerationPrompts
         "dialogue_coverage_rate": dialogue_covered / dialogue_total if dialogue_total else 1.0,
         "dynamic_environment_leaks": dynamic_leaks,
         "character_state_conflicts": state_conflicts,
-        "direction_conflicts": 0,
-        "cross_shot_leaks": 0,
+        "direction_conflicts": direction_conflicts,
+        "cross_shot_leaks": cross_shot_leaks,
         "timeline_conflicts": timeline_conflicts,
         "capacity_warnings": capacity_warnings,
         "missing_scene_ids": missing_ids,

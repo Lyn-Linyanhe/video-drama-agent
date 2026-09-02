@@ -569,6 +569,6 @@ async def test_character_reextract_preserves_existing_profile_on_repair_failure(
     agent = VisualPromptAgent(api_provider="mock")
     agent.llm = _RepairFailsLLM()
     result = await agent.reextract_visible_characters(script)
-    assert result.status == "partial"
+    assert result.status == "failed"
     assert result.chinese["\u82cf\u7720"] == complete
     assert any("repair failed" in error for error in result.errors)

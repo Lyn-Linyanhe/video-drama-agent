@@ -72,6 +72,7 @@ from src.services.media_quality import (
     review_video_subjective,
 )
 from src.services.prompt_composer import compose_video_prompt, provider_capabilities
+from src.services.prompt_fidelity_gate import audit_current_prompt_fidelity, generation_snapshot_digest, prompt_fidelity_gate_detail
 from src.services.tts_provider import describe_dashscope_tts_error
 
 # ── 全局单例 ─────────────────────────────────────────────────
@@ -430,6 +431,7 @@ def _state_to_json(state: DramaState) -> str:
         "visual_stage_error": state.visual_stage_error,
         "visual_performance": state.visual_performance,
         "prompt_review": state.prompt_review,
+        "prompt_fidelity": state.prompt_fidelity,
         "user_feedback": state.user_feedback,
         "scene_vision_descriptions": state.scene_vision_descriptions,
         "shot_productions": {
@@ -825,6 +827,7 @@ def _state_from_json(json_str: str) -> DramaState:
         visual_stage_error=data.get("visual_stage_error", ""),
         visual_performance=data.get("visual_performance") or {},
         prompt_review=data.get("prompt_review") or {},
+        prompt_fidelity=data.get("prompt_fidelity") or {},
     )
 
     # 重建 Pydantic 子模型
@@ -1389,6 +1392,7 @@ def _reconcile_state_after_script_change(
     from src.utils.visual_asset_manifest import normalize_scene_assets, normalize_scene_name, scene_source_signature, state_for_scene
 
     old_script = state.script
+    state.prompt_fidelity = {}
     state.prompt_review = {
         "status": "pending",
         "prompt_signature": "",
@@ -2166,8 +2170,11 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         effective["effective_prompt"] = final_provider_prompt
     style_snapshot = _visual_style_snapshot(state.creative_profile)
     explicit_references = [item for item in references if item.get("source") == "explicit"]
-    return {
+    snapshot = {
         "scene_id": scene_id,
+        "source_prompt": _shot_prompt(state, scene_id).prompt,
+        "source_duration_sec": int(_shot_prompt(state, scene_id).duration_sec or 0),
+        "effective_duration_sec": int(raw_prompt.duration_sec or 0),
         "raw_prompt": raw_prompt.prompt,
         "raw_negative_prompt": raw_prompt.negative_prompt,
         "prepared_shot": prepared.model_dump(),
@@ -2204,6 +2211,8 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         "audio_policy": "native_dialogue_post_mix_bgm" if native_audio_requested else "external_tts_post_mix_bgm",
         "dialogue_plan": dialogue_plan,
     }
+    snapshot["prompt_snapshot_digest"] = generation_snapshot_digest(snapshot)
+    return snapshot
 
 
 def _migrate_legacy_shot_references(state: DramaState) -> None:
@@ -2351,6 +2360,9 @@ def _production_payload(state: DramaState) -> dict:
         if key != "capability"
     }
 
+    fidelity_report = audit_current_prompt_fidelity(state)
+    state.prompt_fidelity = fidelity_report.model_dump()
+
     productions = []
     provider = video_gen_agent.api_client.provider_name
     for scene in state.script.scenes:
@@ -2408,6 +2420,17 @@ def _production_payload(state: DramaState) -> dict:
             "needs_refresh": state.generation_prompts.needs_refresh,
         },
         "prompt_review": state.prompt_review,
+        "prompt_fidelity": {
+            **state.prompt_fidelity,
+            "status": "failed" if state.prompt_fidelity.get("status") == "blocked" else state.prompt_fidelity.get("status", "clean"),
+        },
+        "shot_capacity": {
+            "items": [item.model_dump() for item in (state.generation_prompts.capacity_diagnostics or [])],
+        },
+        "character_profile_repair": {
+            "status": getattr(state.visual_design, "profile_repair_status", None) or "not_available",
+            "errors": list(getattr(state.visual_design, "profile_repair_errors", []) or []),
+        },
         "provider_capabilities": provider_capabilities(provider),
         "subtitle_enabled": state.subtitle_enabled,
         "subtitle_mode": state.subtitle_mode,

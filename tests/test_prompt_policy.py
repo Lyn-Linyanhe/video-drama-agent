@@ -200,7 +200,8 @@ def test_existing_tapnow_style_timeline_is_preserved():
     prompt = "1.5s，特写，镜头慢慢推进；切镜头，2s，大特写/插入，手机屏幕短信；切镜头，1.5s，闪回叠加。"
     shot = ShotPrompt(scene_id=1, prompt=prompt, duration_sec=5)
 
-    assert build_timed_shot_prompt(shot, _script()) == prompt
+    rendered = build_timed_shot_prompt(shot, _script())
+    assert rendered == prompt.replace("0s-5s：", "0s-5s，")
 
 
 def test_timed_prompt_adds_phone_flashback_and_text_overlay_guidance():
@@ -751,7 +752,7 @@ def test_already_polished_timed_prompt_is_idempotent():
     prompt = "【单镜头时间轴】\n0s-5s：苏眠保持同一动作。\n【连续锁定】\n总时长约5s，单镜头连续完成。"
     shot = ShotPrompt(scene_id=1, prompt=prompt, duration_sec=5)
 
-    assert build_timed_shot_prompt(shot, _script()) == prompt
+    assert build_timed_shot_prompt(shot, _script()) == prompt.replace("0s-5s：", "0s-5s，")
 
 
 def test_model_prompt_supplement_is_stripped_before_timed_repair():
@@ -968,8 +969,11 @@ def test_urgent_action_scene_allocates_time_to_script_task_not_only_props():
     rendered = build_timed_shot_prompt(shot, script)
     action_line = next(line for line in rendered.splitlines() if "手持跟拍/中近景动作镜头" in line)
     prop_line = next(line for line in rendered.splitlines() if "短促道具强调特写" in line)
-    action_duration = float(action_line.split("s", 1)[0].replace("切镜头，", ""))
-    prop_duration = float(prop_line.split("s", 1)[0].replace("切镜头，", ""))
+    action_range = re.search(r"(\d+(?:\.\d+)?)s-(\d+(?:\.\d+)?)s", action_line)
+    prop_range = re.search(r"(\d+(?:\.\d+)?)s-(\d+(?:\.\d+)?)s", prop_line)
+    assert action_range and prop_range
+    action_duration = float(action_range.group(2)) - float(action_range.group(1))
+    prop_duration = float(prop_range.group(2)) - float(prop_range.group(1))
 
     assert "开锁" in action_line
     assert action_duration > prop_duration
@@ -1188,7 +1192,7 @@ def test_short_image_to_video_prompt_preserves_all_action_beats():
     rendered = build_timed_shot_prompt(shot, script)
     timed_lines = [
         line for line in rendered.splitlines()
-        if line.startswith("切镜头，") or re.match(r"^\d+(?:\.\d+)?s，", line)
+        if re.search(r"\d+(?:\.\d+)?s-\d+(?:\.\d+)?s[，,]", line)
     ]
 
     assert len(timed_lines) >= 4
@@ -1303,7 +1307,7 @@ def test_prompt_lint_replaces_duplicate_timed_segments_with_reaction_beat():
     rendered = build_timed_shot_prompt(shot, script)
 
     assert rendered.count(repeated_line) == 1
-    assert "切镜头，6.8s，近景/正面固定，苏眠对上一动作结果产生明确反应" in rendered
+    assert "切镜头，3.2s-10s，近景/正面固定，苏眠对上一动作结果产生明确反应" in rendered
 
 
 def test_prompt_lint_repairs_three_person_finalized_frame_label():

@@ -74,6 +74,9 @@ class DramaState:
     prompt_review: dict = field(default_factory=dict)
     """Kimi storyboard prompt-review lifecycle and latest report."""
 
+    prompt_fidelity: dict = field(default_factory=dict)
+    """Latest deterministic storyboard-to-prompt fidelity report."""
+
     generated_assets: Optional[GeneratedAssets] = None
     """Output of Video Generation Agent — generated video files."""
 

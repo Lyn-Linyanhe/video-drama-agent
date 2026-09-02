@@ -19,6 +19,7 @@ class PromptFidelityIssue(BaseModel):
     description: str
     deterministic: bool = True
     blocks_generation: bool = False
+    repair_action: Literal["edit_prompt", "edit_structure", "manual_review"] = "manual_review"
     evidence: PromptFidelityEvidence
 
 

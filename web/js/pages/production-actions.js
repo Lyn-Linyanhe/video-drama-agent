@@ -748,6 +748,39 @@ function promptReviewHtml(review) {
   </section>`;
 }
 
+function storyboardQualityDiagnosticsHtml(data = {}) {
+  const fidelity = data?.prompt_fidelity || {};
+  const capacity = data?.shot_capacity || {};
+  const characterRepair = data?.character_profile_repair || {};
+  const fidelityIssues = Array.isArray(fidelity.issues) ? fidelity.issues : [];
+  const capacityItems = Array.isArray(capacity.items) ? capacity.items : [];
+  const characterErrors = Array.isArray(characterRepair.errors) ? characterRepair.errors : [];
+  const hasBlockingFidelity = Boolean(
+    fidelity.status === 'blocked'
+    || fidelity.status === 'failed'
+    || fidelity.blocked
+    || fidelityIssues.some(issue => issue?.blocks_generation || issue?.severity === 'critical'),
+  );
+  const sections = [];
+  if (hasBlockingFidelity) {
+    const issueHtml = fidelityIssues.map(issue => {
+      const sceneLabel = Number(issue?.scene_id) > 0 ? `镜头 ${issue.scene_id}` : '全片';
+      const evidence = issue?.evidence || {};
+      return `<div style="margin-top:6px;padding:8px;border-left:3px solid #ef4444;background:#202024;font-size:11px"><b>${escapeHtml(sceneLabel)} · ${escapeHtml(issue?.issue_code || '保真问题')}</b><div style="margin-top:3px">期望：${escapeHtml(evidence.expected_excerpt || issue?.expected_excerpt || '')}</div><div style="margin-top:3px">实际：${escapeHtml(evidence.prompt_excerpt || issue?.prompt_excerpt || '')}</div><div style="margin-top:3px;color:#a1a1aa">章节：${escapeHtml(evidence.prompt_section || issue?.prompt_section || '未标注')}</div></div>`;
+    }).join('');
+    sections.push(`<div style="color:#fca5a5;font-weight:600">提示词存在确定性保真问题：禁止生成</div>${issueHtml}`);
+  }
+  const warningItems = capacityItems.filter(item => item?.status === 'warning' || item?.status === 'overloaded' || item?.warnings?.length);
+  if (warningItems.length) {
+    sections.push(`<div style="color:#fbbf24;font-weight:600">镜头承载偏高：建议拆镜，但当前内容未被删除</div>${warningItems.map(item => `<div style="margin-top:5px;color:#d4d4d8;font-size:11px">镜头 ${escapeHtml(String(item.scene_id || '未知'))}：${escapeHtml((item.warnings || []).join('；') || '当前镜头承载偏高')}</div>`).join('')}`);
+  }
+  if (characterRepair.status === 'partial' || characterRepair.status === 'warning' || characterErrors.length) {
+    sections.push(`<div style="color:#fbbf24;font-weight:600">角色状态信息不完整：可继续查看，但建议补充</div>${characterErrors.map(error => `<div style="margin-top:5px;color:#d4d4d8;font-size:11px">${escapeHtml(String(error))}</div>`).join('')}`);
+  }
+  if (!sections.length) return '';
+  return `<section class="production-panel storyboard-quality-diagnostics" style="margin:0 0 10px;padding:12px"><div style="font-size:13px;font-weight:600">分镜质量诊断</div><div style="display:grid;gap:8px;margin-top:8px">${sections.map(section => `<div>${section}</div>`).join('')}</div></section>`;
+}
+
 function promptPolicyFields(policy = {}) {
   const stylePrefix = String(policy.style_prefix || '').trim();
   const globalNegative = String(policy.global_negative_prompt || '').trim();
@@ -930,6 +963,7 @@ function renderProductionWorkspace() {
     </div>
     ${promptQuality.needs_refresh ? '<div class="production-panel" style="margin:0 0 10px;padding:10px;color:#fbbf24;font-size:12px">当前项目含旧版非中文分镜提示词。已有视频与手动编辑将保留；确认需要更新时，请重新解析剧本以生成新版中文分镜。</div>' : ''}
     ${promptReviewHtml(promptReview)}
+    ${storyboardQualityDiagnosticsHtml(productionData)}
     ${promptPolicySummaryHtml(promptPolicy)}
     <div class="production-shell">
       <aside class="production-panel production-assets">
@@ -1316,6 +1350,7 @@ const __moduleActions = {
   promptReviewIssues,
   promptReviewIssueGroup,
   promptReviewShotStatusLabel,
+  storyboardQualityDiagnosticsHtml,
   productionFocusReviewRepair,
   productionAudioModeHtml,
   productionSetAudioMode,
