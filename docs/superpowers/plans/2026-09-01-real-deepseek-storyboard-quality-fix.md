@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12、Pydantic、pytest、现有 `ScriptAgent`、`VisualPromptAgent`、`timed_prompt_composer`、JSON 项目状态、官方 DeepSeek OpenAI-compatible API。
 
-**Spec:** `docs/superpowers/plans/2026-09-01-storyboard-fidelity-and-capacity.md`；真实测试证据：`tmp/real_magi_deepseek_e2e_20260901.json`。
+**Spec:** 本计划中的 Task 2–6 接口与验收条款；真实测试证据：`tmp/real_magi_deepseek_after_fix_20260901.json`。
 
 ## 执行状态（2026-09-02）
 
@@ -50,8 +50,8 @@
 - Create: `tests/fixtures/magi_storyboard_source_20260901.txt`
 - Create: `scripts/run_storyboard_quality_check.py`
 - Create: `tests/test_storyboard_quality_check.py`
-- Preserve as evidence: `tmp/real_magi_deepseek_e2e_20260901.json`
-- Preserve as evidence: `tmp/real_magi_deepseek_e2e_20260901_full.txt`
+- Preserve as evidence: `tmp/real_magi_deepseek_after_fix_20260901.json`
+- Preserve as evidence: `tmp/real_magi_deepseek_after_fix_20260901_full.txt`
 
 **Interfaces:**
 - `scripts/run_storyboard_quality_check.py` 提供纯离线入口：
@@ -117,11 +117,11 @@ capacity_warnings
 
 ```bash
 python scripts/run_storyboard_quality_check.py \
-  --input tmp/real_magi_deepseek_e2e_20260901.json \
-  --out tmp/magi_storyboard_quality_baseline_20260901.json
+  --input tmp/real_magi_deepseek_after_fix_20260901.json \
+  --out tmp/magi_storyboard_quality_reaudit_20260902.json
 ```
 
-结果只写入 `tmp/`，不覆盖历史项目。
+结果只写入 `tmp/`，不覆盖历史项目。历史基线指标已保存在 `tmp/magi_storyboard_quality_baseline_20260901.json`；由于原始 e2e 输入文件未随当前工作区保留，不再伪造可重复的基线命令。
 
 - [ ] **Step 5: 提交独立基线**
 
