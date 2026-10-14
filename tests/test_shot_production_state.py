@@ -84,6 +84,8 @@ def test_shot_production_state_round_trips_with_references_and_versions():
             )
         ],
         active_version_id="version-0001",
+        generation_status_by_shot_id={"scene-1-shot-1": "failed"},
+        generation_error_by_shot_id={"scene-1-shot-1": "persisted child failure"},
         generation_status="success",
     )
 
@@ -899,6 +901,52 @@ def test_production_payload_exposes_normalized_default_video_policy_for_legacy_s
     assert "capability" not in policy
 
 
+def test_production_payload_preserves_parent_duration_and_exposes_child_plan(monkeypatch):
+    from src.schemas.shot_plan import ShotPlan, ShotUnit, SceneCapacityReport
+
+    state = _state()
+    state.script.scenes[0].duration_sec = 30
+    state.script.duration_sec = 30
+    state.generation_prompts.shots[0].duration_sec = 30
+    state.generation_prompts.shot_plans = [ShotPlan(
+        scene_id=1,
+        parent_duration_sec=30,
+        capacity=SceneCapacityReport(
+            scene_id=1, required_total_duration_sec=30, available_duration_sec=30,
+            recommended_total_duration_sec=30, recommended_durations_sec=[15, 15],
+            recommended_shot_count=2, status="auto_split", warnings=["split"],
+        ),
+        units=[
+            ShotUnit(shot_id="scene-1-shot-1", parent_scene_id=1, order=1, duration_sec=15),
+            ShotUnit(shot_id="scene-1-shot-2", parent_scene_id=1, order=2, duration_sec=15),
+        ],
+    )]
+    state.video_generation_policy = {
+        "provider": "happyhorse",
+        "model": "happyhorse-1.1-i2v",
+        "resolution": "1080p",
+    }
+    monkeypatch.setattr(
+        api_context,
+        "video_gen_agent",
+        SimpleNamespace(
+            api_client=SimpleNamespace(provider_name="happyhorse"),
+            _build_reference_identity_bundle=lambda *_args: {},
+        ),
+    )
+
+    payload = api_context._production_payload(state)
+    item = payload["productions"][0]
+
+    assert item["prompt"]["duration_sec"] == 30
+    assert item["source_duration_sec"] == 30
+    assert [shot["shot_id"] for shot in item["executable_shots"]] == [
+        "scene-1-shot-1", "scene-1-shot-2"
+    ]
+    assert item["estimated_duration_sec"] == 30
+    assert item["estimated_cost_rmb"] == 0.0
+
+
 def test_unresolved_legacy_reference_is_preserved_as_manual():
     state = _state()
     state.shot_productions[1] = ShotProductionState(
@@ -1072,7 +1120,8 @@ def test_generation_snapshot_uses_one_primary_character_view_for_inline_mentions
     assert snapshot["raw_prompt"].count("@character:苏眠:front_half") == 2
     assert "@character:@character" not in snapshot["raw_prompt"]
     assert "@character:苏眠:back_full" not in snapshot["raw_prompt"]
-    assert len(snapshot["references"]) == 4
+    assert len(snapshot["references"]) == 1
+    assert snapshot["references"][0]["view_type"] == "front_half"
 
 
 def test_generation_snapshot_places_continuity_tail_frame_before_asset_references(tmp_path, monkeypatch):
@@ -1152,7 +1201,11 @@ def test_multi_reference_prompt_emphasizes_continuity_and_view_consistency():
     assert "正反打" in rendered
     assert "上一镜尾帧" in rendered
     assert "正面、侧面和背面" in rendered
-    assert "人物转身" in rendered
+    # The old free-text 「人物转身…要和参考图一致」 sentence was replaced by an
+    # explicit first-frame lock: the tail frame must be the first frame, and
+    # scene references are not allowed to override its camera.
+    assert "必须作为本镜第一帧" in rendered
+    assert "场景参考图只提供空间陈设，不得覆盖尾帧机位" in rendered
 
 
 def test_multi_reference_prompt_respects_explicit_timed_edit_plan():
@@ -1270,18 +1323,8 @@ def test_reference_bundle_includes_multiple_character_views_in_priority_order(tm
         state.prop_images,
     )
 
-    assert refs[1] == [
-        str(tmp_path / "front_half.png"),
-        str(tmp_path / "front_full.png"),
-        str(tmp_path / "left_profile.png"),
-        str(tmp_path / "back_full.png"),
-    ]
-    assert identities[1] == [
-        ("character", "Hero", "front_half"),
-        ("character", "Hero", "front_full"),
-        ("character", "Hero", "left_profile"),
-        ("character", "Hero", "back_full"),
-    ]
+    assert refs[1] == [str(tmp_path / "front_half.png")]
+    assert identities[1] == [("character", "Hero", "front_half")]
 
 
 def test_default_references_auto_select_wan_scene_group_view(tmp_path):
@@ -1639,7 +1682,626 @@ def test_reference_catalog_lists_only_video_ready_prop_references(tmp_path):
     assert [item["image_path"] for item in catalog["props"]] == [str(confirmed)]
 
 
+@pytest.mark.asyncio
+async def test_refresh_native_asr_uses_active_child_version(monkeypatch):
+    from src.schemas.assets import GeneratedAssets, ShotAsset
+    from src.schemas.audio import AudioAssets
+
+    state = _state()
+    state.generated_assets = GeneratedAssets(shots=[ShotAsset(
+        scene_id=1,
+        shot_id="scene-1-shot-1",
+        local_path="new.mp4",
+        native_audio_enabled=True,
+        success=True,
+    )])
+    state.audio_assets = AudioAssets(scenes=[])
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        active_version_id="old",
+        active_version_by_shot_id={"scene-1-shot-1": "new"},
+        video_versions=[
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="old.mp4", native_audio_enabled=True, success=True, version_id="old", created_at="", generation_snapshot={"dialogue_plan": ["old"]}),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="new.mp4", native_audio_enabled=True, success=True, version_id="new", created_at="", generation_snapshot={"dialogue_plan": ["new"]}),
+        ],
+    )
+    called = []
+    from src.api.routes import jobs as jobs_routes
+    monkeypatch.setattr(jobs_routes, "align_native_subtitles", lambda path, plan, enabled, model_name: (called.append((path, plan)) or {"status": "disabled", "provider": "x", "model": "y", "segments": [], "changed_lines": [], "error": ""}))
+
+    await jobs_routes._refresh_native_asr(state)
+
+    assert called == [("new.mp4", ["new"])]
+
+
+def test_legacy_scene_generation_entry_rejects_planned_child_shots(monkeypatch):
+    state = _state()
+    from src.schemas.shot_plan import ShotPlan, ShotUnit, SceneCapacityReport
+    state.generation_prompts.shot_plans = [ShotPlan(
+        scene_id=1,
+        parent_duration_sec=5,
+        capacity=SceneCapacityReport(
+            scene_id=1, required_total_duration_sec=6, available_duration_sec=6,
+            recommended_total_duration_sec=6, recommended_durations_sec=[3, 3],
+            recommended_shot_count=2, status="auto_split", warnings=[],
+        ),
+        units=[
+            ShotUnit(shot_id="scene-1-shot-1", parent_scene_id=1, order=1, duration_sec=3),
+            ShotUnit(shot_id="scene-1-shot-2", parent_scene_id=1, order=2, duration_sec=3),
+        ],
+    )]
+
+    with pytest.raises(HTTPException, match="子镜头"):
+        _schedule_shot_video_job(state, 1)
+
+
 def test_single_shot_generation_requires_at_least_one_saved_reference_image():
     state = _state()
     with pytest.raises(HTTPException, match="参考图"):
         _schedule_shot_video_job(state, 1)
+
+
+def test_shot_prompt_resolves_planned_child_unit_by_stable_shot_id():
+    from src.schemas.shot_plan import ShotPlan, ShotUnit, SceneCapacityReport
+
+    state = _state()
+    state.script.scenes[0].duration_sec = 8
+    state.script.duration_sec = 8
+    state.script.scenes[0].action_description = "Hero walks to the table and picks up the key"
+    state.generation_prompts.shots[0].duration_sec = 8
+    state.generation_prompts.shots[0].prompt = "【动作时间轴】0-8s Hero walks to the table and picks up the key"
+    state.generation_prompts.shot_plans = [ShotPlan(
+        scene_id=1, parent_duration_sec=8,
+        capacity=SceneCapacityReport(scene_id=1, required_total_duration_sec=8, available_duration_sec=8, recommended_total_duration_sec=8, recommended_durations_sec=[4, 4], recommended_shot_count=2, status="auto_split", warnings=["split"]),
+        units=[
+            ShotUnit(shot_id="scene-1-shot-1", parent_scene_id=1, order=1, beat_ids=["scene-1-beat-1"], duration_sec=3),
+            ShotUnit(shot_id="scene-1-shot-2", parent_scene_id=1, order=2, beat_ids=["scene-1-beat-2"], duration_sec=4, continuity_from_shot_id="scene-1-shot-1"),
+        ],
+    )]
+
+    child = api_context._shot_prompt(state, 1, "scene-1-shot-2")
+
+    assert child.shot_id == "scene-1-shot-2"
+    assert child.duration_sec == 4
+    assert "【本镜禁止执行】" in child.prompt
+
+
+def test_video_snapshot_freezes_child_shot_prompt_and_identity(monkeypatch):
+    from src.schemas.shot_plan import ShotPlan, ShotUnit, SceneCapacityReport
+
+    state = _state()
+    state.script.scenes[0].duration_sec = 8
+    state.script.duration_sec = 8
+    state.script.scenes[0].action_description = "Hero walks to the table and picks up the key"
+    state.generation_prompts.shots[0].duration_sec = 8
+    state.generation_prompts.shots[0].prompt = "【动作时间轴】0-8s Hero walks to the table and picks up the key"
+    state.generation_prompts.shot_plans = [ShotPlan(
+        scene_id=1, parent_duration_sec=8,
+        capacity=SceneCapacityReport(scene_id=1, required_total_duration_sec=8, available_duration_sec=8, recommended_total_duration_sec=8, recommended_durations_sec=[4, 4], recommended_shot_count=2, status="auto_split", warnings=["split"]),
+        units=[
+            ShotUnit(shot_id="scene-1-shot-1", parent_scene_id=1, order=1, beat_ids=["scene-1-beat-1"], duration_sec=4),
+            ShotUnit(shot_id="scene-1-shot-2", parent_scene_id=1, order=2, beat_ids=["scene-1-beat-2"], duration_sec=4, continuity_from_shot_id="scene-1-shot-1"),
+        ],
+    )]
+    monkeypatch.setattr(api_context, "_reconcile_shot_references", lambda *_args: [])
+    from src.services.video_capabilities import normalize_video_policy
+    policy = normalize_video_policy({"provider": "mock", "model": "mock", "resolution": "720p"})
+
+    snapshot = _build_video_generation_snapshot(state, 1, policy, shot_id="scene-1-shot-2")
+
+    assert snapshot["shot_id"] == "scene-1-shot-2"
+    assert snapshot["scene_id"] == 1
+    assert snapshot["effective_duration_sec"] == 4
+    assert "【本镜禁止执行】" in snapshot["raw_prompt"]
+
+
+def test_sync_active_shot_asset_keeps_all_generated_child_shots():
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        video_versions=[
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", parent_scene_id=1, local_path="child-1.mp4", success=True, version_id="v-child-1", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-2", parent_scene_id=1, local_path="child-2.mp4", success=True, version_id="v-child-2", created_at=""),
+        ],
+        active_version_id="v-child-2",
+        generation_status="success",
+    )
+
+    _sync_active_shot_asset(state, 1)
+
+    assert [item.shot_id for item in state.generated_assets.shots] == ["scene-1-shot-1", "scene-1-shot-2"]
+
+
+@pytest.mark.asyncio
+async def test_production_route_expands_shot_plan_into_child_jobs(monkeypatch):
+    from src.schemas.shot_plan import ShotPlan, ShotUnit, SceneCapacityReport
+
+    state = _state()
+    state.generation_prompts.shots[0].prompt = "Hero waits."
+    state.generation_prompts.shot_plans = [ShotPlan(
+        scene_id=1, parent_duration_sec=5,
+        capacity=SceneCapacityReport(
+            scene_id=1, required_total_duration_sec=4, available_duration_sec=5,
+            recommended_total_duration_sec=6, recommended_durations_sec=[3, 3],
+            recommended_shot_count=2, status="auto_split", warnings=["split"],
+        ),
+        units=[
+            ShotUnit(shot_id="scene-1-shot-1", parent_scene_id=1, order=1, beat_ids=["scene-1-beat-1"], duration_sec=3),
+            ShotUnit(shot_id="scene-1-shot-2", parent_scene_id=1, order=2, beat_ids=["scene-1-beat-2"], duration_sec=3),
+        ],
+    )]
+    production = ShotProductionState(scene_id=1)
+    captured = []
+
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production_routes, "_production_payload", lambda _state: {"ok": True})
+    async def prepare(_state):
+        return None
+    monkeypatch.setattr(production_routes, "_prepare_auto_references", prepare)
+    monkeypatch.setattr(production_routes, "_ensure_shot_production", lambda *_args: production)
+    monkeypatch.setattr(production_routes, "audit_current_prompt_fidelity", lambda _state: SimpleNamespace(model_dump=lambda: {}, blocked=False))
+    monkeypatch.setattr(production_routes, "prompt_fidelity_gate_detail", lambda _report: None)
+    monkeypatch.setattr(production_routes.job_store, "list_jobs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(production_routes, "normalize_video_policy", lambda *_args, **_kwargs: {
+        "provider": "mock", "model": "mock", "resolution": "720p",
+        "unit_price_rmb_per_sec": 0.0, "capability": {"continuity": False},
+    })
+    monkeypatch.setattr(production_routes, "_build_video_generation_snapshot", lambda _state, scene_id, policy, **kwargs: (
+        captured.append(kwargs.get("shot_id")) or {"scene_id": scene_id, "shot_id": kwargs.get("shot_id"), "references": []}
+    ))
+    monkeypatch.setattr(production_routes.job_manager, "create_job", lambda project_id, **spec: {"job_id": spec["target_id"]})
+
+    result = await production_routes.generate_project_production_shot(state.project_id, 1)
+
+    assert result["job_ids"] == ["scene-1-shot-1", "scene-1-shot-2"]
+    assert captured == ["scene-1-shot-1", "scene-1-shot-2"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_worker_uses_materialized_child_and_project_policy(tmp_path, monkeypatch):
+    from src.schemas.assets import ShotAsset
+
+    state = _state()
+    state.video_generation_policy = {
+        "provider": "happyhorse",
+        "model": "happyhorse-1.1-i2v",
+        "resolution": "1080p",
+    }
+    reference_path = tmp_path / "reference.png"
+    reference_path.write_bytes(b"png")
+    video_path = tmp_path / "child.mp4"
+    video_path.write_bytes(b"mp4")
+    production = api_context._ensure_shot_production(state, 1)
+    production.references = []
+    child = state.generation_prompts.shots[0].model_copy(update={
+        "shot_id": "scene-1-shot-1",
+        "parent_scene_id": 1,
+        "shot_order": 1,
+        "duration_sec": 5,
+        "prompt": "child prompt",
+    })
+    calls = []
+    selected_policies = []
+
+    class _SelectedAgent:
+        async def generate_shot(self, shot, references, **kwargs):
+            calls.append((shot, references, kwargs))
+            return ShotAsset(
+                scene_id=shot.scene_id,
+                shot_id=shot.shot_id,
+                parent_scene_id=shot.parent_scene_id,
+                shot_order=shot.shot_order,
+                duration_sec=shot.duration_sec,
+                local_path=str(video_path),
+                success=True,
+            )
+
+    selected_agent = _SelectedAgent()
+    monkeypatch.setattr(api_context, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(api_context, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(api_context, "_materialized_shot_prompts", lambda *_args, **_kwargs: [child])
+    monkeypatch.setattr(
+        api_context,
+        "_build_video_generation_snapshot",
+        lambda _state, _scene_id, _policy, shot_id=None: {
+            "scene_id": 1,
+            "shot_id": shot_id,
+            "prepared_shot": child.model_dump(),
+            "provider_prompt": "child provider prompt",
+            "references": [{"image_path": str(reference_path), "asset_type": "scene", "asset_id": "room", "view_type": "wide"}],
+            "reference_labels": ["scene:room (wide)"],
+            "reference_mode": "first_frame",
+            "native_audio_requested": False,
+        },
+    )
+    monkeypatch.setattr(
+        api_context,
+        "video_agent_for_policy",
+        lambda policy: (selected_policies.append(policy) or selected_agent),
+        raising=False,
+    )
+    monkeypatch.setattr(api_context, "video_gen_agent", selected_agent)
+    monkeypatch.setattr(api_context, "inspect_video", lambda *_args, **_kwargs: {"status": "passed"})
+    async def _review(*_args, **_kwargs):
+        return {"status": "pass", "issues": []}
+    monkeypatch.setattr(api_context, "review_video_subjective", _review)
+    api_context.video_jobs.clear()
+
+    await api_context._run_shot_video_job(state.project_id, 1, "legacy-version")
+
+    assert selected_policies and selected_policies[0]["provider"] == "happyhorse"
+    assert len(calls) == 1
+    assert calls[0][0].shot_id == "scene-1-shot-1"
+    assert calls[0][0].duration_sec == 5
+    assert calls[0][1] == [str(reference_path)]
+    assert calls[0][2]["request_is_prepared"] is True
+    assert state.shot_productions[1].video_versions[0].shot_id == "scene-1-shot-1"
+
+
+def test_sync_active_shot_asset_persists_expected_child_shot_ids():
+    from src.schemas.shot_plan import ShotPlan, ShotUnit, SceneCapacityReport
+
+    state = _state()
+    state.generation_prompts.shot_plans = [ShotPlan(
+        scene_id=1, parent_duration_sec=5,
+        capacity=SceneCapacityReport(
+            scene_id=1, required_total_duration_sec=4, available_duration_sec=5,
+            recommended_total_duration_sec=6, recommended_durations_sec=[3, 3],
+            recommended_shot_count=2, status="auto_split", warnings=["split"],
+        ),
+        units=[
+            ShotUnit(shot_id="scene-1-shot-1", parent_scene_id=1, order=1, duration_sec=3),
+            ShotUnit(shot_id="scene-1-shot-2", parent_scene_id=1, order=2, duration_sec=3),
+        ],
+    )]
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        video_versions=[ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="one.mp4", success=True, version_id="v1", created_at="")],
+        active_version_id="v1", generation_status="success",
+    )
+
+    _sync_active_shot_asset(state, 1)
+
+    assert state.generated_assets.expected_shot_ids == ["scene-1-shot-1", "scene-1-shot-2"]
+
+
+def test_sync_active_shot_asset_uses_only_latest_active_version_per_child():
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        video_versions=[
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="old.mp4", success=True, version_id="old", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="new.mp4", success=True, version_id="new", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-2", local_path="two.mp4", success=True, version_id="two", created_at=""),
+        ],
+        active_version_id="two",
+        active_version_by_shot_id={"scene-1-shot-1": "new", "scene-1-shot-2": "two"},
+        generation_status="success",
+    )
+
+    _sync_active_shot_asset(state, 1)
+
+    assert [(item.shot_id, item.local_path) for item in state.generated_assets.shots] == [
+        ("scene-1-shot-1", "new.mp4"), ("scene-1-shot-2", "two.mp4")
+    ]
+
+
+def test_sync_active_shot_asset_uses_latest_child_version_without_active_map():
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        video_versions=[
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="old.mp4", success=True, version_id="old", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="new.mp4", success=True, version_id="new", created_at=""),
+        ],
+        active_version_id="new",
+        generation_status="success",
+    )
+
+    _sync_active_shot_asset(state, 1)
+
+    assert [(item.shot_id, item.local_path) for item in state.generated_assets.shots] == [
+        ("scene-1-shot-1", "new.mp4")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_activate_child_version_updates_per_shot_active_map(monkeypatch):
+    from src.api.context import ActivateVideoVersionRequest
+
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        video_versions=[
+            ShotVideoVersion(scene_id=1, local_path="parent.mp4", success=True, version_id="version-parent", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="one-old.mp4", success=True, version_id="version-old", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="one-new.mp4", success=True, version_id="version-new", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-2", local_path="two.mp4", success=True, version_id="version-two", created_at=""),
+        ],
+        active_version_id="version-parent",
+        active_version_by_shot_id={"scene-1-shot-2": "version-two"},
+        generation_status="success",
+    )
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production_routes, "_production_payload", lambda _state: {"ok": True})
+
+    await production_routes.activate_project_video_version(
+        state.project_id, 1, ActivateVideoVersionRequest(version_id="version-new", shot_id="scene-1-shot-1")
+    )
+
+    assert state.shot_productions[1].active_version_by_shot_id == {
+        "scene-1-shot-1": "version-new", "scene-1-shot-2": "version-two",
+    }
+    assert state.shot_productions[1].active_version_id == "version-parent"
+    assert next(item for item in state.generated_assets.shots if item.shot_id == "scene-1-shot-1").local_path == "one-new.mp4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version_id", "shot_id"),
+    [
+        ("version-two", "scene-1-shot-1"),
+        ("version-parent", "scene-1-shot-1"),
+        ("version-new", None),
+    ],
+)
+async def test_activate_version_rejects_cross_child_and_parent_child_scope_mismatch(
+    monkeypatch, version_id, shot_id,
+):
+    from src.api.context import ActivateVideoVersionRequest
+
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        video_versions=[
+            ShotVideoVersion(scene_id=1, local_path="parent.mp4", success=True, version_id="version-parent", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="one.mp4", success=True, version_id="version-new", created_at=""),
+            ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-2", local_path="two.mp4", success=True, version_id="version-two", created_at=""),
+        ],
+        active_version_id="version-parent",
+        active_version_by_shot_id={"scene-1-shot-2": "version-two"},
+        generation_status="success",
+    )
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    request = ActivateVideoVersionRequest(version_id=version_id, **({"shot_id": shot_id} if shot_id is not None else {}))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await production_routes.activate_project_video_version(state.project_id, 1, request)
+
+    assert exc_info.value.status_code == 409
+    assert state.shot_productions[1].active_version_id == "version-parent"
+    assert state.shot_productions[1].active_version_by_shot_id == {"scene-1-shot-2": "version-two"}
+
+
+@pytest.mark.asyncio
+async def test_activate_parent_version_keeps_legacy_request_compatible(monkeypatch):
+    from src.api.context import ActivateVideoVersionRequest
+
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        video_versions=[ShotVideoVersion(scene_id=1, local_path="parent.mp4", success=True, version_id="version-parent", created_at="")],
+        active_version_id="old-parent",
+        generation_status="failed",
+    )
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production_routes, "_production_payload", lambda _state: {"ok": True})
+
+    await production_routes.activate_project_video_version(
+        state.project_id, 1, ActivateVideoVersionRequest(version_id="version-parent")
+    )
+
+    assert state.shot_productions[1].active_version_id == "version-parent"
+
+
+@pytest.mark.asyncio
+async def test_child_failure_persists_exact_error_without_borrowing_sibling(monkeypatch):
+    from src.api.routes import jobs
+
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        generation_status="generating",
+        generation_status_by_shot_id={"scene-1-shot-1": "generating", "scene-1-shot-2": "generating"},
+        generation_error_by_shot_id={"scene-1-shot-2": "sibling failure"},
+    )
+    monkeypatch.setattr(jobs, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda _state: None)
+
+    await jobs._mark_video_job_stopped(state.project_id, 1, "selected child failure", "scene-1-shot-1")
+
+    production = state.shot_productions[1]
+    assert production.generation_error_by_shot_id == {
+        "scene-1-shot-1": "selected child failure",
+        "scene-1-shot-2": "sibling failure",
+    }
+    assert production.error_message == "scene-1-shot-1: selected child failure"
+
+
+def test_restarting_service_keeps_child_generation_running_when_child_job_is_active(monkeypatch):
+    state = _state()
+    state.shot_productions[1] = ShotProductionState(scene_id=1, generation_status="generating")
+    monkeypatch.setattr(api_context.job_store, "list_jobs", lambda *_args, **_kwargs: [{
+        "job_type": "video.generate", "target_type": "shot_unit",
+        "target_id": "scene-1-shot-2", "payload": {"scene_id": 1, "shot_id": "scene-1-shot-2"},
+    }])
+
+    production = api_context._ensure_shot_production(state, 1)
+
+    assert production.generation_status == "generating"
+
+
+def test_user_removed_automatic_reference_is_not_readded_on_reconcile(monkeypatch):
+    state = _state()
+    kept = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="asset",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        asset_version_id="hero-v1",
+        image_path="hero-v1.png",
+    )
+    removed = ShotReference(
+        reference_id="prop|watch|front",
+        source="asset",
+        asset_type="prop",
+        asset_id="watch",
+        view_type="front",
+        asset_version_id="watch-v1",
+        image_path="watch-v1.png",
+    )
+    state.shot_productions[1] = ShotProductionState(
+        scene_id=1,
+        references=[kept],
+        excluded_automatic_reference_ids=[removed.reference_id],
+    )
+    monkeypatch.setattr(api_context, "_default_shot_references", lambda *_: [kept, removed])
+
+    references = _reconcile_shot_references(state, 1)
+
+    assert [item.reference_id for item in references] == [kept.reference_id]
+    assert state.shot_productions[1].excluded_automatic_reference_ids == [removed.reference_id]
+
+
+@pytest.mark.asyncio
+async def test_readding_reference_clears_automatic_exclusion(monkeypatch):
+    state = _state()
+    reference = ShotReference(
+        reference_id="character|Hero|front_full",
+        source="asset",
+        asset_type="character",
+        asset_id="Hero",
+        view_type="front_full",
+        asset_version_id="hero-v1",
+        image_path="hero-v1.png",
+    )
+    production = ShotProductionState(
+        scene_id=1,
+        references=[],
+        excluded_automatic_reference_ids=[reference.reference_id],
+    )
+    state.shot_productions[1] = production
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_ensure_shot_production", lambda *_args: production)
+    monkeypatch.setattr(
+        production_routes,
+        "_reference_catalog",
+        lambda _state: {"by_id": {reference.reference_id: reference}, "characters": [], "scenes": [], "props": [], "auto_reference_ids": {reference.reference_id}},
+    )
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production_routes, "_production_payload", lambda _state: {"ok": True})
+
+    result = await production_routes.update_project_production_shot(
+        state.project_id,
+        1,
+        ProductionShotUpdateRequest(
+            prompt="Hero waits.",
+            references=[ProductionReferenceRequest(reference_id=reference.reference_id)],
+        ),
+    )
+
+    assert result == {"ok": True}
+    assert production.excluded_automatic_reference_ids == []
+    assert production.references[0].reference_id == reference.reference_id
+
+
+def test_manual_reference_removal_does_not_suppress_asset_binding():
+    state = _state()
+    manual = ShotReference(
+        reference_id="manual|board|1",
+        source="manual",
+        asset_type="manual",
+        asset_id="board",
+        view_type="image",
+        image_path="moodboard.png",
+    )
+    state.shot_productions[1] = ShotProductionState(scene_id=1, references=[manual])
+
+    references = _reconcile_shot_references(state, 1)
+
+    assert references[0].reference_id == manual.reference_id
+    assert state.shot_productions[1].excluded_automatic_reference_ids == []
+
+@pytest.mark.asyncio
+async def test_deleting_automatic_duplicate_keeps_exclusion_even_if_manual_same_asset_remains(monkeypatch):
+    state = _state()
+    reference_id = "prop|prop_watch_chain|front"
+    manual = ShotReference(
+        reference_id=reference_id,
+        source="manual",
+        asset_type="prop",
+        asset_id="prop_watch_chain",
+        view_type="front",
+        asset_version_id="watch-v1",
+        image_path="watch-v1.png",
+    )
+    automatic = manual.model_copy(update={"source": "asset"})
+    production = ShotProductionState(
+        scene_id=1,
+        references=[manual, automatic],
+    )
+    state.shot_productions[1] = production
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_ensure_shot_production", lambda *_args: production)
+    monkeypatch.setattr(
+        production_routes,
+        "_reference_catalog",
+        lambda _state: {"by_id": {reference_id: automatic}, "characters": [], "scenes": [], "props": [], "auto_reference_ids": {reference_id}},
+    )
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production_routes, "_production_payload", lambda _state: {"ok": True})
+
+    result = await production_routes.update_project_production_shot(
+        state.project_id,
+        1,
+        ProductionShotUpdateRequest(
+            prompt="Hero waits.",
+            references=[ProductionReferenceRequest(reference_id=reference_id, source="manual")],
+            excluded_automatic_reference_ids=[reference_id],
+        ),
+    )
+
+    assert result == {"ok": True}
+    assert production.excluded_automatic_reference_ids == [reference_id]
+
+
+@pytest.mark.asyncio
+async def test_settings_only_save_preserves_over_cap_parent_prompt_and_duration(monkeypatch):
+    from src.api.context import VideoGenerationPolicyRequest
+
+    state = _state()
+    state.script.scenes[0].duration_sec = 30
+    state.generation_prompts.shots[0].duration_sec = 30
+    state.generation_prompts.shots[0].negative_prompt = "parent negative"
+    state.prompt_review = {"status": "ready"}
+    production = ShotProductionState(scene_id=1, continuity_enabled=True)
+    state.shot_productions[1] = production
+    monkeypatch.setattr(production_routes, "_load_project_state", lambda _project_id: state)
+    monkeypatch.setattr(production_routes, "_ensure_shot_production", lambda *_args: production)
+    monkeypatch.setattr(production_routes, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(production_routes, "_production_payload", lambda _state: {"ok": True})
+    monkeypatch.setattr(
+        production_routes, "validate_video_duration",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("settings must not validate parent duration")),
+    )
+
+    result = await production_routes.update_project_production_shot(
+        state.project_id, 1, ProductionShotUpdateRequest(
+            video_override=VideoGenerationPolicyRequest(provider="mock", model="mock", resolution="720p"),
+            continuity_enabled=False,
+        ),
+    )
+
+    assert result == {"ok": True}
+    assert state.generation_prompts.shots[0].prompt == "Hero waits."
+    assert state.generation_prompts.shots[0].negative_prompt == "parent negative"
+    assert state.generation_prompts.shots[0].duration_sec == 30
+    assert state.script.scenes[0].duration_sec == 30
+    assert state.prompt_review == {"status": "ready"}
+    assert production.video_override["resolution"] == "720p"
+    assert production.continuity_enabled is False

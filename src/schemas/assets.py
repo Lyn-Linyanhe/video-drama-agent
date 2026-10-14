@@ -5,8 +5,14 @@ from typing import Literal, Optional
 
 
 class ShotAsset(BaseModel):
-    """A single generated video shot."""
+    """A single generated video shot or executable child-shot unit."""
     scene_id: int = Field(description="Matches ScriptBreakdown.scenes[].scene_id")
+    shot_id: str | None = Field(default=None, description="Stable executable ShotUnit identity")
+    parent_scene_id: int | None = Field(default=None, ge=1, description="Parent scene for split shots")
+    shot_order: int | None = Field(default=None, ge=1, description="Stable execution order within the parent scene")
+    continuity_from_shot_id: str | None = Field(default=None, description="Explicit child shot whose tail state this shot continues")
+    beat_ids: list[str] = Field(default_factory=list)
+    dialogue_ids: list[str] = Field(default_factory=list)
     video_url: str = Field(default="", description="URL of the generated video")
     local_path: Optional[str] = Field(default=None, description="Downloaded local file path")
     duration_sec: float = Field(default=0.0, description="Actual video duration")
@@ -24,7 +30,11 @@ class ShotAsset(BaseModel):
 
 class GeneratedAssets(BaseModel):
     """Collection of generated video assets."""
-    shots: list[ShotAsset] = Field(description="Generated video per scene")
+    shots: list[ShotAsset] = Field(description="Generated video per scene or executable child shot")
+    expected_shot_ids: list[str] = Field(
+        default_factory=list,
+        description="Executable child shots expected by the current ShotPlan; used to prevent silent omissions",
+    )
     total_cost: float = Field(default=0.0, description="Total API cost in USD")
     generation_time_sec: float = Field(default=0.0, description="Total generation time")
     all_success: bool = Field(
@@ -81,8 +91,22 @@ class ShotProductionState(BaseModel):
 
     scene_id: int = Field(description="Matches ScriptBreakdown scene_id")
     references: list[ShotReference] = Field(default_factory=list)
+    excluded_automatic_reference_ids: list[str] = Field(
+        default_factory=list,
+        description="Automatic reference ids explicitly removed by the user for this shot",
+    )
     video_versions: list[ShotVideoVersion] = Field(default_factory=list)
     active_version_id: str = Field(default="")
+    active_version_by_shot_id: dict[str, str] = Field(
+        default_factory=dict,
+        description="Active video version per executable child shot; legacy projects use active_version_id",
+    )
+    generation_status_by_shot_id: dict[str, str] = Field(default_factory=dict)
+    generation_error_by_shot_id: dict[str, str] = Field(
+        default_factory=dict,
+        description="Last persisted generation error per executable child shot",
+    )
+    generation_snapshots_by_shot_id: dict[str, dict] = Field(default_factory=dict)
     generation_status: str = Field(default="idle", description="idle, generating, success, failed")
     error_message: str = Field(default="")
     started_at: str = Field(default="")

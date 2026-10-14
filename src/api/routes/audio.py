@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 from ..context import *
 from .job_helpers import _job_public
+from src.agents.assembly_agent import normalize_subtitle_style
 from src.services.audio_timeline import (
     audio_line_or_404 as _audio_line_or_404,
     audio_scene as _audio_scene,
@@ -134,8 +135,94 @@ async def export_project_audio_subtitles(project_id: str, mode: str = "dialogue"
     path = AssemblyAgent()._write_subtitle_file(state.script, by_scene, output_dir, subtitle_mode=mode)
     if not path:
         raise HTTPException(409, "No generated dialogue audio is available for subtitle export")
+    state.subtitle_path = str(path)
     _save_project_state(state)
     return {"subtitle_path": str(path), "mode": mode}
+
+
+def _narration_lines_by_scene(state) -> dict[int, list[str]]:
+    """Spread the project's narration text across scenes.
+
+    Narration has no audio track and is not split per scene in the script, so
+    non-empty lines are distributed in order across the scenes that carry no
+    dialogue. That mirrors how a story recap reads over silent shots.
+    """
+    raw = str(getattr(state, "subtitle_narration_text", "") or "")
+    lines = [item.strip() for item in re.split(r"[\r\n]+", raw) if item.strip()]
+    if not lines or not state.script:
+        return {}
+    silent_scenes = [scene.scene_id for scene in state.script.scenes if not scene.dialogue]
+    targets = silent_scenes or [scene.scene_id for scene in state.script.scenes]
+    grouped: dict[int, list[str]] = {}
+    for index, text in enumerate(lines):
+        grouped.setdefault(targets[index % len(targets)], []).append(text)
+    return grouped
+
+
+@router.post("/api/projects/{project_id}/subtitles/burn")
+async def burn_project_subtitles(
+    project_id: str,
+    video_path: str = "",
+    mode: str = "",
+):
+    """Burn subtitles onto an already assembled video, writing a new file.
+
+    Final assembly only burns subtitles as a side effect of a full render, so
+    there was no way to caption a finished video or try a different style.
+    """
+    state = _load_project_state(project_id)
+    if not state.script:
+        raise HTTPException(409, "Please confirm and analyze the script first")
+    resolved_mode = (mode or state.subtitle_mode or "dialogue").strip()
+    if resolved_mode not in AssemblyAgent.SUBTITLE_MODES:
+        raise HTTPException(400, "Subtitle mode must be one of: " + ", ".join(AssemblyAgent.SUBTITLE_MODES))
+    if resolved_mode == "off":
+        raise HTTPException(400, "请先选择一种字幕模式。")
+
+    source_video = video_path.strip() or str(state.output_video_path or "")
+    if not source_video or not os.path.isfile(source_video):
+        raise HTTPException(409, "请先合成成片，再烧录字幕。")
+
+    audio = _project_audio_assets(state)
+    _layout_project_audio(state)
+    by_scene = {scene.scene_id: scene for scene in audio.scenes}
+    narration = _narration_lines_by_scene(state) if resolved_mode in {"narration", "all"} else None
+
+    output_dir = OUTPUT_DIR / project_id / "assets" / "final"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Subtitle timing must follow the video we are actually burning onto, so the
+    # real per-shot durations are measured instead of the estimated timeline.
+    measured = AssemblyAgent().measured_scene_durations(state.script, by_scene)
+    scene_starts = AssemblyAgent()._measure_scene_starts(state.script, by_scene)
+    subtitle_path = AssemblyAgent()._write_subtitle_file(
+        state.script, by_scene, output_dir,
+        scene_starts=scene_starts, subtitle_mode=resolved_mode,
+        narration_lines=narration, scene_durations=measured,
+    )
+    if not subtitle_path:
+        raise HTTPException(409, "没有可用于字幕的台词或旁白。")
+
+    stem = Path(source_video).stem
+    target = str(output_dir / f"{stem}_sub.mp4")
+    style = normalize_subtitle_style(getattr(state, "subtitle_style", None))
+    try:
+        result_path = AssemblyAgent().burn_subtitles_into_video(
+            source_video, subtitle_path, target, style,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"字幕烧录失败: {exc}") from exc
+
+    state.subtitle_path = str(subtitle_path)
+    state.subtitle_mode = resolved_mode
+    state.subtitle_enabled = True
+    _save_project_state(state)
+    return {
+        "output_video_path": result_path,
+        "source_video_path": source_video,
+        "subtitle_path": str(subtitle_path),
+        "mode": resolved_mode,
+        "style": style,
+    }
 
 
 @router.post("/api/projects/{project_id}/audio-library/upload")

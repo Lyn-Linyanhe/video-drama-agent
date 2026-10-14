@@ -60,6 +60,7 @@ from src.utils.project_store import ProjectStore
 from src.utils.asset_versions import ImageAssetVersions
 from src.schemas.jobs import ACTIVE_JOB_STATES, JobBatchPublic, JobCreateRequest, JobPublic, TERMINAL_JOB_STATES
 from src.schemas.project import CreativeProfile
+from src.schemas.prompt import ShotPrompt
 from src.services import JobManager, JobStore
 from src.services.generation_hooks import GenerationHooks, bind_generation_hooks
 from src.services.job_handlers import register_handlers
@@ -281,7 +282,9 @@ class GenerateAssetRequest(BaseModel):
 
 class ProductionSettingsRequest(BaseModel):
     subtitle_enabled: bool = True
-    subtitle_mode: str | None = Field(default=None, pattern="^(off|dialogue|speaker)$")
+    subtitle_mode: str | None = Field(default=None, pattern="^(off|dialogue|speaker|narration|all)$")
+    subtitle_style: dict | None = None
+    subtitle_narration_text: str | None = Field(default=None, max_length=4000)
     asr_enabled: bool | None = None
     asr_model: str | None = Field(default=None, max_length=80)
     audio_mode: Literal["native_dialogue", "external_tts"] | None = None
@@ -366,6 +369,7 @@ class ProductionShotUpdateRequest(BaseModel):
         le=60,
     )
     references: list[ProductionReferenceRequest] | None = None
+    excluded_automatic_reference_ids: list[str] | None = Field(default=None, max_length=512)
     video_override: VideoGenerationPolicyRequest | None = None
     continuity_enabled: bool | None = None
     transition_type: str | None = Field(default=None, max_length=16)
@@ -378,6 +382,10 @@ class ProductionPromptRevisionRequest(BaseModel):
 
 class ActivateVideoVersionRequest(BaseModel):
     version_id: str = Field(..., min_length=8, max_length=128)
+    # Optional for backwards-compatible parent-shot activation. Child-shot callers
+    # must provide the exact executable shot scope so sibling versions cannot be
+    # activated through the shared scene endpoint.
+    shot_id: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class ManualAssetRequest(BaseModel):
@@ -418,6 +426,9 @@ def _state_to_json(state: DramaState) -> str:
         "output_video_path": state.output_video_path,
         "subtitle_enabled": state.subtitle_enabled,
         "subtitle_mode": state.subtitle_mode,
+        "subtitle_style": state.subtitle_style,
+        "subtitle_narration_text": state.subtitle_narration_text,
+        "subtitle_path": state.subtitle_path,
         "assembly_audio_override": state.assembly_audio_override,
         "prompt_overrides": state.prompt_overrides,
         "prompt_policy": state.prompt_policy.model_dump(),
@@ -814,9 +825,12 @@ def _state_from_json(json_str: str) -> DramaState:
         subtitle_enabled=bool(data.get("subtitle_enabled", True)),
         subtitle_mode=(
             data.get("subtitle_mode")
-            if data.get("subtitle_mode") in {"off", "dialogue", "speaker"}
+            if data.get("subtitle_mode") in {"off", "dialogue", "speaker", "narration", "all"}
             else ("dialogue" if bool(data.get("subtitle_enabled", True)) else "off")
         ),
+        subtitle_style=data.get("subtitle_style") or {},
+        subtitle_narration_text=str(data.get("subtitle_narration_text") or ""),
+        subtitle_path=str(data.get("subtitle_path") or ""),
         assembly_audio_override=str(data.get("assembly_audio_override") or ""),
         prompt_overrides=data.get("prompt_overrides", {}),
         user_feedback=data.get("user_feedback", ""),
@@ -1469,14 +1483,125 @@ def _reconcile_state_after_script_change(
     return state
 
 
-def _shot_prompt(state: DramaState, scene_id: int):
+def _duration_cap_from_policy(policy: dict | None) -> int | None:
+    """Resolve a normalized policy's executable maximum duration."""
+    capability = dict((policy or {}).get("capability") or {})
+    maximum = capability.get("duration_max")
+    if maximum is None:
+        durations = capability.get("durations") or []
+        maximum = max(durations) if durations else None
+    return int(maximum) if maximum is not None else None
+
+
+def _duration_min_from_policy(policy: dict | None) -> int:
+    """Resolve a normalized policy's executable minimum duration."""
+    capability = dict((policy or {}).get("capability") or {})
+    minimum = capability.get("duration_min")
+    if minimum is None:
+        durations = capability.get("durations") or []
+        minimum = min(durations) if durations else 3
+    try:
+        return max(1, int(minimum))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _duration_options_from_policy(policy: dict | None) -> list[int]:
+    """Resolve finite provider duration choices from a normalized policy."""
+    from src.services.video_capabilities import duration_options_for_policy
+
+    return duration_options_for_policy(policy)
+
+
+def _video_duration_cap(state: DramaState, override: dict | None = None) -> int | None:
+    """Resolve the selected provider's executable maximum duration.
+
+    Keep this lookup tied to the normalized capability snapshot so API reads,
+    task creation, and provider execution use the same duration contract.
+    """
+    from src.services.video_capabilities import normalize_video_policy
+
+    return _duration_cap_from_policy(
+        normalize_video_policy(state.video_generation_policy, override)
+    )
+
+
+def _video_duration_min(state: DramaState, override: dict | None = None) -> int:
+    from src.services.video_capabilities import normalize_video_policy
+
+    return _duration_min_from_policy(
+        normalize_video_policy(state.video_generation_policy, override)
+    )
+
+
+def _video_duration_options(state: DramaState, override: dict | None = None) -> list[int]:
+    from src.services.video_capabilities import normalize_video_policy
+
+    return _duration_options_from_policy(
+        normalize_video_policy(state.video_generation_policy, override)
+    )
+
+
+def _shot_prompt(
+    state: DramaState,
+    scene_id: int,
+    shot_id: str | None = None,
+    *,
+    duration_cap_sec: int | float | None = None,
+    provider_min_duration_sec: int | float | None = None,
+    duration_options: list[int] | None = None,
+):
     prompt = next(
         (item for item in state.generation_prompts.shots if item.scene_id == scene_id),
         None,
     )
     if prompt is None:
         raise HTTPException(404, "Storyboard shot not found")
-    return prompt
+    if not shot_id:
+        return prompt
+    from src.services.shot_prompt_materializer import materialize_shot_prompts
+    cap = duration_cap_sec if duration_cap_sec is not None else _video_duration_cap(state)
+    minimum = provider_min_duration_sec if provider_min_duration_sec is not None else _video_duration_min(state)
+    options = duration_options if duration_options is not None else _video_duration_options(state)
+    materialized = materialize_shot_prompts(
+        state.generation_prompts,
+        state.script,
+        provider_min_duration_sec=minimum,
+        duration_cap_sec=cap,
+        duration_options=options,
+    )
+    child = next((item for item in materialized if item.shot_id == shot_id), None)
+    if child is None or child.scene_id != scene_id:
+        raise HTTPException(404, "Executable child shot not found")
+    return child
+
+
+def _materialized_shot_prompts(
+    state: DramaState,
+    scene_id: int,
+    *,
+    duration_cap_sec: int | float | None = None,
+    provider_min_duration_sec: int | float | None = None,
+    duration_options: list[int] | None = None,
+):
+    """Return executable child prompts for one scene, preserving legacy fallback."""
+    from src.services.shot_prompt_materializer import materialize_shot_prompts
+
+    if state.generation_prompts is None or state.script is None:
+        return []
+    cap = duration_cap_sec if duration_cap_sec is not None else _video_duration_cap(state)
+    minimum = provider_min_duration_sec if provider_min_duration_sec is not None else _video_duration_min(state)
+    options = duration_options if duration_options is not None else _video_duration_options(state)
+    return [
+        item for item in materialize_shot_prompts(
+            state.generation_prompts,
+            state.script,
+            provider_min_duration_sec=minimum,
+            duration_cap_sec=cap,
+            duration_options=options,
+        )
+        if int(item.scene_id) == int(scene_id)
+    ]
 
 
 def _script_scene(state: DramaState, scene_id: int):
@@ -1706,12 +1831,14 @@ def _replace_reference_mentions(text: str, reference, token: str) -> tuple[str, 
 def _character_inline_view_rank(prompt: str, reference) -> int:
     """Choose the one character image that represents this shot in the text."""
     view_type = _reference_value(reference, "view_type").lower()
-    normalized_prompt = str(prompt or "")
+    from src.services.prompt_execution_context import extract_camera_scoped_text
+
+    normalized_prompt = extract_camera_scoped_text(prompt)
     if any(term in normalized_prompt for term in ("背面", "背影", "背后", "背身")):
         preference = ("back", "profile", "front_full", "front_half")
     elif any(term in normalized_prompt for term in ("侧面", "侧脸", "侧身", "过肩")):
         preference = ("profile", "front_half", "front_full", "back")
-    elif any(term in normalized_prompt for term in ("全身", "远景", "大全景")):
+    elif any(term in normalized_prompt for term in ("全身", "远景", "大全景", "wide", "拉远")):
         preference = ("front_full", "front_half", "profile", "back")
     else:
         preference = ("front_half", "front_full", "profile", "back")
@@ -1749,6 +1876,36 @@ def _automatic_references_for_inline_text(prompt: str, references):
         selected.append(primary_characters[identity])
         seen_characters.add(identity)
     return selected
+
+
+def _compact_automatic_character_references(prompt: str, references):
+    """Keep one automatic character view per identity; preserve manual extras."""
+    ordered = list(references or [])
+    character_groups: dict[str, list] = {}
+    for reference in ordered:
+        if _reference_value(reference, "asset_type") != "character":
+            continue
+        if _reference_value(reference, "source", "asset") != "asset":
+            continue
+        identity = _reference_value(reference, "asset_id") or _reference_value(reference, "reference_id")
+        character_groups.setdefault(identity, []).append(reference)
+    if not character_groups:
+        return ordered
+    keep_keys = set()
+    for identity, group in character_groups.items():
+        chosen = min(group, key=lambda item: _character_inline_view_rank(prompt, item))
+        keep_keys.add(_reference_submission_key(chosen))
+    compacted = []
+    for reference in ordered:
+        if _reference_value(reference, "asset_type") != "character":
+            compacted.append(reference)
+            continue
+        if _reference_value(reference, "source", "asset") != "asset":
+            compacted.append(reference)
+            continue
+        if _reference_submission_key(reference) in keep_keys:
+            compacted.append(reference)
+    return compacted
 
 
 def _inline_automatic_asset_mentions(prompt: str, references) -> str:
@@ -1818,9 +1975,11 @@ def _default_shot_references(state: DramaState, scene_id: int):
 def _reconcile_shot_references(state: DramaState, scene_id: int):
     """Refresh only asset-bound references while retaining manual entries and order."""
     production = _ensure_shot_production(state, scene_id)
+    excluded_ids = set(production.excluded_automatic_reference_ids)
     latest_by_identity = {
         _asset_reference_key(reference): reference
         for reference in _default_shot_references(state, scene_id)
+        if reference.reference_id not in excluded_ids
     }
     reconciled = []
     for reference in production.references:
@@ -1829,6 +1988,8 @@ def _reconcile_shot_references(state: DramaState, scene_id: int):
             continue
         if reference.source == "explicit":
             reconciled.append(_resolve_explicit_reference_version(state, reference))
+            continue
+        if reference.reference_id in excluded_ids:
             continue
         latest = latest_by_identity.pop(_asset_reference_key(reference), None)
         reconciled.append(latest or reference.model_copy(update={"stale": True}))
@@ -1883,12 +2044,16 @@ def _clamp_production_duration(value) -> int:
 
 
 def _duration_for_video_policy(value, policy: dict) -> int:
-    """Use model capability bounds for Seedance while preserving legacy limits elsewhere."""
-    if str(policy.get("provider") or "").lower() == "seedance":
-        from src.services.video_capabilities import validate_video_duration
+    """Validate a duration against the selected provider's capability snapshot.
 
-        return validate_video_duration(policy, value)
-    return _clamp_production_duration(value)
+    The mock provider is a legacy test-only path without a real provider
+    capability snapshot, so it retains the historical display clamp.
+    """
+    if str(policy.get("provider") or "").lower() == "mock":
+        return _clamp_production_duration(value)
+    from src.services.video_capabilities import validate_video_duration
+
+    return validate_video_duration(policy, value)
 
 
 def _safe_reference_tag_part(value: object, fallback: str = "ref") -> str:
@@ -1935,13 +2100,56 @@ def _visual_style_snapshot(profile) -> dict:
     }
 
 
-def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: dict) -> dict:
+def _build_video_generation_snapshot(
+    state: DramaState,
+    scene_id: int,
+    policy: dict,
+    shot_id: str | None = None,
+) -> dict:
     """Freeze the exact prompt and ordered image references for one video task."""
     from src.services.video_capabilities import video_agent_for_policy
     from src.services.video_continuity import continuity_reference
-    from src.services.native_audio import append_native_dialogue_prompt, build_dialogue_plan
+    from src.services.native_audio import (
+        append_native_dialogue_prompt,
+        base_dialogue_id as _base_dialogue_id,
+        build_dialogue_plan,
+    )
 
-    raw_prompt = _shot_prompt(state, scene_id).model_copy(deep=True)
+    source_prompt = _shot_prompt(
+        state,
+        scene_id,
+        shot_id=shot_id,
+        duration_cap_sec=_video_duration_cap(state, policy) if shot_id else None,
+        provider_min_duration_sec=_duration_min_from_policy(policy) if shot_id else None,
+        duration_options=_duration_options_from_policy(policy) if shot_id else None,
+    )
+    is_child_shot = bool(shot_id or getattr(source_prompt, "shot_id", None))
+    child_dialogue_ids = (
+        list(getattr(source_prompt, "dialogue_ids", []) or [])
+        if is_child_shot
+        else None
+    )
+    script_for_shot = state.script
+    scene = _script_scene(state, scene_id)
+    if child_dialogue_ids is not None:
+        # Prompt preparation restores structured dialogue that is absent from a
+        # draft. Scope the script copy first, otherwise every child receives all
+        # dialogue from its parent scene and the provider gets contradictory
+        # instructions about which lines belong in this clip.
+        script_for_shot = state.script.model_copy(deep=True)
+        scoped_scene = next(
+            item for item in script_for_shot.scenes
+            if int(item.scene_id) == int(scene_id)
+        )
+        allowed_dialogue_ids = {
+            _base_dialogue_id(item) for item in child_dialogue_ids
+        }
+        scoped_scene.dialogue = [
+            line
+            for index, line in enumerate(scoped_scene.dialogue, start=1)
+            if f"scene-{scene_id}-dialogue-{index}" in allowed_dialogue_ids
+        ]
+    raw_prompt = source_prompt.model_copy(deep=True)
     raw_prompt.duration_sec = _duration_for_video_policy(raw_prompt.duration_sec, policy)
     reconciled_references = _deduplicate_shot_references(_reconcile_shot_references(state, scene_id))
     raw_prompt.prompt = _inline_automatic_asset_mentions(raw_prompt.prompt, reconciled_references)
@@ -1958,9 +2166,17 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         for reference in reconciled_references
         if reference.image_path and Path(reference.image_path).is_file() and not reference.stale
     ]
+    references = _compact_automatic_character_references(raw_prompt.prompt, references)
     continuity_reference_added = False
     if policy.get("capability", {}).get("continuity"):
-        tail_path, tail_label = continuity_reference(state, scene_id, policy)
+        continuity_dependency = getattr(source_prompt, "continuity_from_shot_id", None)
+        if shot_id or continuity_dependency:
+            tail_path, tail_label = continuity_reference(
+                state, scene_id, policy, shot_id, continuity_dependency,
+            )
+        else:
+            # Keep legacy monkeypatched/three-argument integrations readable.
+            tail_path, tail_label = continuity_reference(state, scene_id, policy)
         if tail_path and Path(tail_path).is_file():
             continuity_reference_added = True
             references.insert(0, {
@@ -2117,7 +2333,7 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
         prompt_policy=state.prompt_policy,
         visual_design=state.visual_design,
         scene_vision_descriptions=state.scene_vision_descriptions,
-        script=state.script,
+        script=script_for_shot,
         creative_profile=state.creative_profile,
     )
     if references:
@@ -2137,10 +2353,13 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
             labels,
             state.visual_design,
             state.scene_vision_descriptions,
-            state.script,
+            script_for_shot,
         )
-    scene = _script_scene(state, scene_id)
-    dialogue_plan = build_dialogue_plan(scene)
+    # 拆段对白按段取文时必须使用与规划时相同的时长上限，重打包结果才一致。
+    speech_budget_sec = _duration_cap_from_policy(policy)
+    dialogue_plan = build_dialogue_plan(
+        scene, dialogue_ids=child_dialogue_ids, speech_budget_sec=speech_budget_sec,
+    )
     audio_mode_requested = str(getattr(state.creative_profile, "audio_mode", "auto") or "auto").lower()
     if audio_mode_requested not in {"auto", "native_dialogue", "external_tts"}:
         audio_mode_requested = "auto"
@@ -2163,7 +2382,8 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
     audio_mode_effective = "native_dialogue" if native_audio_requested else "external_tts"
     if native_audio_requested:
         final_provider_prompt, _native_lines = append_native_dialogue_prompt(
-            final_provider_prompt, scene,
+            final_provider_prompt, scene, dialogue_ids=child_dialogue_ids,
+            speech_budget_sec=speech_budget_sec,
         )
         prepared = prepared.model_copy(update={"prompt": final_provider_prompt})
         effective["provider_prompt"] = final_provider_prompt
@@ -2172,8 +2392,11 @@ def _build_video_generation_snapshot(state: DramaState, scene_id: int, policy: d
     explicit_references = [item for item in references if item.get("source") == "explicit"]
     snapshot = {
         "scene_id": scene_id,
-        "source_prompt": _shot_prompt(state, scene_id).prompt,
-        "source_duration_sec": int(_shot_prompt(state, scene_id).duration_sec or 0),
+        "shot_id": shot_id or str(getattr(source_prompt, "shot_id", "") or ""),
+        "shot_order": getattr(source_prompt, "shot_order", None),
+        "continuity_from_shot_id": getattr(source_prompt, "continuity_from_shot_id", None),
+        "source_prompt": source_prompt.prompt,
+        "source_duration_sec": int(source_prompt.duration_sec or 0),
         "effective_duration_sec": int(raw_prompt.duration_sec or 0),
         "raw_prompt": raw_prompt.prompt,
         "raw_negative_prompt": raw_prompt.negative_prompt,
@@ -2265,7 +2488,17 @@ def _ensure_shot_production(state: DramaState, scene_id: int):
             state.project_id, states=ACTIVE_JOB_STATES, limit=100,
         ) if state.project_id else []
         active = any(
-            item["job_type"] == "video.generate" and item["target_id"] == str(scene_id)
+            item.get("job_type") == "video.generate"
+            and (
+                (
+                    item.get("target_type") == "shot"
+                    and str(item.get("target_id") or "") == str(scene_id)
+                )
+                or (
+                    item.get("target_type") == "shot_unit"
+                    and int((item.get("payload") or item.get("request") or {}).get("scene_id") or 0) == int(scene_id)
+                )
+            )
             for item in active_jobs
         )
         if not active:
@@ -2284,8 +2517,35 @@ def _sync_active_shot_asset(state: DramaState, scene_id: int) -> None:
     )
     if state.generated_assets is None:
         state.generated_assets = GeneratedAssets(shots=[])
+    if state.generation_prompts and state.generation_prompts.shot_plans:
+        state.generated_assets.expected_shot_ids = [
+            str(unit.shot_id)
+            for plan in state.generation_prompts.shot_plans
+            for unit in plan.units
+            if unit.shot_id
+        ]
     state.generated_assets.shots = [item for item in state.generated_assets.shots if item.scene_id != scene_id]
-    if active:
+    child_versions = [
+        item for item in production.video_versions
+        if getattr(item, "shot_id", None) and item.success
+    ]
+    if child_versions:
+        by_shot: dict[str, object] = {}
+        for item in child_versions:
+            shot_id = str(item.shot_id)
+            active_id = production.active_version_by_shot_id.get(shot_id, "")
+            if active_id:
+                if item.version_id == active_id:
+                    by_shot[shot_id] = item
+            else:
+                # Legacy projects do not have a per-shot active map; retained
+                # versions are append-only, so the last successful one is the
+                # current readable version.
+                by_shot[shot_id] = item
+        state.generated_assets.shots.extend(
+            ShotAsset.model_validate(item.model_dump()) for item in by_shot.values()
+        )
+    elif active:
         state.generated_assets.shots.append(ShotAsset.model_validate(active.model_dump()))
     state.generated_assets.all_success = bool(state.generated_assets.shots) and all(
         item.success for item in state.generated_assets.shots
@@ -2370,13 +2630,31 @@ def _production_payload(state: DramaState) -> dict:
         _reconcile_shot_references(state, scene.scene_id)
         prompt = _shot_prompt(state, scene.scene_id)
         video_policy = normalize_video_policy(state.video_generation_policy, production.video_override)
-        display_duration = (
-            int(round(float(prompt.duration_sec)))
-            if video_policy.get("provider") == "seedance"
-            else _clamp_production_duration(prompt.duration_sec)
+        duration_cap = _duration_cap_from_policy(video_policy)
+        duration_options = _duration_options_from_policy(video_policy)
+        capacity_plan = next(
+            (
+                plan for plan in (state.generation_prompts.shot_plans or [])
+                if int(plan.scene_id) == int(scene.scene_id)
+            ),
+            None,
         )
+        executable_shots = []
+        capacity_error = ""
+        try:
+            executable_shots = _materialized_shot_prompts(
+                state,
+                scene.scene_id,
+                duration_cap_sec=duration_cap,
+                provider_min_duration_sec=_duration_min_from_policy(video_policy),
+                duration_options=duration_options,
+            )
+        except (ValueError, HTTPException) as exc:
+            # The preview must expose the real parent duration and diagnostic,
+            # never replace an over-cap parent with a fake legal duration.
+            capacity_error = str(getattr(exc, "detail", exc))
+
         display_prompt = prompt.model_copy(update={
-            "duration_sec": display_duration,
             "prompt": _inline_automatic_asset_mentions(prompt.prompt, production.references),
         })
         effective = compose_video_prompt(
@@ -2387,7 +2665,12 @@ def _production_payload(state: DramaState) -> dict:
             creative_profile=state.creative_profile,
         )
         policy_public = {key: value for key, value in video_policy.items() if key != "capability"}
-        estimated_cost_rmb = round(float(policy_public["unit_price_rmb_per_sec"]) * float(display_prompt.duration_sec), 4)
+        source_duration_sec = float(scene.duration_sec or prompt.duration_sec or 0)
+        estimated_duration_sec = round(
+            sum(float(item.duration_sec or 0) for item in executable_shots),
+            2,
+        ) if executable_shots else source_duration_sec
+        estimated_cost_rmb = round(float(policy_public["unit_price_rmb_per_sec"]) * estimated_duration_sec, 4)
         productions.append({
             "scene": scene.model_dump(),
             "prompt": display_prompt.model_dump(),
@@ -2395,6 +2678,13 @@ def _production_payload(state: DramaState) -> dict:
             "production": production.model_dump(),
             "video_policy": policy_public,
             "video_capability": video_policy["capability"],
+            "source_duration_sec": source_duration_sec,
+            "provider_duration_cap_sec": duration_cap,
+            "provider_duration_options": duration_options,
+            "capacity_error": capacity_error,
+            "shot_plan": capacity_plan.model_dump() if capacity_plan else None,
+            "executable_shots": [item.model_dump() for item in executable_shots],
+            "estimated_duration_sec": estimated_duration_sec,
             "estimated_cost_rmb": estimated_cost_rmb,
         })
     catalog = _reference_catalog(state)
@@ -2434,76 +2724,170 @@ def _production_payload(state: DramaState) -> dict:
         "provider_capabilities": provider_capabilities(provider),
         "subtitle_enabled": state.subtitle_enabled,
         "subtitle_mode": state.subtitle_mode,
+        "subtitle_style": state.subtitle_style,
+        "subtitle_narration_text": state.subtitle_narration_text,
+        "subtitle_path": state.subtitle_path,
         "output_video_path": state.output_video_path,
         "missing_media_paths": _missing_media_paths(state),
     }
 
 
 async def _run_shot_video_job(project_id: str, scene_id: int, version_id: str) -> None:
-    """Background task that persists one generated video version."""
+    """Compatibility worker that follows the current policy/materialization contract.
+
+    This path is retained for old callers, but it must behave like the current
+    ``video.generate`` worker: resolve the project policy, materialize executable
+    child shots, freeze a snapshot, and invoke the policy-specific provider agent.
+    """
+    current_shot_id: str | None = None
     try:
-        state = _load_project_state(project_id)
-        production = _ensure_shot_production(state, scene_id)
-        prompt = _shot_prompt(state, scene_id).model_copy(deep=True)
-        valid_references = [
-            item
-            for item in _deduplicate_shot_references(production.references)
-            if Path(item.image_path).is_file()
-        ]
-        prompt.prompt = _inline_automatic_asset_mentions(prompt.prompt, valid_references)
-        reference_paths = [item.image_path for item in valid_references]
-        reference_labels = [
-            _reference_label_for_item(item.model_dump(), index)
-            for index, item in enumerate(valid_references, start=1)
-        ]
-        asset = await video_gen_agent.generate_shot(
-            prompt,
-            reference_paths,
-            reference_labels=reference_labels,
-            visual_design=state.visual_design,
-            scene_vision_descriptions=state.scene_vision_descriptions,
-            script=state.script,
-            project_id=project_id,
-            version_id=version_id,
-            generation_prompts=state.generation_prompts,
-            prompt_policy=state.prompt_policy,
-            creative_profile=state.creative_profile,
+        from src.schemas.assets import ShotVideoVersion
+        from src.services.video_capabilities import (
+            normalize_video_policy,
+            requires_reference_image,
+            validate_video_duration,
         )
 
-        latest = _load_project_state(project_id)
-        latest_production = _ensure_shot_production(latest, scene_id)
-        now = datetime.now().isoformat(timespec="seconds")
-        latest_production.completed_at = now
-        if asset.success:
-            from src.schemas.assets import ShotVideoVersion
+        state = _load_project_state(project_id)
+        production = _ensure_shot_production(state, scene_id)
+        policy = normalize_video_policy(state.video_generation_policy, production.video_override)
+        duration_cap = _duration_cap_from_policy(policy)
+        duration_options = _duration_options_from_policy(policy)
+        executable_shots = _materialized_shot_prompts(
+            state,
+            scene_id,
+            duration_cap_sec=duration_cap,
+            provider_min_duration_sec=_duration_min_from_policy(policy),
+            duration_options=duration_options,
+        )
+        if not executable_shots:
+            raise ValueError(f"镜头 {scene_id} 没有可执行的子镜头")
 
-            version = ShotVideoVersion(
-                **asset.model_dump(), version_id=version_id, created_at=now,
+        selected_agent = video_agent_for_policy(policy)
+        successful_versions: list[str] = []
+        current_shot_id: str | None = None
+        for index, source_prompt in enumerate(executable_shots, start=1):
+            shot_id = str(getattr(source_prompt, "shot_id", "") or "").strip() or None
+            current_shot_id = shot_id
+            snapshot = _build_video_generation_snapshot(
+                state,
+                scene_id,
+                policy,
+                shot_id=shot_id,
             )
+            prompt = ShotPrompt.model_validate(
+                snapshot.get("prepared_shot") or source_prompt.model_dump()
+            )
+            validate_video_duration(policy, prompt.duration_sec)
+            snapshot_references = list(snapshot.get("references") or [])
+            missing_references = [
+                str(item.get("reference_id") or item.get("asset_id") or "unknown")
+                for item in snapshot_references
+                if not Path(item.get("image_path") or "").is_file()
+            ]
+            if missing_references:
+                raise ValueError("提交快照中的参考图已丢失：" + "、".join(missing_references))
+            if requires_reference_image(policy) and not snapshot_references:
+                raise ValueError("请先生成角色、场景或道具参考图")
+
+            reference_paths = [str(item["image_path"]) for item in snapshot_references]
+            reference_labels = list(snapshot.get("reference_labels") or [
+                _reference_label_for_item(item, ref_index)
+                for ref_index, item in enumerate(snapshot_references, start=1)
+            ])
+            child_version_id = (
+                version_id
+                if len(executable_shots) == 1
+                else f"{version_id}-{index}"
+            )
+            asset = await selected_agent.generate_shot(
+                prompt,
+                reference_paths,
+                reference_labels=reference_labels,
+                visual_design=state.visual_design,
+                scene_vision_descriptions=state.scene_vision_descriptions,
+                script=state.script,
+                project_id=project_id,
+                version_id=child_version_id,
+                generation_prompts=state.generation_prompts,
+                prompt_policy=state.prompt_policy,
+                request_is_prepared=True,
+                provider_prompt=snapshot.get("provider_prompt") or prompt.prompt,
+                reference_mode=snapshot.get("reference_mode") or "auto",
+                last_frame_reference=snapshot.get("last_frame_reference_path") or None,
+                return_last_frame=bool(snapshot.get("return_last_frame")),
+                generate_audio=bool(snapshot.get("native_audio_requested")),
+                creative_profile=state.creative_profile,
+            )
+            asset.api_used = policy["model"]
+            asset.shot_id = shot_id
+            asset.parent_scene_id = scene_id
+            asset.shot_order = getattr(prompt, "shot_order", None)
+            asset.continuity_from_shot_id = getattr(prompt, "continuity_from_shot_id", None)
+            asset.beat_ids = list(getattr(prompt, "beat_ids", []) or [])
+            asset.dialogue_ids = list(getattr(prompt, "dialogue_ids", []) or [])
+            if not asset.success or not asset.local_path:
+                raise RuntimeError(asset.error_message or "视频生成失败")
+
+            quality_report = {}
             try:
-                quality_report = inspect_video(asset.local_path, expected_duration=prompt.duration_sec)
+                quality_report = inspect_video(
+                    asset.local_path,
+                    expected_duration=prompt.duration_sec,
+                )
                 visual_review = await review_video_subjective(
                     asset.local_path,
-                    (latest_production.last_generation_snapshot or {}).get("provider_prompt") or prompt.prompt,
+                    snapshot.get("provider_prompt") or prompt.prompt,
                 )
                 quality_report["visual_review"] = visual_review
                 if visual_review.get("status") == "warning":
                     quality_report["status"] = "warning"
                     quality_report["warnings"] = visual_review.get("issues", [])
-                version.quality_report = quality_report
             except Exception as review_exc:
-                version.quality_report = {
+                quality_report = {
                     "status": "skipped",
                     "warnings": [f"视频审核未完成：{str(review_exc)[:180]}"],
                 }
+
+            latest = _load_project_state(project_id)
+            latest_production = _ensure_shot_production(latest, scene_id)
+            now = datetime.now().isoformat(timespec="seconds")
+            version = ShotVideoVersion(
+                **asset.model_dump(),
+                version_id=child_version_id,
+                created_at=now,
+                provider=policy["provider"],
+                model=policy["model"],
+                resolution=policy["resolution"],
+                capability_snapshot=policy["capability"],
+                unit_price_rmb_per_sec=policy["unit_price_rmb_per_sec"],
+                estimated_cost_rmb=round(
+                    policy["unit_price_rmb_per_sec"] * float(asset.duration_sec or prompt.duration_sec),
+                    4,
+                ),
+                generation_snapshot=snapshot,
+                quality_report=quality_report,
+            )
             latest_production.video_versions.append(version)
-            latest_production.active_version_id = version_id
-            latest_production.generation_status = "success"
+            if shot_id:
+                latest_production.active_version_by_shot_id[shot_id] = child_version_id
+                latest_production.generation_status_by_shot_id[shot_id] = "success"
+                latest_production.generation_error_by_shot_id.pop(shot_id, None)
+                latest_production.generation_snapshots_by_shot_id[shot_id] = snapshot
+            else:
+                latest_production.active_version_id = child_version_id
+            latest_production.generation_status = "generating"
             latest_production.error_message = ""
+            latest_production.completed_at = ""
             _sync_active_shot_asset(latest, scene_id)
-        else:
-            latest_production.generation_status = "failed"
-            latest_production.error_message = asset.error_message or "视频生成失败"
+            _save_project_state(latest)
+            successful_versions.append(child_version_id)
+
+        latest = _load_project_state(project_id)
+        latest_production = _ensure_shot_production(latest, scene_id)
+        latest_production.generation_status = "success"
+        latest_production.error_message = ""
+        latest_production.completed_at = datetime.now().isoformat(timespec="seconds")
         _save_project_state(latest)
     except Exception as exc:
         try:
@@ -2512,6 +2896,9 @@ async def _run_shot_video_job(project_id: str, scene_id: int, version_id: str) -
             production.generation_status = "failed"
             production.error_message = str(exc)
             production.completed_at = datetime.now().isoformat(timespec="seconds")
+            if current_shot_id:
+                production.generation_status_by_shot_id[current_shot_id] = "failed"
+                production.generation_error_by_shot_id[current_shot_id] = str(exc)
             _save_project_state(latest)
         except Exception:
             pass

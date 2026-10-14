@@ -11,6 +11,7 @@ class DialogueLine(BaseModel):
     character: str = Field(description="Character name speaking the line")
     line: str = Field(description="The dialogue text")
     emotion: Optional[str] = Field(default=None, description="Emotion while speaking")
+    order: Optional[int] = Field(default=None, ge=1, description="Optional source narrative order within a scene")
 
 
 class Scene(BaseModel):

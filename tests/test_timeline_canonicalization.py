@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 from src.schemas.prompt import ShotPrompt
 from src.schemas.script import Scene, ScriptBreakdown
 from src.services.timed_prompt_composer import build_timed_shot_prompt
@@ -51,12 +53,11 @@ def test_finalized_duration_only_timeline_is_canonicalized_to_ranges():
     assert not re.search(r"^(?:切镜头，)?\d+(?:\.\d+)?s[，,]", rendered, re.M)
 
 
-def test_duration_only_provider_cap_is_canonicalized_to_ranges():
+def test_duration_only_provider_cap_rejects_over_capacity_parent_instead_of_scaling():
     shot = ShotPrompt(
         scene_id=1,
         duration_sec=20,
         prompt="【时间轴分镜】\n总时长约20s\n10s，动作一\n切镜头，10s，动作二",
     )
-    rendered = build_timed_shot_prompt(shot, _script(20), duration_cap_sec=15)
-    assert "0s-7.5s，动作一" in rendered
-    assert "切镜头，7.5s-15s，动作二" in rendered
+    with pytest.raises(ValueError, match="超过.*上限|duration.*cap"):
+        build_timed_shot_prompt(shot, _script(20), duration_cap_sec=15)

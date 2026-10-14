@@ -10,6 +10,10 @@ const isMissingMediaPath = (...args) => globalThis.StudioActions.isMissingMediaP
 const onProviderChange = (...args) => globalThis.StudioActions.onProviderChange(...args);
 const produceStatus = (...args) => globalThis.StudioActions.produceStatus(...args);
 const productionCurrent = (...args) => globalThis.StudioActions.productionCurrent(...args);
+const productionSelectedShot = (...args) => globalThis.StudioActions.productionSelectedShot(...args);
+const productionShotStatus = (...args) => globalThis.StudioActions.productionShotStatus(...args);
+const productionShotVersions = (...args) => globalThis.StudioActions.productionShotVersions(...args);
+const productionShotActiveVersionId = (...args) => globalThis.StudioActions.productionShotActiveVersionId(...args);
 const productionImageUrl = (...args) => globalThis.StudioActions.productionImageUrl(...args);
 const productionPreviewHtml = (...args) => globalThis.StudioActions.productionPreviewHtml(...args);
 const productionStatusLabel = (...args) => globalThis.StudioActions.productionStatusLabel(...args);
@@ -31,9 +35,61 @@ let productionMentionSelection = null;
 let productionMentionOutsideHandlerInstalled = false;
 let productionVideoPolicySaveChain = Promise.resolve();
 let productionVideoPolicyRevision = 0;
+let productionShotSaveChain = Promise.resolve();
+let productionShotSaveRevision = 0;
+let productionInspectorTab = 'words';
+const productionDrafts = new Map();
+let productionDraftProjectId = null;
 
 function productionPromptEditor() {
   return document.getElementById('production-prompt');
+}
+
+function productionEditorShotKey(shotId = '') {
+  const projectId = String(appState?.projectId || '');
+  const id = String(shotId || '').trim();
+  if (!projectId || !id) return '';
+  return `${projectId}:${id}`;
+}
+
+function productionRenderedEditorKey(root) {
+  if (!root) return '';
+  const shotId = String(root.dataset.productionEditorShotId || '').trim();
+  if (!shotId) return '';
+  const sceneId = String(root.dataset.productionEditorSceneId || '').trim();
+  // Parent editors used to be keyed by scene id, so a later child with the
+  // same digits could restore the parent's unsaved text. Keep parent drafts
+  // on the parent: selection id.
+  const keyId = sceneId && shotId === sceneId ? `parent:${sceneId}` : shotId;
+  return productionEditorShotKey(keyId);
+}
+
+function productionRememberDraft(key, values) {
+  if (!key || !values) return;
+  productionDrafts.set(key, {
+    prompt: String(values.prompt ?? ''),
+    negative: String(values.negative ?? ''),
+    feedback: String(values.feedback ?? ''),
+    duration: String(values.duration ?? ''),
+  });
+}
+
+function productionDraftFromEditor() {
+  const prompt = document.getElementById('production-prompt');
+  if (!prompt) return null;
+  return {
+    prompt: productionPromptText(),
+    negative: document.getElementById('production-negative')?.value || '',
+    feedback: document.getElementById('production-feedback')?.value || '',
+    duration: document.getElementById('production-duration')?.value || '',
+  };
+}
+
+function productionRememberRenderedDraft(root) {
+  if (!root || !document.getElementById('production-prompt')) return;
+  const key = productionRenderedEditorKey(root);
+  const values = productionDraftFromEditor();
+  if (key && values) productionRememberDraft(key, values);
 }
 
 function productionPromptSerializeNode(node) {
@@ -155,19 +211,30 @@ function captureProductionEditorState(root) {
       focused: document.activeElement === element,
     };
   });
-  const renderedSceneId = root.dataset.productionEditorSceneId || String(productionSceneId || '');
+  const renderedSceneId = root.dataset.productionEditorShotId || root.dataset.productionEditorSceneId || String(productionShotId || productionSceneId || '');
   return {
     sceneId: renderedSceneId, values,
     policyOpen: root.querySelector('details.production-panel')?.open || false,
+    projectToolsOpen: root.querySelector('details.production-project-tools')?.open || false,
+    secondaryOpen: [...root.querySelectorAll('details.production-secondary-section')]
+      .filter(item => item.open)
+      .map(item => item.classList.contains('production-assets-section') ? 'assets' : item.classList.contains('production-audio-section') ? 'audio' : item.classList.contains('production-timeline-section') ? 'timeline' : ''),
     pageScrollY: window.scrollY,
   };
 }
 
 function restoreProductionEditorState(root, snapshot) {
-  const renderedSceneId = root.dataset.productionEditorSceneId || String(productionSceneId || '');
+  const renderedSceneId = root.dataset.productionEditorShotId || root.dataset.productionEditorSceneId || String(productionShotId || productionSceneId || '');
   if (!snapshot || snapshot.sceneId !== renderedSceneId) return;
   const details = root.querySelector('details.production-panel');
   if (details) details.open = snapshot.policyOpen;
+  const projectTools = root.querySelector('details.production-project-tools');
+  if (projectTools) projectTools.open = Boolean(snapshot.projectToolsOpen);
+  const secondaryOpen = new Set(snapshot.secondaryOpen || []);
+  root.querySelectorAll('details.production-secondary-section').forEach(item => {
+    const key = item.classList.contains('production-assets-section') ? 'assets' : item.classList.contains('production-audio-section') ? 'audio' : item.classList.contains('production-timeline-section') ? 'timeline' : '';
+    item.open = secondaryOpen.has(key);
+  });
   Object.entries(snapshot.values).forEach(([id, state]) => {
     const element = root.querySelector(`#${id}`);
     if (!element) return;
@@ -182,70 +249,121 @@ function restoreProductionEditorState(root, snapshot) {
   window.scrollTo(0, snapshot.pageScrollY);
 }
 
+function productionActiveVideoBatchJobs(jobs = activeProjectJobs(item => item.job_type === 'video.generate')) {
+  const batchId = jobs.find(item => String(item.batch_id || '').trim())?.batch_id || '';
+  return batchId ? jobs.filter(item => item.batch_id === batchId) : [];
+}
+
+function productionCurrentVideoButtonLabel(job, shotStatus) {
+  if (job) return job.batch_id ? '终止批量中的当前镜头' : '终止当前镜头';
+  return shotStatus === 'failed' || shotStatus === 'canceled' ? '重试当前镜头' : '生成当前镜头';
+}
+
+function patchProductionCurrentPreview(current) {
+  if (!current) return;
+  const shot = productionSelectedShot(current);
+  const status = productionShotStatus(current, shot);
+  ['production-current-status', 'production-context-status'].forEach(id => {
+    const element = document.getElementById(id);
+    if (element) element.textContent = productionStatusLabel(status);
+  });
+  const stage = document.getElementById('production-preview-stage');
+  const html = productionPreviewHtml(current);
+  // Keep a playing video intact when an unrelated job emits progress.
+  if (stage && stage.dataset.productionPreviewHtml !== html) {
+    stage.innerHTML = html;
+    stage.dataset.productionPreviewHtml = html;
+  }
+}
+
+function productionTimelineTargetSelector(sceneId, shotId = '') {
+  return `[data-production-scene-id="${CSS.escape(String(sceneId))}"][data-production-shot-id="${CSS.escape(String(shotId))}"]`;
+}
+
 function patchProductionJobState(job) {
   const root = document.getElementById('shot-production-workspace');
   if (!root || !productionData) return;
   const current = productionCurrent();
   const activeVideos = activeProjectJobs(item => item.job_type === 'video.generate');
-  const currentVideoJob = activeVideos.find(item => item.target_id === String(productionSceneId));
+  const activeBatchVideos = productionActiveVideoBatchJobs(activeVideos);
+  const currentShot = productionSelectedShot(current);
+  const currentTargetId = String(currentShot?.shot_id || productionSceneId || '');
+  const currentVideoJob = activeVideos.find(item => item.target_type === (currentShot?.shot_id ? 'shot_unit' : 'shot') && String(item.target_id) === currentTargetId);
   const pendingButton = document.getElementById('production-generate-pending');
   const currentButton = document.getElementById('production-generate-current');
+  const currentFooterButton = document.getElementById('production-generate-current-footer');
   const audioButton = document.getElementById('btn-gen-audio');
   const finalButton = document.getElementById('btn-assemble');
-  if (pendingButton) pendingButton.textContent = activeVideos.length ? '终止本批次' : '一键准备参考图并生成视频';
-  if (currentButton && current) currentButton.textContent = currentVideoJob ? '终止' : (current.production.generation_status === 'failed' || current.production.generation_status === 'canceled' ? '重试生成' : '生成视频');
+  const currentStatus = current ? productionShotStatus(current, currentShot) : 'idle';
+  if (pendingButton) pendingButton.textContent = activeBatchVideos.length ? '终止项目批量视频' : '项目级批量生成未生成镜头';
+  const currentLabel = productionCurrentVideoButtonLabel(currentVideoJob, currentStatus);
+  if (currentButton && current) currentButton.textContent = currentLabel;
+  if (currentFooterButton && current) currentFooterButton.textContent = currentLabel;
   const audioSummary = productionData?.audio_summary || {};
   if (audioButton) audioButton.textContent = activeProjectJobs(item => item.job_type === 'audio.generate').length
     ? '终止台词生成'
     : (audioSummary.failed_line_count ? '重试失败台词' : '生成缺失台词');
   if (finalButton) finalButton.textContent = activeProjectJobs(item => item.job_type === 'final.assemble').length ? '终止合成' : '合成作品';
-  if (job?.target_type === 'shot') {
-    const timeline = root.querySelector(`[data-production-scene-id="${CSS.escape(String(job.target_id))}"] .timeline-status`);
-    if (timeline) timeline.textContent = isTerminalJob(job) ? productionStatusLabel(productionData.productions.find(item => String(item.scene.scene_id) === String(job.target_id))?.production?.generation_status) : (JOB_STATE_LABELS[job.state] || job.state);
+  patchProductionCurrentPreview(current);
+  if (job?.job_type === 'video.generate' && ['shot', 'shot_unit'].includes(job.target_type)) {
+    const targetId = String(job.target_id || '');
+    const targetItem = (productionData.productions || []).find(item => job.target_type === 'shot'
+      ? String(item.scene?.scene_id) === targetId
+      : executableShotsForItem(item).some(shot => String(shot.shot_id) === targetId));
+    if (targetItem) {
+      const targetShot = job.target_type === 'shot_unit'
+        ? executableShotsForItem(targetItem).find(shot => String(shot.shot_id) === targetId)
+        : targetItem.prompt;
+      const timeline = root.querySelector(`${productionTimelineTargetSelector(targetItem.scene.scene_id, targetShot?.shot_id || '')} .timeline-status`);
+      if (timeline) timeline.textContent = productionStatusLabel(productionShotStatus(targetItem, targetShot));
+    }
   }
 }
 
 function patchProductionWorkspace(previousData) {
   const current = productionCurrent();
-  const previous = (previousData?.productions || []).find(item => item.scene.scene_id === productionSceneId);
   if (!current) { renderProductionWorkspace(); return; }
-  const previousVersion = previous?.production?.active_version_id || '';
-  const activeVersion = current.production.active_version_id || '';
-  const status = document.getElementById('production-current-status');
-  if (status) status.textContent = productionStatusLabel(current.production.generation_status);
-  const refreshPreview = previousVersion !== activeVersion || (
-    !activeVersion && previous?.production?.generation_status !== current.production.generation_status
-  );
-  if (refreshPreview) {
-    const stage = document.getElementById('production-preview-stage');
-    const versions = document.getElementById('production-version-list');
-    const download = document.getElementById('production-preview-download');
-    if (stage) stage.innerHTML = productionPreviewHtml(current);
-    if (versions) versions.innerHTML = productionVersionListHtml(current);
-    if (download) {
-      const active = current.production.video_versions.find(item => item.version_id === activeVersion);
-      const url = productionVideoUrl(active);
-      download.innerHTML = url ? `<a class="btn-secondary btn-sm" href="${url}" download>下载</a>` : '';
-    }
+  const selectedShot = productionSelectedShot(current);
+  const activeVersion = productionShotActiveVersionId(current, selectedShot);
+  patchProductionCurrentPreview(current);
+  const versions = document.getElementById('production-version-list');
+  const download = document.getElementById('production-preview-download');
+  if (versions) versions.innerHTML = productionVersionListHtml(current);
+  if (download) {
+    const active = productionShotVersions(current, selectedShot).find(item => item.version_id === activeVersion);
+    const url = productionVideoUrl(active);
+    download.innerHTML = url ? `<a class="btn-secondary btn-sm" href="${url}" download>下载</a>` : '';
   }
   if (JSON.stringify(previousData?.audio || {}) !== JSON.stringify(productionData?.audio || {})) {
     renderProductionAudioTimeline();
   }
-  (productionData.productions || []).forEach(item => {
-    const button = document.querySelector(`#shot-production-workspace [data-production-scene-id="${CSS.escape(String(item.scene.scene_id))}"]`);
+  const timelineEntries = (productionData.productions || []).flatMap(item => [
+    {item, sceneId: item.scene.scene_id, shotId: '', shot: item.prompt},
+    ...executableShotsForItem(item).map(shot => ({item, sceneId: item.scene.scene_id, shotId: shot.shot_id, shot})),
+  ]);
+  timelineEntries.forEach(entry => {
+    const selector = productionTimelineTargetSelector(entry.sceneId, entry.shotId);
+    const button = document.querySelector(`#shot-production-workspace ${selector}`);
     if (!button) return;
-    const version = item.production.video_versions.find(entry => entry.version_id === item.production.active_version_id);
+    const item = entry.item;
+    const status = productionShotStatus(item, entry.shot);
+    const activeVersionId = entry.shotId
+      ? item.production.active_version_by_shot_id?.[entry.shotId] || ''
+      : item.production.active_version_id || '';
+    const version = item.production.video_versions.find(candidate => candidate.version_id === activeVersionId);
     const url = productionVideoUrl(version);
-    const oldVideo = button.querySelector('video');
-    if (url && (!oldVideo || oldVideo.src !== new URL(url, window.location.href).href)) {
-      const replacement = document.createElement('video');
-      replacement.muted = true;
-      replacement.preload = 'metadata';
-      replacement.src = url;
-      (oldVideo || button.querySelector('img, div')).replaceWith(replacement);
+    if (entry.shotId || !executableShotsForItem(item).length) {
+      const oldVideo = button.querySelector('video');
+      if (url && (!oldVideo || oldVideo.src !== new URL(url, window.location.href).href)) {
+        const replacement = document.createElement('video');
+        replacement.muted = true;
+        replacement.preload = 'metadata';
+        replacement.src = url;
+        (oldVideo || button.querySelector('img, div'))?.replaceWith(replacement);
+      }
     }
     const label = button.querySelector('.timeline-status');
-    if (label) label.textContent = productionStatusLabel(item.production.generation_status);
+    if (label) label.textContent = productionStatusLabel(status);
   });
   patchProductionJobState();
 }
@@ -264,7 +382,10 @@ async function loadProductionWorkspace({patch = false} = {}) {
     productionData = data;
     if (!productionSceneId || !productionData.productions.some(item => item.scene.scene_id === productionSceneId)) {
       productionSceneId = productionData.productions[0]?.scene.scene_id || null;
+      productionShotId = null;
     }
+    const selection = productionSelection(productionData, productionSceneId, productionShotId);
+    productionShotId = selection.shotId;
     if (patch && previousData && document.getElementById('shot-production-workspace')) patchProductionWorkspace(previousData);
     else renderProductionWorkspace();
   } catch (error) {
@@ -737,15 +858,98 @@ function promptReviewHtml(review) {
   const issues = promptReviewIssues(report);
   const grouped = ['解析问题', '分镜问题', '跨镜问题'].map(group => ({group, items: issues.filter(issue => promptReviewIssueGroup(issue) === group)})).filter(item => item.items.length);
   const groupHtml = grouped.length ? grouped.map(item => `<div style="margin-top:8px"><b style="font-size:11px;color:#d4d4d8">${item.group} · ${item.items.length}</b><div style="display:grid;gap:6px;margin-top:5px">${item.items.map(issue => promptReviewIssueHtml(issue)).join('')}</div></div>`).join('') : '';
-  return `<section class="production-panel" style="margin:0 0 10px;padding:12px">
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <div><b style="font-size:13px">Kimi 分镜提示词检验</b><span style="margin-left:8px;color:${color};font-size:12px">${escapeHtml(labels[status] || status)}${score !== null ? ` · ${score} 分` : ''}${report.report_version > 1 ? ` · v${report.report_version}` : ''}</span></div>
-      <button class="btn-secondary btn-sm" onclick="StudioActions.productionReviewPrompts()" ${status === 'generating' ? 'disabled' : ''}>${status === 'generating' ? '审核中' : '重新检验'}</button>
-      ${review?.model ? `<span style="color:#71717a;font-size:11px">${escapeHtml(review.model)}</span>` : ''}
-    </div>
-    <div style="margin-top:7px;color:#d4d4d8;font-size:12px;line-height:1.55">${escapeHtml(summary)}</div>
+  return `<section class="production-panel production-review-fold">
+    <div class="production-review-bar"><b>Kimi 分镜提示词检验</b><span style="color:${color}">${escapeHtml(labels[status] || status)}${score !== null ? ` · ${score} 分` : ''}</span><button class="btn-secondary btn-sm" onclick="StudioActions.productionReviewPrompts()" ${status === 'generating' ? 'disabled' : ''}>${status === 'generating' ? '审核中' : '重新检验'}</button><span class="production-review-summary">${escapeHtml(summary)}${review?.model ? ` · ${escapeHtml(review.model)}` : ''}</span></div>
     ${groupHtml}
   </section>`;
+}
+
+function executableShotsForItem(item) {
+  return Array.isArray(item?.executable_shots)
+    ? item.executable_shots.filter(shot => shot && shot.shot_id)
+    : [];
+}
+
+function productionTimelineEntries(data = {}) {
+  const productions = Array.isArray(data?.productions) ? data.productions : [];
+  return productions.flatMap((item, sceneIndex) => {
+    const sceneId = Number(item?.scene?.scene_id);
+    const children = executableShotsForItem(item);
+    if (children.length) {
+      return children.map((shot, childIndex) => ({
+        item,
+        sceneId,
+        shotId: String(shot.shot_id),
+        shot,
+        isSubShot: true,
+        label: `镜头 ${sceneId}-${Number(shot.shot_order || childIndex + 1)} · ${Number(shot.duration_sec || 0)}s`,
+      }));
+    }
+    const prompt = item?.prompt || {};
+    return [{
+      item,
+      sceneId,
+      shotId: null,
+      shot: prompt,
+      isSubShot: false,
+      label: `镜头 ${sceneIndex + 1} · ${Number(prompt.duration_sec || item?.scene?.duration_sec || 0)}s`,
+    }];
+  });
+}
+
+function productionSelection(data = {}, sceneId, shotId = null) {
+  const item = (data?.productions || []).find(entry => Number(entry?.scene?.scene_id) === Number(sceneId)) || null;
+  if (!item) return {item: null, sceneId: Number(sceneId), shotId: null, shot: null, isSubShot: false};
+  const children = executableShotsForItem(item);
+  const parentSelected = String(shotId || '') === `parent:${Number(sceneId)}`;
+  const shot = children.length && !parentSelected
+    ? (children.find(entry => String(entry.shot_id) === String(shotId || '')) || children[0])
+    : (item.prompt || null);
+  return {
+    item,
+    sceneId: Number(sceneId),
+    shotId: parentSelected ? `parent:${Number(sceneId)}` : (shot?.shot_id ? String(shot.shot_id) : null),
+    shot,
+    isSubShot: Boolean(shot?.shot_id),
+  };
+}
+
+function productionGenerationTarget(sceneId, shotId = null) {
+  const normalizedShotId = String(shotId || '').trim();
+  return normalizedShotId
+    ? {target_type: 'shot_unit', target_id: normalizedShotId, payload: {scene_id: Number(sceneId), shot_id: normalizedShotId}}
+    : {target_type: 'shot', target_id: String(sceneId), payload: {scene_id: Number(sceneId)}};
+}
+
+function productionTimelineHtml(data = {}) {
+  const productions = Array.isArray(data?.productions) ? data.productions : [];
+  return productions.map((item, sceneIndex) => {
+    const sceneId = Number(item?.scene?.scene_id);
+    const production = item?.production || {};
+    const children = executableShotsForItem(item);
+    const entries = children.length ? children : [item?.prompt || {}];
+    const buttons = entries.map((shot, childIndex) => {
+      const shotId = String(shot?.shot_id || '');
+      const status = productionShotStatus(item, shot);
+      const activeVersionId = shotId
+        ? production.active_version_by_shot_id?.[shotId] || ''
+        : production.active_version_id || '';
+      const version = (production.video_versions || []).find(entry => entry.version_id === activeVersionId && (!shotId || entry.shot_id === shotId));
+      const video = productionVideoUrl(version);
+      const fallback = (production.references || []).find(reference => reference.asset_type === 'scene') || production.references?.[0];
+      const activeSceneId = Number(globalThis.productionSceneId || 0);
+      const activeShotId = globalThis.productionShotId || (sceneId === activeSceneId ? String(children[0]?.shot_id || '') : '');
+      const active = sceneId === activeSceneId && activeShotId === shotId;
+      const label = shotId
+        ? `镜头 ${sceneId}-${Number(shot.shot_order || childIndex + 1)} · ${Number(shot.duration_sec || 0)}s`
+        : `镜头 ${sceneId || sceneIndex + 1} · ${Number(shot.duration_sec || item?.scene?.duration_sec || 0)}s`;
+      const shotArg = shotId ? `'${escapeHtml(shotId)}'` : 'null';
+      return `<button class="timeline-shot ${active ? 'active' : ''}" data-production-scene-id="${sceneId}" data-production-shot-id="${escapeHtml(shotId)}" onclick="StudioActions.productionSelectScene(${sceneId}, ${shotArg})"><span class="timeline-status">${productionStatusLabel(status)}</span>${video ? `<video muted preload="metadata" src="${video}"></video>` : fallback ? `<img src="${productionImageUrl(fallback)}" alt="">` : '<div style="height:64px;display:grid;place-items:center">◌</div>'}<span>${escapeHtml(label)}</span></button>`;
+    }).join('');
+    if (!children.length) return buttons;
+    const parentActive = sceneId === Number(globalThis.productionSceneId || 0) && String(globalThis.productionShotId || '') === `parent:${sceneId}`;
+    return `<div class="production-timeline-group"><div class="production-timeline-shots">${buttons}</div><button type="button" class="btn-secondary btn-sm production-timeline-parent ${parentActive ? 'active' : ''}" data-production-scene-id="${sceneId}" data-production-shot-id="" aria-current="${parentActive ? 'true' : 'false'}" title="编辑父镜头 ${sceneId} 的源提示词" onclick="StudioActions.productionSelectScene(${sceneId}, 'parent:${sceneId}')">父镜头 ${sceneId} · 编辑源提示词 <span class="timeline-status">${productionStatusLabel(productionShotStatus(item, item.prompt))}</span></button><div class="production-timeline-group-label">已拆 ${children.length} 个可执行子镜头</div></div>`;
+  }).join('');
 }
 
 function storyboardQualityDiagnosticsHtml(data = {}) {
@@ -772,13 +976,42 @@ function storyboardQualityDiagnosticsHtml(data = {}) {
   }
   const warningItems = capacityItems.filter(item => item?.status === 'warning' || item?.status === 'overloaded' || item?.warnings?.length);
   if (warningItems.length) {
-    sections.push(`<div style="color:#fbbf24;font-weight:600">镜头承载偏高：建议拆镜，但当前内容未被删除</div>${warningItems.map(item => `<div style="margin-top:5px;color:#d4d4d8;font-size:11px">镜头 ${escapeHtml(String(item.scene_id || '未知'))}：${escapeHtml((item.warnings || []).join('；') || '当前镜头承载偏高')}</div>`).join('')}`);
+    const productionByScene = new Map((data?.productions || []).map(item => [Number(item?.scene?.scene_id), item]));
+    const formatDuration = value => Number(value || 0).toFixed(0).replace(/\.0$/, '');
+    const warningHtml = warningItems.map(item => {
+      const sceneId = Number(item?.scene_id);
+      const production = productionByScene.get(sceneId);
+      const materialized = executableShotsForItem(production);
+      const savedDurations = materialized.map(shot => Number(shot.duration_sec || 0)).filter(value => value > 0);
+      const recommendedDurations = Array.isArray(item?.recommended_durations_sec)
+        ? item.recommended_durations_sec.map(value => Number(value || 0)).filter(value => value > 0)
+        : [];
+      const durationList = recommendedDurations.length ? recommendedDurations : savedDurations;
+      const sourceDuration = Number(item?.source_duration_sec || production?.scene?.duration_sec || 0);
+      const recommendedTotal = Number(
+        item?.recommended_total_duration_sec
+        || durationList.reduce((sum, value) => sum + value, 0)
+        || sourceDuration,
+      );
+      const dialogueSec = Number(item?.estimated_dialogue_sec || 0);
+      const actionSec = Number(item?.action_required_sec || 0);
+      const detail = durationList.length > 1
+        ? `原场景 ${formatDuration(sourceDuration)}s；建议 ${formatDuration(recommendedTotal)}s；已拆 ${durationList.length} 个子镜头（${durationList.map(formatDuration).join(' / ')} 秒）${dialogueSec || actionSec ? `；对白约 ${formatDuration(dialogueSec)}s，动作约 ${formatDuration(actionSec)}s` : ''}`
+        : (item.warnings || []).join('；') || '当前镜头承载偏高';
+      return `<div style="margin-top:5px;color:#d4d4d8;font-size:11px">镜头 ${escapeHtml(String(item.scene_id || '未知'))}：${escapeHtml(detail)}</div>`;
+    }).join('');
+    const hasExpandedPlan = warningItems.some(item => {
+      const sourceDuration = Number(item?.source_duration_sec || 0);
+      const recommendedTotal = Number(item?.recommended_total_duration_sec || 0);
+      return recommendedTotal > sourceDuration;
+    });
+    sections.push(`<div style="color:#fbbf24;font-weight:600">${hasExpandedPlan ? '镜头承载偏高：已按内容合理扩时' : '镜头承载偏高：已按内容拆为可执行子镜头'}</div>${warningHtml}`);
   }
   if (characterRepair.status === 'partial' || characterRepair.status === 'warning' || characterErrors.length) {
     sections.push(`<div style="color:#fbbf24;font-weight:600">角色状态信息不完整：可继续查看，但建议补充</div>${characterErrors.map(error => `<div style="margin-top:5px;color:#d4d4d8;font-size:11px">${escapeHtml(String(error))}</div>`).join('')}`);
   }
   if (!sections.length) return '';
-  return `<section class="production-panel storyboard-quality-diagnostics" style="margin:0 0 10px;padding:12px"><div style="font-size:13px;font-weight:600">分镜质量诊断</div><div style="display:grid;gap:8px;margin-top:8px">${sections.map(section => `<div>${section}</div>`).join('')}</div></section>`;
+  return `<section class="production-panel storyboard-quality-diagnostics"><div class="production-diagnostics-head"><span>分镜质量诊断</span><span>${sections.length} 项提示</span></div><div class="production-diagnostics-body">${sections.map(section => `<div>${section}</div>`).join('')}</div></section>`;
 }
 
 function promptPolicyFields(policy = {}) {
@@ -810,6 +1043,21 @@ function promptPolicySummaryHtml(policy = {}) {
     return `<div id="production-prompt-policy-slot" class="production-policy-slot"><button type="button" class="production-policy-trigger" onclick="StudioActions.productionOpenPromptPolicy()"><span>全局规则</span><span class="production-policy-status">未设置 · 添加</span></button></div>`;
   }
   return `<div id="production-prompt-policy-slot" class="production-policy-slot">${promptPolicyEditorHtml(policy)}</div>`;
+}
+
+function productionSetInspector(name) {
+  const root = document.getElementById('shot-production-workspace');
+  const inspector = root?.querySelector('.production-inspector');
+  const next = ['words', 'generate', 'assets'].includes(name) ? name : 'words';
+  productionInspectorTab = next;
+  if (!inspector) return;
+  inspector.dataset.inspector = next;
+  inspector.querySelectorAll('[data-inspector-tab]').forEach(button => {
+    const active = button.dataset.inspectorTab === next;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  if (next === 'words') inspector.querySelector('#production-prompt')?.focus({preventScroll: true});
 }
 
 function productionFocusReviewRepair(action, sceneId) {
@@ -871,12 +1119,28 @@ function productionAudioModeHtml(audioMode = 'native_dialogue', videoPolicy = {}
 function renderProductionWorkspace() {
   const root = document.getElementById('shot-production-workspace');
   if (!root) return;
+  const nextProjectId = String(appState.projectId || '');
+  if (productionDraftProjectId !== nextProjectId) {
+    productionDrafts.clear();
+    productionDraftProjectId = nextProjectId;
+  } else {
+    productionRememberRenderedDraft(root);
+  }
   if (!appState.projectId) { root.innerHTML = '<div class="production-empty">请先完成剧本解析，再进入分镜制作。</div>'; return; }
   if (!productionData) { root.innerHTML = '<div class="production-empty"><span class="spin"></span> 正在加载分镜制作工作台</div>'; loadProductionWorkspace(); return; }
   const current = productionCurrent();
   if (!current) { root.innerHTML = '<div class="production-empty">暂无分镜数据</div>'; return; }
-  const {scene, prompt, production} = current;
-  const effective = current.effective_prompt || {};
+  const selection = productionSelection(productionData, productionSceneId, productionShotId);
+  productionShotId = selection.shotId;
+  const {scene, production} = current;
+  const selectedShot = productionSelectedShot(current) || current.prompt || {};
+  const prompt = selectedShot;
+  const selectedShotId = selectedShot?.shot_id ? String(selectedShot.shot_id) : null;
+  const parentEditorSelected = !selectedShotId;
+  const selectedStatus = productionShotStatus(current, selectedShot);
+  const selectedVersions = productionShotVersions(current, selectedShot);
+  const selectedActiveVersionId = productionShotActiveVersionId(current, selectedShot);
+  const effective = selectedShot?.effective_prompt || (selectedShotId ? {} : current.effective_prompt || {});
   const promptQuality = productionData.prompt_quality || {};
   const promptReview = productionData.prompt_review || {};
   const reviewReport = promptReviewReport(promptReview);
@@ -893,14 +1157,18 @@ function renderProductionWorkspace() {
     : `<div style="font-size:11px;color:#a1a1aa;margin-bottom:4px">主提示词（已合并负面约束）</div>${escapeHtml(providerPrompt)}`;
   const promptPolicy = productionData.prompt_policy || {};
   const activeVideoJobs = activeProjectJobs(job => job.job_type === 'video.generate');
-  const currentVideoJob = activeVideoJobs.find(job => job.target_id === String(scene.scene_id));
-  const activeVideoBatch = activeVideoJobs.find(job => job.batch_id)?.batch_id || '';
-  const batchJobs = activeVideoBatch ? projectJobs.filter(job => job.batch_id === activeVideoBatch) : [];
-  const batchCompleted = batchJobs.filter(job => ['succeeded','failed','canceled','interrupted'].includes(job.state)).length;
+  const currentShot = selectedShot;
+  const currentTargetId = String(currentShot?.shot_id || scene.scene_id || '');
+  const currentVideoJob = activeVideoJobs.find(job => job.target_type === (selectedShotId ? 'shot_unit' : 'shot') && String(job.target_id) === currentTargetId);
+  const batchJobs = productionActiveVideoBatchJobs(activeVideoJobs);
+  const batchScopeNote = batchJobs.length
+    ? `项目级批量进行中 · ${batchJobs.length} 项活动任务`
+    : '项目级 · 仅处理未生成镜头';
+  const currentVideoButtonLabel = productionCurrentVideoButtonLabel(currentVideoJob, selectedStatus);
   const activeAudioJob = activeProjectJobs(job => job.job_type === 'audio.generate')[0];
   const audioSummary = productionData.audio_summary || {};
   const activeFinalJob = activeProjectJobs(job => job.job_type === 'final.assemble')[0];
-  const active = production.video_versions.find(item => item.version_id === production.active_version_id);
+  const active = selectedVersions.find(item => item.version_id === selectedActiveVersionId);
   const activeVideo = productionVideoUrl(active);
   const videoPolicy = current.video_policy || productionData.video_generation_policy || {provider:'mock',model:'mock',resolution:'1080p'};
   const videoCapabilities = productionData.video_capabilities || {};
@@ -909,17 +1177,20 @@ function renderProductionWorkspace() {
   const durationMin = Number(currentCapability.duration_min || 3);
   const durationMax = Number(currentCapability.duration_max || 15);
   const maxReferenceImages = Number(currentCapability.max_reference_images || 0);
+  const hasReferenceLimit = Object.prototype.hasOwnProperty.call(currentCapability, 'max_reference_images');
   const legacyReferenceWarning = videoPolicy.provider === 'seedance' && production.continuity_enabled && production.references.length > 1
     ? '<div class="production-reference-warning" style="margin-top:6px;color:#fbbf24;font-size:11px">连续镜头使用首帧模式，只会提交上一镜尾帧；其他普通参考图不会随请求发送。</div>'
     : videoPolicy.provider === 'seedance' && production.references.length > maxReferenceImages && maxReferenceImages > 0
       ? `<div class="production-reference-warning" style="margin-top:6px;color:#fbbf24;font-size:11px">当前模型最多接受 ${maxReferenceImages} 张参考图，超出的图片提交时会被忽略，任务详情会列出具体原因。</div>`
       : '';
-  const providerOptions = Object.entries(videoCapabilities).map(([key, value]) => `<option value="${key}" ${value.available === false ? 'disabled' : ''} ${key === videoPolicy.provider ? 'selected' : ''}>${key === 'wan' ? '万相 2.6' : key === 'happyhorse' ? '快乐小马' : 'Mock'}</option>`).join('');
+  const providerLabels = {mock: 'Mock', wan: '万相 2.6', happyhorse: '快乐小马', seedance: 'Seedance 火山方舟'};
+  const providerOptions = Object.entries(videoCapabilities).map(([key, value]) => `<option value="${key}" ${value.available === false ? 'disabled' : ''} ${key === videoPolicy.provider ? 'selected' : ''}>${escapeHtml(providerLabels[key] || key)}</option>`).join('');
   const referenceModes = Array.isArray(currentCapability.reference_modes) ? currentCapability.reference_modes : [];
   const modeLabels = {text_to_video:'纯文生视频', first_frame:'首帧', first_last_frame:'首尾帧', multi_reference:'多参考图'};
+  const providerAcceptsReferences = currentCapability.image_to_video !== false;
   const referenceModeHint = referenceModes.length
     ? referenceModes.map(mode => modeLabels[mode] || mode).join(' / ')
-    : (maxReferenceImages > 0 ? '单参考图' : '不支持参考图');
+    : (!providerAcceptsReferences ? '不支持参考图' : (hasReferenceLimit ? (maxReferenceImages > 0 ? '单参考图' : '不支持参考图') : '支持参考图，上限由服务决定'));
   const continuityConsumesReferences = production.continuity_enabled
     && production.references.length > 0
     && (videoPolicy.provider === 'seedance' || !currentCapability.multi_reference);
@@ -932,20 +1203,19 @@ function renderProductionWorkspace() {
   const automaticReferenceCount = production.references.filter(item => item.source === 'asset').length;
   const manualReferenceCount = production.references.filter(item => item.source === 'manual').length;
   const explicitReferenceCount = production.references.filter(item => item.source === 'explicit').length;
-  const providerAcceptsReferences = currentCapability.image_to_video !== false;
   const referenceLimit = maxReferenceImages > 0
     ? maxReferenceImages
     : (providerAcceptsReferences ? referenceCount : 0);
   const submittedReferenceCount = continuityConsumesReferences
     ? (production.continuity_enabled && providerAcceptsReferences ? Math.min(1, referenceLimit) : 0)
-    : Math.min(referenceCount, referenceLimit);
+    : (providerAcceptsReferences ? Math.min(referenceCount, referenceLimit || referenceCount) : 0);
   const referenceSummaryParts = [
     automaticReferenceCount ? `自动 ${automaticReferenceCount}` : '',
     manualReferenceCount ? `手动 ${manualReferenceCount}` : '',
     explicitReferenceCount ? `显式 ${explicitReferenceCount}` : '',
     referenceCount ? `提交 ${submittedReferenceCount}/${referenceCount}` : '未绑定参考图',
   ].filter(Boolean);
-  const referenceWarning = continuityWarning || legacyReferenceWarning || (referenceCount > maxReferenceImages
+  const referenceWarning = continuityWarning || legacyReferenceWarning || (hasReferenceLimit && maxReferenceImages > 0 && referenceCount > maxReferenceImages
     ? `<div class="production-reference-warning" style="margin-top:6px;color:#fbbf24;font-size:11px">当前模型最多接受 ${maxReferenceImages} 张参考图，超出的图片不会发送；任务详情会列出被忽略的图片。</div>`
     : '');
   const referenceManagerOpen = Boolean(referenceWarning || production.references.some(item => item.stale));
@@ -954,33 +1224,49 @@ function renderProductionWorkspace() {
   const continuityHint = production.continuity_enabled ? (production.continuity_stale ? '上一镜已变化，需重新生成' : (production.continuity_tail_frame_path ? `引用镜头 ${production.continuity_source_scene_id} 尾帧` : '生成时引用上一镜尾帧')) : '独立镜头';
   const catalog = productionData.asset_catalog || {characters:[], scenes:[], props:[]};
   const assetGrid = (assets, empty) => assets.length ? `<div class="asset-grid">${assets.map(item => `<button class="asset-item" onclick="StudioActions.productionAddReference('${StudioActions.escapeHtml(item.reference_id)}')"><img src="${productionImageUrl(item)}" alt=""><span>${escapeHtml(item.label)}</span></button>`).join('')}</div>` : `<div style="font-size:11px;color:#71717a">${empty}</div>`;
-  const preview = activeVideo ? `<video controls src="${activeVideo}"></video>` : `<div><div style="font-size:28px;margin-bottom:8px">${production.generation_status === 'generating' ? '◌' : '▶'}</div><div>${productionStatusLabel(production.generation_status)}</div>${production.error_message ? `<div style="font-size:11px;color:#fca5a5;margin-top:8px">${escapeHtml(production.error_message)}</div>` : ''}</div>`;
+  const preview = productionPreviewHtml(current);
   const editorSnapshot = captureProductionEditorState(root);
+  const timelineHtml = productionTimelineHtml(productionData);
+  const inspectorOpen = ['words', 'generate', 'assets'].includes(productionInspectorTab) ? productionInspectorTab : 'words';
+  const shotLabel = selectedShotId ? `${scene.scene_id}-${Number(selectedShot.shot_order || 1)}` : String(scene.scene_id);
+  const scopeLabel = parentEditorSelected ? `父镜头 ${scene.scene_id} · 可编辑源提示词` : `子镜头 ${shotLabel} · 画面只读，生成设置可改`;
   root.innerHTML = `
     <div class="production-toolbar production-workspace-toolbar">
-      <div class="production-toolbar-title"><span class="production-eyebrow">分镜工作台</span><h3>分镜制作</h3><span id="production-global-status" class="production-global-status"></span></div>
-      <div class="production-toolbar-actions"><button class="btn-primary btn-sm" id="production-generate-pending" onclick="StudioActions.productionGeneratePending()">${activeVideoJobs.length ? `终止本批次 ${batchCompleted}/${batchJobs.length || activeVideoJobs.length}` : '一键准备参考图并生成视频'}</button><button class="btn-secondary btn-sm" id="btn-gen-audio" onclick="StudioActions.productionGenerateAudio()">${activeAudioJob ? '终止台词生成' : (audioSummary.failed_line_count ? '重试失败台词' : '生成缺失台词')}</button><button class="btn-secondary btn-sm" id="btn-assemble" onclick="StudioActions.productionAssembleVideo()">${activeFinalJob ? '终止合成' : '合成作品'}</button></div>
+      <div class="production-toolbar-title"><h3>镜头 ${escapeHtml(shotLabel)}</h3><span id="production-global-status" class="production-global-status"></span><span class="production-context-scope">${scopeLabel}</span><span id="production-context-status" class="production-context-status">${productionStatusLabel(selectedStatus)}</span></div>
+      <div class="production-context-actions"><button type="button" class="btn-secondary btn-sm" onclick="StudioActions.productionNavigateAdjacent(-1)" title="上一个镜头">上一镜</button><button type="button" class="btn-secondary btn-sm" onclick="StudioActions.productionNavigateAdjacent(1)" title="下一个镜头">下一镜</button><button class="btn-primary btn-sm" id="production-generate-current" onclick="StudioActions.productionGenerateCurrent()">${currentVideoButtonLabel}</button></div>
+      <div class="production-project-tools" title="项目级 · 不会改变当前镜头选择"><div class="production-toolbar-actions"><button class="btn-secondary btn-sm" id="production-generate-pending" onclick="StudioActions.productionGeneratePending()">${batchJobs.length ? `终止项目批量视频（${batchJobs.length} 项活动）` : '批量未生成'}</button><button class="btn-secondary btn-sm" id="btn-gen-audio" onclick="StudioActions.productionGenerateAudio()">${activeAudioJob ? '终止项目台词' : (audioSummary.failed_line_count ? '重试失败台词' : '生成缺失台词')}</button><button class="btn-secondary btn-sm" id="btn-assemble" onclick="StudioActions.productionAssembleVideo()">${activeFinalJob ? '终止正式合成' : '正式合成'}</button></div><span class="production-project-tools-note">作用于整个项目，不会改变当前镜头选择</span></div>
     </div>
-    ${promptQuality.needs_refresh ? '<div class="production-panel" style="margin:0 0 10px;padding:10px;color:#fbbf24;font-size:12px">当前项目含旧版非中文分镜提示词。已有视频与手动编辑将保留；确认需要更新时，请重新解析剧本以生成新版中文分镜。</div>' : ''}
-    ${promptReviewHtml(promptReview)}
-    ${storyboardQualityDiagnosticsHtml(productionData)}
-    ${promptPolicySummaryHtml(promptPolicy)}
-    <div class="production-shell">
-      <aside class="production-panel production-assets">
-        <div class="production-panel-heading"><div><span class="production-eyebrow">参考素材</span><h4>资产库</h4></div><span class="production-count">${catalog.characters.length + catalog.scenes.length + catalog.props.length}</span></div>
-        <section class="production-asset-group"><h5>角色形象</h5>${assetGrid(catalog.characters, '请先生成角色形象图')}</section>
-        <section class="production-asset-group"><h5>场景参考</h5>${assetGrid(catalog.scenes, '请先生成场景参考图')}</section>
-        <section class="production-asset-group"><h5>道具参考</h5>${assetGrid(catalog.props, '当前镜头没有可用关键道具图')}</section>
-        <p class="production-help-text">点击资产即可加入当前镜头；已加入的参考图可在中间区域排序或移除。</p>
+    <div class="production-shell production-stage-shell">
+      <aside class="production-panel production-preview">
+        <div class="production-preview-header"><span id="production-preview-download">${activeVideo ? `<a class="btn-secondary btn-sm" href="${activeVideo}" download>下载</a>` : ''}</span></div>
+        <div id="production-preview-stage" class="preview-stage">${preview}</div>
+        <div class="production-editor-section production-generation-section production-stage-quickset">
+          <label class="production-quickset-field"><span>服务</span><select id="production-video-provider" onchange="StudioActions.productionVideoProviderChanged()">${providerOptions}</select></label>
+          <label class="production-quickset-field"><span>模型</span><select id="production-video-model" onchange="StudioActions.productionVideoModelChanged()">${modelOptions}</select></label>
+          <label class="production-quickset-field"><span>清晰度</span><select id="production-video-resolution" onchange="StudioActions.productionVideoResolutionChanged()">${resolutionOptions}</select></label>
+          <label class="production-toggle"><input id="production-continuity" type="checkbox" ${production.continuity_enabled ? 'checked' : ''} onchange="StudioActions.productionContinuityChanged(this)"><span>承接上一镜尾帧</span></label>
+        </div>
+        <section class="production-version-section"><div class="production-section-heading"><h5>这一镜的版本</h5><span class="production-section-note">${selectedShotId ? `子镜头 ${escapeHtml(selectedShotId)}` : `父镜头 ${scene.scene_id}`}</span></div><div id="production-version-list" class="version-list">${productionVersionListHtml(current)}</div></section>
       </aside>
-      <main class="production-panel production-editor">
+      <main class="production-panel production-editor production-inspector" data-inspector="${escapeHtml(inspectorOpen)}">
+        <div class="production-inspector-tabs" role="tablist" aria-label="镜头检查">
+          <button type="button" role="tab" data-inspector-tab="words" aria-selected="${inspectorOpen === 'words' ? 'true' : 'false'}" class="${inspectorOpen === 'words' ? 'is-active' : ''}" onclick="StudioActions.productionSetInspector('words')">提示词</button>
+          <button type="button" role="tab" data-inspector-tab="generate" aria-selected="${inspectorOpen === 'generate' ? 'true' : 'false'}" class="${inspectorOpen === 'generate' ? 'is-active' : ''}" onclick="StudioActions.productionSetInspector('generate')">对白与成本</button>
+          <button type="button" role="tab" data-inspector-tab="assets" aria-selected="${inspectorOpen === 'assets' ? 'true' : 'false'}" class="${inspectorOpen === 'assets' ? 'is-active' : ''}" onclick="StudioActions.productionSetInspector('assets')">素材</button>
+        </div>
+        <section class="production-notices" aria-label="项目提示">
+          ${promptQuality.needs_refresh ? '<div class="production-panel production-stale-note">当前项目含旧版非中文分镜提示词。已有视频与手动编辑将保留；确认需要更新时，请重新解析剧本以生成新版中文分镜。</div>' : ''}
+          ${promptReviewHtml(promptReview)}
+          ${storyboardQualityDiagnosticsHtml(productionData)}
+          ${promptPolicySummaryHtml(promptPolicy)}
+        </section>
         <header class="production-editor-header">
-          <div class="production-shot-title"><span class="production-eyebrow">当前镜头</span><h3>镜头 ${scene.scene_id}</h3><p>${escapeHtml(scene.location)} <span>·</span> 可见角色：${escapeHtml((scene.characters || []).join('、') || '无')}</p></div>
-          <div class="production-meta"><label class="production-chip production-duration-chip"><span>时长</span><input id="production-duration" type="number" min="3" max="30" value="${prompt.duration_sec}"><span class="production-unit">秒</span></label><span class="production-chip production-status-chip">${productionStatusLabel(production.generation_status)}</span></div>
+          <div class="production-shot-title"><span class="production-eyebrow">当前镜头</span><h3>镜头 ${selectedShotId ? `${scene.scene_id}-${Number(selectedShot.shot_order || 1)}` : scene.scene_id}</h3><p>${parentEditorSelected ? '父镜头源提示词与生成目标' : `来源镜头 ${scene.scene_id} · 自动拆镜执行版本`} <span>·</span> ${escapeHtml(scene.location)} <span>·</span> 可见角色：${escapeHtml((scene.characters || []).join('、') || '无')}</p></div>
+          <div class="production-meta"><label class="production-chip production-duration-chip"><span>时长</span><input id="production-duration" type="number" min="3" max="30" value="${prompt.duration_sec}" ${selectedShotId ? 'disabled' : ''}><span class="production-unit">秒</span></label><span id="production-current-status" class="production-chip production-status-chip">${productionStatusLabel(selectedStatus)}</span></div>
         </header>
         <section class="production-editor-section production-reference-section">
           <div class="production-section-heading"><div><span class="production-eyebrow">01 · 参考输入</span><h4>参考素材</h4></div><span class="production-section-note">${escapeHtml(referenceSummaryParts.join(' · '))}</span></div>
-          <div id="production-reference-capability" class="production-reference-summary"><span>${escapeHtml(referenceSummaryParts.join(' · '))}</span><span>最多 ${maxReferenceImages} 张 <b>·</b> ${escapeHtml(referenceModeHint)}</span></div>
+          <div id="production-reference-capability" class="production-reference-summary"><span>${escapeHtml(referenceSummaryParts.join(' · '))}</span><span>${hasReferenceLimit ? `最多 ${maxReferenceImages} 张` : '未声明固定上限'} <b>·</b> ${escapeHtml(referenceModeHint)}</span></div>
           ${referenceWarning}
           <details class="production-reference-manager" ${referenceManagerOpen ? 'open' : ''}>
             <summary><span>管理参考图</span><span>排序、版本和手动添加</span></summary>
@@ -991,41 +1277,49 @@ function renderProductionWorkspace() {
           </details>
         </section>
         <section class="production-editor-section production-prompt-section">
-          <div class="production-section-heading"><div><span class="production-eyebrow">02 · 提示词</span><h4>生成提示词</h4></div><span class="production-section-note">可直接编辑</span></div>
-          <div class="production-prompt-field"><label class="production-field-label" for="production-prompt">主提示词</label><div class="production-textarea-wrap"><div id="production-prompt" class="production-script production-prompt-editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="视频生成提示词" spellcheck="false" oninput="StudioActions.productionMentionKeydown(event)" onkeydown="StudioActions.productionMentionKeydown(event)" onkeyup="StudioActions.productionMentionKeydown(event)" onmouseup="StudioActions.productionRememberPromptSelection(event)" onblur="StudioActions.productionRememberPromptSelection(event)">${productionPromptEditorHtml(prompt.prompt)}</div><textarea id="production-prompt-value" hidden>${escapeHtml(prompt.prompt)}</textarea><div id="production-mention-suggestions" class="production-mention-suggestions" hidden></div></div></div>
-          <div class="production-prompt-field production-negative-field"><label class="production-field-label" for="production-negative">负面约束 <span>可选</span></label><textarea id="production-negative" class="production-script" placeholder="填写需要避免的画面问题">${escapeHtml(prompt.negative_prompt || '')}</textarea></div>
+          <div class="production-section-heading"><div><span class="production-eyebrow">02 · 提示词</span><h4>生成提示词</h4></div><span class="production-section-note">${parentEditorSelected ? '可直接编辑父镜头' : '自动拆镜执行版本 · 只读'}</span></div>
+          <div class="production-prompt-field"><label class="production-field-label" for="production-prompt">${selectedShotId ? `自动拆镜 · 来源镜头 ${scene.scene_id} · 子镜头 ${Number(selectedShot.shot_order || 1)}/${executableShotsForItem(current).length}` : '主提示词'}</label><div class="production-textarea-wrap"><div id="production-prompt" class="production-script production-prompt-editor" contenteditable="${selectedShotId ? 'false' : 'true'}" role="textbox" aria-multiline="true" data-placeholder="视频生成提示词" spellcheck="false" oninput="StudioActions.productionMentionKeydown(event)" onkeydown="StudioActions.productionMentionKeydown(event)" onkeyup="StudioActions.productionMentionKeydown(event)" onmouseup="StudioActions.productionRememberPromptSelection(event)" onblur="StudioActions.productionRememberPromptSelection(event)">${productionPromptEditorHtml(prompt.prompt)}</div><textarea id="production-prompt-value" hidden>${escapeHtml(prompt.prompt)}</textarea><div id="production-mention-suggestions" class="production-mention-suggestions" hidden></div></div></div>
+          <div class="production-prompt-field production-negative-field"><label class="production-field-label" for="production-negative">负面约束 <span>可选</span></label><textarea id="production-negative" class="production-script" placeholder="填写需要避免的画面问题" ${selectedShotId ? 'readonly' : ''}>${escapeHtml(prompt.negative_prompt || '')}</textarea></div>
           <details class="production-provider-preview"><summary>查看最终发送内容 <span>${escapeHtml(effective.provider || '')} · ${negativeMode === 'merged' ? '负面约束已合并' : '独立负面参数'}</span></summary><div class="production-provider-preview-body">${finalPromptPreview}</div></details>
           ${currentPromptReviewHtml}
         </section>
-        <section class="production-editor-section production-generation-section">
-          <div class="production-section-heading"><div><span class="production-eyebrow">03 · 生成设置</span><h4>生成设置</h4></div><span class="production-section-note">提交前可调整</span></div>
-          <div class="production-settings-grid"><label class="production-field-label">视频服务<select id="production-video-provider" onchange="StudioActions.productionVideoProviderChanged()">${providerOptions}</select></label><label class="production-field-label">模型<select id="production-video-model" onchange="StudioActions.productionVideoModelChanged()">${modelOptions}</select></label><label class="production-field-label">清晰度<select id="production-video-resolution" onchange="StudioActions.productionVideoResolutionChanged()">${resolutionOptions}</select></label></div>
-          <div class="production-capability-note">成本档位：${escapeHtml(current.video_capability?.cost_tier || '未标注')} · 未单独设置的后续分镜会继承当前选择</div>
-          ${audioModeHtml}
-          <div class="production-continuity-row"><label class="production-toggle"><input id="production-continuity" type="checkbox" ${production.continuity_enabled ? 'checked' : ''}><span>承接上一镜尾帧</span></label><span class="production-continuity-state ${production.continuity_stale ? 'is-warning' : ''}">${escapeHtml(continuityHint)}</span><span class="production-chip production-hard-cut-chip">新任务采用硬切</span></div>
-        </section>
         <section class="production-editor-section production-ai-section">
-          <div class="production-section-heading"><div><span class="production-eyebrow">04 · 辅助修改</span><h4>AI 修改提示词</h4></div><span class="production-section-note">用自然语言描述修改方向</span></div>
-          <textarea id="production-feedback" class="production-feedback" placeholder="例如：让镜头更近一些，保留人物动作和场景不变"></textarea>
-          <button class="btn-secondary production-ai-button" onclick="StudioActions.productionRevisePrompt()">AI 修改提示词</button>
+          <div class="production-section-heading"><div><span class="production-eyebrow">04 · 辅助修改</span><h4>AI 修改提示词</h4></div><span class="production-section-note">${parentEditorSelected ? '仅修改父镜头源提示词' : '子镜头只读，请切回父镜头修改'}</span></div>
+          ${parentEditorSelected ? '<textarea id="production-feedback" class="production-feedback" placeholder="例如：让镜头更近一些，保留人物动作和场景不变"></textarea><button class="btn-secondary production-ai-button" onclick="StudioActions.productionRevisePrompt()">AI 修改提示词</button>' : '<div class="production-readonly-note">当前是自动拆镜执行版本。AI 修改会作用于父镜头源提示词，请先点击时间线中的“父镜头”入口。</div>'}
         </section>
-        <footer class="production-editor-footer-actions production-actions"><div class="production-save-hint">保存后再提交生成，当前镜头的修改会单独记录。</div><div class="production-footer-buttons"><button class="btn-secondary" onclick="StudioActions.productionSaveCurrent()">保存编辑</button><button class="btn-primary" id="production-generate-current" onclick="StudioActions.productionGenerateCurrent()">${currentVideoJob ? '终止' : production.generation_status === 'failed' || production.generation_status === 'canceled' ? '重试生成' : '生成视频'}</button></div></footer>
+        <section class="production-editor-section production-generation-detail">
+          <div class="production-section-heading"><div><span class="production-eyebrow">对白音频来源</span><h4>${escapeHtml(String(videoPolicy.provider || ''))} · ${escapeHtml(String(videoPolicy.model || ''))}</h4></div><span class="production-section-note">提交前可调整</span></div>
+          ${audioModeHtml}
+          <div class="production-capability-note">成本档位：${escapeHtml(current.video_capability?.cost_tier || '未标注')} · 未单独设置的后续分镜会继承当前选择</div>
+          <div class="production-continuity-row"><span class="production-chip production-hard-cut-chip">新任务采用硬切</span><span class="production-continuity-state ${production.continuity_stale ? 'is-warning' : ''}">${escapeHtml(continuityHint)}</span></div>
+        </section>
+        <section class="production-editor-section production-assets-section">
+          <div class="production-section-heading"><div><span class="production-eyebrow">素材库</span><h4>参考资产</h4></div><span class="production-section-note">点击加入当前镜头</span></div>
+          <section class="production-asset-group"><h5>角色形象</h5>${assetGrid(catalog.characters, '请先生成角色形象图')}</section>
+          <section class="production-asset-group"><h5>场景参考</h5>${assetGrid(catalog.scenes, '请先生成场景参考图')}</section>
+          <section class="production-asset-group"><h5>道具参考</h5>${assetGrid(catalog.props, '当前镜头没有可用关键道具图')}</section>
+        </section>
+        <footer class="production-editor-footer-actions production-actions"><div class="production-save-hint" id="production-save-state">${selectedShotId ? '当前子镜头为自动拆镜执行版本，生成设置仍会保存。' : '当前父镜头可编辑；未保存修改会在生成前保存。'}</div><div class="production-footer-buttons">${selectedShotId ? '<button class="btn-secondary" disabled>当前子镜头只读</button>' : '<button class="btn-secondary" onclick="StudioActions.productionSaveCurrent()">保存父镜头编辑</button>'}<button class="btn-primary" id="production-generate-current-footer" onclick="StudioActions.productionGenerateCurrent()">${currentVideoButtonLabel}</button></div></footer>
       </main>
-      <aside class="production-panel production-preview"><div class="production-preview-header"><div><span class="production-eyebrow">输出预览</span><h4>视频预览</h4></div><span id="production-preview-download">${activeVideo ? `<a class="btn-secondary btn-sm" href="${activeVideo}" download>下载</a>` : ''}</span></div><div class="preview-stage">${preview}</div><section class="production-version-section"><div class="production-section-heading"><h5>历史版本</h5><span class="production-section-note">点击切换</span></div><div id="production-version-list" class="version-list">${production.video_versions.map((item,index) => `<button class="version-item ${item.version_id === production.active_version_id ? 'active' : ''}" onclick="StudioActions.productionActivateVersion('${item.version_id}')"><video muted preload="metadata" src="${productionVideoUrl(item)}"></video><span>版本 ${index + 1}</span></button>`).join('') || '<span class="production-empty-inline">暂无生成版本</span>'}</div></section></aside>
     </div>
-    <section id="production-audio-workspace" class="production-panel production-audio-workspace"></section>
-    <div class="production-panel production-timeline">${productionData.productions.map((item,index) => { const version=item.production.video_versions.find(v=>v.version_id===item.production.active_version_id); const video=productionVideoUrl(version); const fallback=item.production.references.find(r=>r.asset_type==='scene') || item.production.references[0]; return `<button class="timeline-shot ${item.scene.scene_id===productionSceneId?'active':''}" onclick="StudioActions.productionSelectScene(${item.scene.scene_id})"><span class="timeline-status">${productionStatusLabel(item.production.generation_status)}</span>${video ? `<video muted preload="metadata" src="${video}"></video>` : fallback ? `<img src="${productionImageUrl(fallback)}" alt="">` : '<div style="height:72px;display:grid;place-items:center">◌</div>'}<span>镜头 ${index+1} · ${item.prompt.duration_sec}s</span></button>`; }).join('')}</div>`;
+    <section class="production-filmstrip" aria-label="全片镜头胶片">
+      <div class="production-filmstrip-head"><span class="production-eyebrow">胶片</span><strong>${productionData.productions.length} 场</strong><span>点画面切换镜头</span></div>
+      <div class="production-panel production-timeline">${timelineHtml}</div>
+    </section>
+    <section class="production-secondary-section production-audio-section">
+      <div class="production-panel-heading"><div><span class="production-eyebrow">项目音频</span><h4>对白、BGM 与字幕</h4></div><span class="production-secondary-meta">${audioSummary.voice_count ? `音色 ${audioSummary.confirmed_voice_count || 0}/${audioSummary.voice_count}` : '全项目共用'}</span></div>
+      <section id="production-audio-workspace" class="production-panel production-audio-workspace"></section>
+    </section>`;
   root.dataset.productionEditorSceneId = String(scene.scene_id);
-  root.querySelector('.production-toolbar .btn-primary')?.setAttribute('id', 'production-generate-pending');
+  root.dataset.productionEditorShotId = String(selection.shotId || selectedShotId || `parent:${scene.scene_id}`);
   root.querySelector('#production-video-provider option[value="seedance"]')?.replaceChildren(document.createTextNode('Seedance 火山方舟'));
   root.querySelector('.production-meta .production-chip:last-child')?.setAttribute('id', 'production-current-status');
-  root.querySelector('.production-actions .btn-primary')?.setAttribute('id', 'production-generate-current');
-  root.querySelector('.preview-stage')?.setAttribute('id', 'production-preview-stage');
+  const previewStage = root.querySelector('.preview-stage');
+  if (previewStage) {
+    previewStage.setAttribute('id', 'production-preview-stage');
+    previewStage.dataset.productionPreviewHtml = preview;
+  }
   root.querySelector('.version-list')?.setAttribute('id', 'production-version-list');
-  root.querySelectorAll('.timeline-shot').forEach((button, index) => {
-    const item = productionData.productions[index];
-    if (item) button.dataset.productionSceneId = String(item.scene.scene_id);
-  });
   const durationInput = root.querySelector('#production-duration');
   if (durationInput) {
     durationInput.min = String(durationMin);
@@ -1037,6 +1331,58 @@ function renderProductionWorkspace() {
   updateProductionVideoSelection();
   renderProductionAudioTimeline();
   restoreProductionEditorState(root, editorSnapshot);
+  // The same-shot snapshot is captured before paint and can still hold the
+  // saved prompt. Per-shot drafts are the unsaved text, so they win after it.
+  const draft = productionDrafts.get(productionRenderedEditorKey(root));
+  if (draft) {
+    const negative = root.querySelector('#production-negative');
+    const feedback = root.querySelector('#production-feedback');
+    const duration = root.querySelector('#production-duration');
+    if (negative) negative.value = draft.negative;
+    if (feedback) feedback.value = draft.feedback;
+    if (duration && draft.duration !== '') duration.value = draft.duration;
+    productionSetPromptText(draft.prompt);
+  }
+  root.querySelector('.production-filmstrip .timeline-shot.active, .production-filmstrip .production-timeline-parent.active')
+    ?.scrollIntoView({block: 'nearest', inline: 'center'});
+  const stageShell = root.querySelector('.production-stage-shell');
+  const scheduleFrame = typeof requestAnimationFrame === 'function'
+    ? requestAnimationFrame
+    : (callback => setTimeout(callback, 16));
+  const fitStageShell = (attempt = 0) => {
+    if (!stageShell) return;
+    if (window.innerWidth <= 1100) { stageShell.style.height = ''; return; }
+    if (attempt > 60) return;
+    if (stageShell.getClientRects().length === 0) { scheduleFrame(() => fitStageShell(attempt + 1)); return; }
+    const top = Math.ceil(stageShell.getBoundingClientRect().top);
+    if (top <= 1) { scheduleFrame(() => fitStageShell(attempt + 1)); return; }
+    const strip = root.querySelector('.production-filmstrip');
+    const stripHeight = strip ? Math.ceil(strip.getBoundingClientRect().height) + 12 : 0;
+    stageShell.style.height = `${Math.max(300, window.innerHeight - top - stripHeight - 20)}px`;
+  };
+  fitStageShell();
+  scheduleFrame(() => fitStageShell());
+  [120, 400, 800, 1500].forEach(delay => setTimeout(() => fitStageShell(), delay));
+  if (!root.dataset.productionStageFitBound && typeof window.addEventListener === 'function') {
+    root.dataset.productionStageFitBound = '1';
+    window.addEventListener('resize', () => fitStageShell());
+  }
+  root.querySelectorAll('#production-preview-stage video').forEach(video => {
+    const fit = () => {
+      if (!video.videoWidth || !video.videoHeight) return;
+      video.parentElement.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+    };
+    video.addEventListener('loadedmetadata', fit);
+    fit();
+  });
+  root.querySelectorAll('.production-filmstrip video').forEach(video => {
+    const showFrame = () => {
+      if (!video.duration) return;
+      video.currentTime = Math.min(0.8, video.duration / 2);
+    };
+    video.addEventListener('loadedmetadata', showFrame);
+    showFrame();
+  });
 }
 
 function productionHasVideoOverride(item) {
@@ -1093,24 +1439,114 @@ function persistProductionVideoPolicy(policy) {
   return productionVideoPolicySaveChain;
 }
 
-async function productionSaveCurrent() {
-  await productionVideoPolicySaveChain;
-  const current = productionCurrent(); if (!current) return false;
-  syncProductionMentionBindings(current);
-  const payload = {prompt: productionSyncPromptValue(), negative_prompt: document.getElementById('production-negative').value, duration_sec: Number(document.getElementById('production-duration').value), references: current.production.references.map(item => ({reference_id:item.reference_id,source:item.source || 'asset',reference_token:item.reference_token || '',token:item.reference_token || '',version_id:item.asset_version_id || '',explicit_base_source:item.source === 'explicit' ? (item.explicit_base_source || '') : ''})), video_override:{provider:document.getElementById('production-video-provider').value,model:document.getElementById('production-video-model').value,resolution:document.getElementById('production-video-resolution').value}, continuity_enabled:document.getElementById('production-continuity').checked};
-  try {
-     const data = await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/shots/${productionSceneId}`, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}, '保存失败');
-    if (!data) return false;
-    productionData = data; renderProductionWorkspace();
-    return true;
-  } catch (error) { alert(error.message); return false; }
+function productionSaveCurrent() {
+  const current = productionCurrent();
+  if (!current || !appState.projectId) return Promise.resolve(false);
+  const selectedShot = productionSelectedShot(current);
+  const projectId = appState.projectId;
+  const sceneId = productionSceneId;
+  const shotId = productionShotId;
+  const policySave = productionVideoPolicySaveChain;
+  if (!selectedShot?.shot_id) syncProductionMentionBindings(current);
+  const payload = {
+    references: current.production.references.map(item => ({reference_id:item.reference_id,source:item.source || 'asset',reference_token:item.reference_token || '',token:item.reference_token || '',version_id:item.asset_version_id || '',explicit_base_source:item.source === 'explicit' ? (item.explicit_base_source || '') : ''})),
+    excluded_automatic_reference_ids: current.production.excluded_automatic_reference_ids || [],
+    video_override: {
+      provider: document.getElementById('production-video-provider').value,
+      model: document.getElementById('production-video-model').value,
+      resolution: document.getElementById('production-video-resolution').value,
+    },
+    continuity_enabled: document.getElementById('production-continuity').checked,
+  };
+  // Child prompts are derived and read-only; saving their settings must not
+  // revalidate the parent duration or reconcile its mentions against child text.
+  if (!selectedShot?.shot_id) {
+    payload.prompt = productionSyncPromptValue();
+    payload.negative_prompt = document.getElementById('production-negative').value;
+    payload.duration_sec = Number(document.getElementById('production-duration').value);
+  }
+  const revision = ++productionShotSaveRevision;
+  productionShotSaveChain = productionShotSaveChain.catch(() => false).then(async () => {
+    await policySave;
+    if (projectId !== appState.projectId) return false;
+    try {
+      const data = await projectJsonRequest(`${API_BASE}/api/projects/${projectId}/production/shots/${sceneId}`, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}, '保存失败');
+      if (!data || projectId !== appState.projectId) return false;
+      if (revision === productionShotSaveRevision) {
+        productionData = data;
+        if (sceneId === productionSceneId && shotId === productionShotId) renderProductionWorkspace();
+      }
+      return true;
+    } catch (error) { alert(error.message); return false; }
+  });
+  return productionShotSaveChain;
 }
 
-async function productionAddReference(referenceId) { const current=productionCurrent(); if (!current || current.production.references.some(item=>item.reference_id===referenceId)) return; const reference=(productionData.asset_catalog.characters || []).concat(productionData.asset_catalog.scenes || [], productionData.asset_catalog.props || []).find(item=>item.reference_id===referenceId); if (!reference) return; current.production.references.push({...reference,source:'manual'}); await productionSaveCurrent(); }
-async function productionRemoveReference(index) { const current=productionCurrent(); if (!current) return; current.production.references.splice(index,1); await productionSaveCurrent(); }
+async function productionAddReference(referenceId) {
+  const current=productionCurrent();
+  if (!current || current.production.references.some(item=>item.reference_id===referenceId)) return;
+  const reference=(productionData.asset_catalog.characters || []).concat(productionData.asset_catalog.scenes || [], productionData.asset_catalog.props || []).find(item=>item.reference_id===referenceId);
+  if (!reference) return;
+  current.production.excluded_automatic_reference_ids = (current.production.excluded_automatic_reference_ids || []).filter(id => id !== referenceId);
+  current.production.references.push({...reference,source:'manual'});
+  await productionSaveCurrent();
+}
+async function productionRemoveReference(index) {
+  const current=productionCurrent();
+  if (!current) return;
+  const reference = current.production.references[index];
+  if (!reference) return;
+  if (reference.source === 'asset' && reference.reference_id) {
+    const excluded = current.production.excluded_automatic_reference_ids || [];
+    if (!excluded.includes(reference.reference_id)) excluded.push(reference.reference_id);
+    current.production.excluded_automatic_reference_ids = excluded;
+  }
+  current.production.references.splice(index,1);
+  await productionSaveCurrent();
+}
 function productionDragStart(index) { productionDragIndex=index; }
 async function productionDropReference(index) { const current=productionCurrent(); if (!current || productionDragIndex===null || productionDragIndex===index) return; const [item]=current.production.references.splice(productionDragIndex,1); current.production.references.splice(index,0,item); productionDragIndex=null; await productionSaveCurrent(); }
-function productionSelectScene(sceneId) { productionSceneId=sceneId; renderProductionWorkspace(); }
+function productionEditorHasUnsavedChanges() {
+  const current = productionCurrent();
+  const selectedShot = productionSelectedShot(current);
+  if (!current || selectedShot?.shot_id) return false;
+  const prompt = productionPromptText();
+  const negative = document.getElementById('production-negative')?.value || '';
+  const duration = Number(document.getElementById('production-duration')?.value || 0);
+  return prompt !== String(current.prompt?.prompt || '')
+    || negative !== String(current.prompt?.negative_prompt || '')
+    || duration !== Number(current.prompt?.duration_sec || 0);
+}
+
+async function productionNavigateAdjacent(delta) {
+  const entries = productionTimelineEntries(productionData);
+  const currentSelectionShotId = String(productionShotId || '');
+  let currentIndex = entries.findIndex(entry => Number(entry.sceneId) === Number(productionSceneId)
+    && String(entry.shotId || '') === String(currentSelectionShotId.startsWith('parent:') ? '' : currentSelectionShotId));
+  if (currentIndex < 0 && currentSelectionShotId.startsWith('parent:')) {
+    currentIndex = entries.findIndex(entry => Number(entry.sceneId) === Number(productionSceneId));
+  }
+  const nextIndex = currentIndex + Number(delta || 0);
+  const next = entries[nextIndex];
+  if (!next) return;
+  if (productionEditorHasUnsavedChanges()) {
+    const save = confirm('当前父镜头有未保存修改。点击“确定”保存后切换，点击“取消”可继续选择是否放弃。');
+    if (save) {
+      if (!await productionSaveCurrent()) return;
+    } else if (!confirm('放弃未保存修改并切换到下一个镜头？')) {
+      return;
+    }
+  }
+  productionSelectScene(next.sceneId, next.shotId || `parent:${next.sceneId}`);
+}
+
+function productionSelectScene(sceneId, shotId = null) {
+  productionRememberRenderedDraft(document.getElementById('shot-production-workspace'));
+  productionSceneId = Number(sceneId);
+  const selection = productionSelection(productionData, productionSceneId, shotId);
+  productionShotId = selection.shotId;
+  renderProductionWorkspace();
+}
 function updateProductionVideoSelection({resetModel = false} = {}) {
   const current = productionCurrent();
   const providerElement = document.getElementById('production-video-provider');
@@ -1136,8 +1572,14 @@ function updateProductionVideoSelection({resetModel = false} = {}) {
   if (continuityControl) {
     const supportsContinuity = Boolean(selectedCapability.continuity);
     continuityControl.disabled = !supportsContinuity;
-     continuityControl.title = supportsContinuity ? '' : '当前模型不支持连续镜头';
+    continuityControl.title = supportsContinuity ? '' : '当前模型不支持连续镜头';
     if (!supportsContinuity) continuityControl.checked = false;
+    // The generation-state harness uses a plain control object, so the HTML
+    // onchange attribute never becomes a function. Bind it here after every
+    // model update so production-continuity.onchange() can save immediately.
+    if (typeof continuityControl.onchange !== 'function') {
+      continuityControl.onchange = () => productionContinuityChanged(continuityControl);
+    }
   }
   const previousResolution = resolution.value;
   const supportedResolutions = selectedCapability.resolutions || ['720p', '1080p'];
@@ -1162,12 +1604,16 @@ function updateProductionVideoSelection({resetModel = false} = {}) {
       selectedCapability,
     );
   }
-  const hint = document.querySelector('#shot-production-workspace .production-reference-capability');
+  const hint = document.querySelector('#shot-production-workspace #production-reference-capability');
   if (hint) {
     const limit = Number(selectedCapability.max_reference_images || 0);
-     const labels = {text_to_video:'纯文生视频', first_frame:'首帧参考', first_last_frame:'首尾帧', multi_reference:'多参考图'};
+    const hasLimit = Object.prototype.hasOwnProperty.call(selectedCapability, 'max_reference_images');
+    const labels = {text_to_video:'纯文生视频', first_frame:'首帧参考', first_last_frame:'首尾帧', multi_reference:'多参考图'};
     const modes = Array.isArray(selectedCapability.reference_modes) ? selectedCapability.reference_modes : [];
-     hint.textContent = `最多 ${limit} 张参考图 · ${modes.map(mode => labels[mode] || mode).join(' / ') || (limit > 0 ? '支持参考图' : '不支持参考图')}`;
+    const acceptsReferences = selectedCapability.image_to_video !== false;
+    const mode = modes.map(value => labels[value] || value).join(' / ')
+      || (!acceptsReferences ? '不支持参考图' : (hasLimit ? (limit > 0 ? '单参考图' : '不支持参考图') : '支持参考图，上限由服务决定'));
+    hint.innerHTML = `<span>${escapeHtml(acceptsReferences ? '参考图能力已更新' : '当前模型不支持参考图')}</span><span>${hasLimit ? `最多 ${limit} 张` : '未声明固定上限'} <b>·</b> ${escapeHtml(mode)}</span>`;
   }
   const duration = document.getElementById('production-duration');
   if (duration) {
@@ -1188,21 +1634,38 @@ function persistSelectedProductionVideoPolicy() {
   });
 }
 function productionVideoProviderChanged() { updateProductionVideoSelection({resetModel: true}); void persistSelectedProductionVideoPolicy(); }
+function productionContinuityChanged(control) {
+  const current = productionCurrent();
+  if (current) current.production.continuity_enabled = Boolean(control?.checked);
+  updateProductionVideoSelection();
+  void productionSaveCurrent();
+}
 function productionVideoModelChanged() { updateProductionVideoSelection(); void persistSelectedProductionVideoPolicy(); }
 function productionVideoResolutionChanged() { updateProductionVideoSelection(); void persistSelectedProductionVideoPolicy(); }
 async function productionGenerateCurrent() {
-  const active = activeProjectJobs(job => job.job_type === 'video.generate' && job.target_id === String(productionSceneId));
+  const current = productionCurrent();
+  if (!current) return;
+  const projectId = appState.projectId;
+  const sceneId = productionSceneId;
+  const shotId = productionShotId;
+  const target = productionGenerationTarget(sceneId, productionSelectedShot(current)?.shot_id || null);
+  const active = activeProjectJobs(job => job.job_type === 'video.generate' && String(job.target_id) === String(target.target_id));
   if (active.length) return cancelMatchingJobs(active);
   const saved = await productionSaveCurrent();
   if (!saved) return;
-   produceStatus('<span style="color:#93c5fd">正在准备参考图并提交视频...</span>');
-  try { await submitProjectJob({job_type:'video.generate',target_type:'shot',target_id:String(productionSceneId),payload:{scene_id:productionSceneId}}); }
+  if (projectId !== appState.projectId || sceneId !== productionSceneId || shotId !== productionShotId) return;
+  const batchJobs = productionActiveVideoBatchJobs(activeProjectJobs(job => job.job_type === 'video.generate'));
+  if (batchJobs.length && !confirm(`项目级批量生成正在进行（${batchJobs.length} 个任务）。\n\n确定只生成当前${target.target_type === 'shot_unit' ? '子镜头' : '父镜头'}吗？这不会取消或替换项目批量任务。`)) return;
+  produceStatus('<span style="color:#93c5fd">正在准备当前镜头的参考图并提交视频...</span>');
+  try { await submitProjectJob({job_type:'video.generate', ...target}); }
   catch(error){alert(error.message);}
 }
 async function productionGeneratePending() {
   const active = activeProjectJobs(job => job.job_type === 'video.generate');
-  if (active.length) return cancelMatchingJobs(active);
-   produceStatus('<span style="color:#93c5fd">正在批量准备参考图并生成视频...</span>');
+  const activeBatch = productionActiveVideoBatchJobs(active);
+  if (activeBatch.length) return cancelMatchingJobs(activeBatch);
+  if (active.length && !confirm('当前镜头视频任务正在进行。\n\n确定提交项目级批量任务吗？当前镜头任务不会被取消，但批量任务会跳过已有活动任务。')) return;
+   produceStatus('<span style="color:#93c5fd">正在准备项目级批量参考图并生成视频...</span>');
   try { await submitProjectJob({job_type:'video.generate',target_type:'shot',payload:{}}); }
   catch(error){alert(error.message);}
 }
@@ -1235,7 +1698,7 @@ async function productionSetSubtitle(enabled) {
   } catch (error) { alert(error.message); }
 }
 async function productionSetSubtitleMode(mode) {
-  if (!['off', 'dialogue', 'speaker'].includes(mode)) return;
+  if (!['off', 'dialogue', 'speaker', 'narration', 'all'].includes(mode)) return;
   try {
     const data = await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/settings`, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({subtitle_enabled:mode !== 'off',subtitle_mode:mode})}, '保存字幕模式失败');
     if (!data) return;
@@ -1306,8 +1769,18 @@ async function productionAssembleVideo() {
       : '<span style="color:#93c5fd">正在合成作品...</span>');
   } catch(error){produceStatus(`<span style="color:#ef4444">${escapeHtml(error.message)}</span>`);}
 }
-async function productionActivateVersion(versionId) { try { const data=await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/shots/${productionSceneId}/activate-version`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version_id:versionId})},'切换版本失败'); if(!data)return; productionData=data; renderProductionWorkspace(); } catch(error){alert(error.message);} }
-async function productionRevisePrompt() { const feedback=document.getElementById('production-feedback').value.trim(); if(!feedback)return; try { const data=await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/shots/${productionSceneId}/revise-prompt`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feedback})},'AI 修改失败'); if(!data)return; productionData=data; renderProductionWorkspace(); } catch(error){alert(error.message);} }
+async function productionActivateVersion(versionId) {
+  const current = productionCurrent();
+  const selectedShot = productionSelectedShot(current);
+  if (!current || !productionShotVersions(current, selectedShot).some(item => item.version_id === versionId)) return;
+  try {
+    const data = await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/shots/${productionSceneId}/activate-version`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version_id:versionId, ...(selectedShot?.shot_id ? {shot_id: selectedShot.shot_id} : {})})}, '切换版本失败');
+    if (!data) return;
+    productionData = data;
+    renderProductionWorkspace();
+  } catch (error) { alert(error.message); }
+}
+async function productionRevisePrompt() { const current=productionCurrent(); const selected=productionSelectedShot(current); if (selected?.shot_id) return alert('自动拆镜执行版本只读，请切回父镜头修改源提示词。'); const feedback=document.getElementById('production-feedback')?.value.trim(); if(!feedback)return; try { const data=await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/shots/${productionSceneId}/revise-prompt`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feedback})},'AI 修改失败'); if(!data)return; productionData=data; renderProductionWorkspace(); } catch(error){alert(error.message);} }
 
 function initializeStudio() {
 setupProductionWorkspace();
@@ -1350,6 +1823,12 @@ const __moduleActions = {
   promptReviewIssues,
   promptReviewIssueGroup,
   promptReviewShotStatusLabel,
+  productionTimelineEntries,
+  productionSelection,
+  productionGenerationTarget,
+  productionActiveVideoBatchJobs,
+  productionCurrentVideoButtonLabel,
+  productionTimelineHtml,
   storyboardQualityDiagnosticsHtml,
   productionFocusReviewRepair,
   productionAudioModeHtml,
@@ -1375,7 +1854,10 @@ const __moduleActions = {
   productionDragStart,
   productionDropReference,
   productionSelectScene,
+  productionNavigateAdjacent,
+  productionSetInspector,
   productionVideoProviderChanged,
+  productionContinuityChanged,
   productionVideoModelChanged,
   productionVideoResolutionChanged,
   productionGenerateCurrent,

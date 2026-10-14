@@ -24,6 +24,27 @@ def _join(parts: list[str]) -> str:
     return "\n".join(part.strip() for part in parts if part and part.strip())
 
 
+_NON_EXECUTION_SECTION_TITLES = (
+    "时间容量诊断",
+    "容量诊断",
+    "审核诊断",
+    "审核信息",
+    "规划说明",
+)
+
+
+def strip_non_execution_prompt_sections(text: str) -> str:
+    """Remove saved planning/audit metadata from provider payloads only."""
+    cleaned = str(text or "")
+    for title in _NON_EXECUTION_SECTION_TITLES:
+        cleaned = re.sub(
+            rf"(?ms)^【{re.escape(title)}】.*?(?=^【[^】]+】|\Z)",
+            "",
+            cleaned,
+        )
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def _join_unique(parts: list[str]) -> str:
     """Keep both legacy and project policy constraints without repeated blocks."""
     seen: set[str] = set()
@@ -125,6 +146,8 @@ def _project_visual_style_block(profile) -> tuple[str, str]:
         if str(item).strip()
     ]
     modifier_text = f" 补充风格标签：{'、'.join(dict.fromkeys(modifiers))}。" if modifiers else ""
+    # 风格层文本自带句号时不再补一个，避免"光影语言。。"式双句号。
+    positive = positive.rstrip("。.")
     return (
         f"【项目视觉媒介】{style_name}：{positive}。{modifier_text}",
         negative,
@@ -141,11 +164,14 @@ def compose_video_prompt(
     """Return the exact provider payload and its auditable composition metadata."""
     policy = policy or PromptPolicy()
     style_block, style_negative = _project_visual_style_block(creative_profile)
+    executable_shot = shot.model_copy(update={
+        "prompt": strip_non_execution_prompt_sections(shot.prompt),
+    })
     effective_prompt = _join_unique([
         policy.style_prefix,
         style_block,
-        shot.prompt,
-        _video_quality_block(shot),
+        executable_shot.prompt,
+        _video_quality_block(executable_shot),
     ])
     effective_negative = _join_unique([
         policy.global_negative_prompt,

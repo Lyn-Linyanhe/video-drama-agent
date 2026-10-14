@@ -522,3 +522,72 @@ def test_environment_cleaner_drops_looking_at_and_event_clauses():
     assert "门铃轻响" not in cleaned
     assert "墙面大片水痕" in cleaned
     assert "中央一张长桌" in cleaned
+
+
+def test_plot_prop_defaults_survive_manifest_enrichment_and_use_stable_ids():
+    from src.utils import visual_asset_manifest as vam
+
+    scenes = [
+        Scene(scene_id=6, duration_sec=8, location="珠宝店", characters=["德拉"],
+              action_description="德拉挑选白金表链，收进掌心", camera_direction="特写", emotion_tone="紧张"),
+        Scene(scene_id=8, duration_sec=8, location="公寓", characters=["德拉"],
+              action_description="德拉握着白金表链回家", camera_direction="近景", emotion_tone="期待"),
+        Scene(scene_id=11, duration_sec=8, location="公寓", characters=["德拉"],
+              action_description="德拉打开纸包，露出玳瑁发梳", camera_direction="特写", emotion_tone="惊喜"),
+        Scene(scene_id=13, duration_sec=8, location="公寓", characters=["德拉"],
+              action_description="德拉看着白金表链和玳瑁发梳", camera_direction="近景", emotion_tone="温暖"),
+    ]
+    script = ScriptBreakdown(title="道具默认描述", genre="情感", logline="礼物", duration_sec=32,
+                             narration_style="无旁白", scenes=scenes)
+
+    manifest = vam.build_manifest_from_scenes(script)
+    script.asset_manifest = manifest
+    vam.enrich_manifest_descriptions(script)
+    props = {prop.name: prop for prop in manifest.props}
+
+    assert props["白金表链"].prop_id == "prop_watch_chain"
+    assert props["玳瑁发梳"].prop_id == "prop_tortoiseshell_comb"
+    assert "细长银白色白金表链" in props["白金表链"].description
+    assert "深棕琥珀色斑纹" in props["玳瑁发梳"].description
+    assert "金色表链" not in props["白金表链"].aliases
+
+
+def test_manifest_extracts_story_central_watch_chain_and_tortoiseshell_comb():
+    scenes = [
+        Scene(scene_id=6, duration_sec=9, location="珠宝店柜台", characters=["德拉"],
+              action_description="德拉挑选一条白金表链，双手捧起表链放入口袋",
+              camera_direction="表链特写", emotion_tone="期待"),
+        Scene(scene_id=8, duration_sec=12, location="公寓", characters=["德拉", "吉姆"],
+              action_description="德拉手里握着白金表链，走向吉姆",
+              camera_direction="双人中景", emotion_tone="慌乱"),
+        Scene(scene_id=11, duration_sec=9, location="公寓", characters=["德拉", "吉姆"],
+              action_description="德拉打开纸包，露出全套玳瑁发梳并抱在胸前",
+              camera_direction="发梳特写", emotion_tone="激动"),
+        Scene(scene_id=12, duration_sec=8, location="公寓", characters=["德拉", "吉姆"],
+              action_description="德拉摊开手掌露出白金表链，递向吉姆",
+              camera_direction="表链特写", emotion_tone="苦涩"),
+        Scene(scene_id=13, duration_sec=12, location="公寓", characters=["德拉", "吉姆"],
+              action_description="德拉低头看手中的表链，又看向桌上的发梳，与吉姆对视",
+              camera_direction="双人近景", emotion_tone="温暖"),
+    ]
+    script = ScriptBreakdown(
+        title="麦琪的礼物道具提取", genre="情感", logline="两份礼物构成反转",
+        duration_sec=50, narration_style="无旁白", scenes=scenes,
+    )
+
+    manifest = build_manifest_from_scenes(script)
+    props = {prop.name: prop for prop in manifest.props}
+
+    assert "白金表链" in props
+    assert props["白金表链"].shot_ids == [6, 8, 12, 13]
+    assert props["白金表链"].critical_reason == "plot"
+    assert "玳瑁发梳" in props
+    assert props["玳瑁发梳"].shot_ids == [11, 13]
+    assert manifest.shot_bindings
+    bindings = {item.scene_id: item.prop_ids for item in manifest.shot_bindings}
+    assert props["白金表链"].prop_id in bindings[6]
+    assert props["白金表链"].prop_id in bindings[8]
+    assert props["白金表链"].prop_id in bindings[12]
+    assert props["白金表链"].prop_id in bindings[13]
+    assert props["玳瑁发梳"].prop_id in bindings[11]
+    assert props["玳瑁发梳"].prop_id in bindings[13]

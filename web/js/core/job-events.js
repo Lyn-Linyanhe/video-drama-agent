@@ -110,8 +110,17 @@ async function loadProjectJobs() {
       projectJobStateCache.set(job.job_id, job.state);
     });
     projectJobs = data.jobs || [];
+    patchProductionJobState();
     syncJobsToAssetState();
     renderProjectJobs(); renderRoles(); renderScenes(); renderProps();
+    const terminalProductionJobs = projectJobs.filter(job => isTerminalJob(job) && ['video.generate', 'audio.generate', 'final.assemble'].includes(job.job_type));
+    if (terminalProductionJobs.length) {
+      const refreshKey = terminalProductionJobs.map(job => `${job.job_id}:${job.state}`).sort().join('|');
+      if (refreshKey !== loadProjectJobs.lastTerminalRefreshKey) {
+        loadProjectJobs.lastTerminalRefreshKey = refreshKey;
+        await loadProductionWorkspace({patch: true});
+      }
+    }
   } catch (error) { console.error(error); }
 }
 

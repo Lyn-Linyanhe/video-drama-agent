@@ -613,6 +613,12 @@ async def review_image_history(project_id: str, req: ImageHistoryReviewRequest):
             else "unreviewed" if visual_status in {"skipped", "unreviewed"}
             else "warning"
         )
+        # An explicit visual review is the point at which an asset earns (or
+        # loses) automatic video-reference eligibility.  Do not preserve a
+        # stale value from the generation-time report: that value is false for
+        # skipped/unreviewed assets and would otherwise keep a newly passed
+        # image out of every shot forever.
+        report["automatic_reference_allowed"] = verdict == "passed"
         history = versions.update_quality_report(
             req.asset_type, req.asset_id, req.view_type, str(selected.get("id")), report,
         )

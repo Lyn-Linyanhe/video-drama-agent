@@ -244,7 +244,13 @@ def build_character_image_prompt(
         framing_guard = "人物不可裁剪、不可遮挡、不得偏离项目艺术风格"
     else:
         framing_guard = "人物不可裁剪、不可遮挡、不可过度风格化"
-    role_information = f"{name}，{description}。"
+    description_text = str(description or "").strip()
+    if description_text.endswith("。"):
+        description_text = description_text[:-1]
+    if description_text.startswith(f"{name}，") or description_text.startswith(f"{name}:") or description_text.startswith(f"{name}："):
+        role_information = f"{description_text}。"
+    else:
+        role_information = f"{name}，{description_text}。" if description_text else f"{name}。"
     framing_override = ""
     if view_type == "front_half":
         role_information += "下身与鞋子信息仅作身份档案，不得在本图绘制或展示。"
@@ -265,10 +271,25 @@ def build_character_image_prompt(
 最终必须严格遵守上述{label}的镜头方向和构图范围。"""
 
 
+def _dedupe_negative_terms(prompt: str) -> str:
+    """Drop duplicated negative terms while preserving order (style layers
+    partially overlap the shared list)."""
+    terms = [term.strip() for term in str(prompt or "").replace("，", ",").split(",")]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for term in terms:
+        if term and term not in seen:
+            seen.add(term)
+            ordered.append(term)
+    return "，".join(ordered)
+
+
 def build_character_negative_prompt(view_type: str, art_style: str = "写实") -> str:
     """Build shared and view-specific exclusions for a character reference image."""
     _, _, _, _, view_exclusions = character_view_spec(view_type)
-    return f"{CHARACTER_COMMON_NEGATIVE_PROMPT}{character_style_negative(art_style)}，{view_exclusions}"
+    return _dedupe_negative_terms(
+        f"{CHARACTER_COMMON_NEGATIVE_PROMPT}{character_style_negative(art_style)}，{view_exclusions}"
+    )
 
 CHARACTER_COMMON_NEGATIVE_PROMPT = (
         "分屏，拼接组图，重复人物，单张图片中出现多个镜头角度，"
@@ -380,10 +401,14 @@ def build_prop_image_prompt(name: str, description: str, style: str = "", custom
     return f"""{medium_title}。系统分别生成六张独立单视图，再以 2 行 3 列的干净网格本地拼接，确保每格只出现同一件道具的一个标准正交视图。{lighting}
 六视图必须依次包含：绝对正前方视图、绝对正后方视图、绝对左侧视图、绝对右侧视图、绝对正上方俯拍视图、绝对正下方仰拍视图。所有视图必须是同一件道具，材质、颜色、比例、结构和磨损状态完全一致。
 摄影与构图：使用超长焦镜头或移轴镜头效果，将透视变形降到最低；本该平行的边缘保持平行，接近正交投影；每个视图如经三脚架精密校准拍摄，物体居中、完整、端正，无倾斜、旋转或透视畸变。
-道具信息：{name}，{description}。
+道具信息：{name}，{_strip_trailing_period(description)}。
 固定形态：柔软或可变形道具在六个方向必须保持剧本明确给出的展开、折叠或放置状态；未指定时不自行增加展开、折叠或放置状态。刚性道具的位置、结构和可动部件状态不得变化。
 限制：每张原始视图只出现一件道具和纯白背景；不得出现人物、场景、浴室、货架、洗手台、桌面陈列、植物、洗护用品、其他道具、多个副本、文字、水印、Logo 或 UI 元素。{custom_text}
 最终由系统拼接为一张横向 2x3 六视图参考图。"""
+
+
+def _strip_trailing_period(value: str) -> str:
+    return str(value or "").strip().rstrip("。")
 
 
 def build_prop_view_prompt(
@@ -408,7 +433,7 @@ def build_prop_view_prompt(
     )
     state_lock = prop_state_lock(name, description)
     return f"""{title}，当前只生成一个{label}视图，不是拼图，不是多宫格。
-道具：{name}。可见外观：{description}。
+道具：{name}。可见外观：{_strip_trailing_period(description)}。
 镜头方向：{camera}。接近正交投影，透视变形最小，物体完整、居中、端正，占画面约70%，四周留白。
 一致性：颜色、材质、尺寸比例、结构、磨损与固定形态严格锁定；柔软道具保持同一展开或折叠状态。
 {state_lock}

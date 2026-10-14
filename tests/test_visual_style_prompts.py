@@ -25,5 +25,5 @@ def test_live_action_style_keeps_realism_and_rejects_illustration():
         art_style="电影级真人写实",
     )
     positive, negative = project_style_layers(state, "character")
-    assert "真实成年人体比例" in positive
+    assert "真实人体比例且符合角色描述的年龄感" in positive
     assert "插画" in negative

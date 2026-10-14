@@ -1,3 +1,4 @@
+import pytest
 from pathlib import Path
 
 
@@ -76,3 +77,91 @@ def test_production_editor_clamps_existing_duration_to_selected_model_bounds():
 
     assert "if (Number.isFinite(currentDuration) && currentDuration < durationMin)" in source
     assert "durationInput.value = String(durationMin)" in source
+
+
+def test_duration_policy_rejects_over_cap_happyhorse_too():
+    import pytest
+    from src.api.context import _duration_for_video_policy
+    from src.services.video_capabilities import normalize_video_policy
+
+    policy = normalize_video_policy({
+        "provider": "happyhorse",
+        "model": "happyhorse-1.1-i2v",
+        "resolution": "1080p",
+    })
+
+    with pytest.raises(Exception, match=r"15"):
+        _duration_for_video_policy(20, policy)
+
+
+def test_happyhorse_client_rejects_over_cap_instead_of_clamping(monkeypatch):
+    import asyncio
+    import pytest
+    from src.api_clients.happyhorse import HappyHorseVideoClient
+
+    client = HappyHorseVideoClient(api_key="test")
+
+    async def unexpected_submit(**_kwargs):
+        raise AssertionError("invalid duration must fail before provider submission")
+
+    monkeypatch.setattr(client, "_submit_task", unexpected_submit)
+    result = asyncio.run(client.generate_video("test", duration_sec=20))
+    assert result.success is False
+    assert "4-15" in result.error_message
+
+
+def test_happyhorse_accepts_the_full_integral_duration_range():
+    from src.services.video_capabilities import normalize_video_policy, validate_video_duration
+
+    policy = normalize_video_policy({
+        "provider": "happyhorse",
+        "model": "happyhorse-1.1-r2v",
+        "resolution": "1080p",
+    })
+
+    for duration in (4, 5, 6, 8, 9, 10, 11, 14, 15):
+        assert validate_video_duration(policy, duration) == duration
+
+
+def test_happyhorse_duration_policy_rejects_fractional_duration_without_rounding():
+    from src.services.video_capabilities import normalize_video_policy, validate_video_duration
+
+    policy = normalize_video_policy({
+        "provider": "happyhorse",
+        "model": "happyhorse-1.1-i2v",
+        "resolution": "1080p",
+    })
+
+    with pytest.raises(Exception, match="integer|整数"):
+        validate_video_duration(policy, 15.4)
+
+
+def test_happyhorse_client_rejects_fractional_duration_without_rounding():
+    from src.api_clients.happyhorse import HappyHorseVideoClient
+
+    client = HappyHorseVideoClient(api_key="test")
+
+    with pytest.raises(ValueError, match="integer|整数"):
+        client._validate_duration(3.4)
+
+
+def test_fractional_declared_duration_option_is_ignored_instead_of_rounded():
+    from src.services.video_capabilities import duration_options_from_capability
+
+    assert duration_options_from_capability({
+        "discrete_durations": True,
+        "durations": [3.4, 5, "not-a-duration"],
+    }) == [5]
+
+
+def test_happyhorse_accepts_non_discrete_durations_in_range():
+    from src.services.video_capabilities import normalize_video_policy, validate_video_duration
+
+    policy = normalize_video_policy({
+        "provider": "happyhorse",
+        "model": "happyhorse-1.1-r2v",
+        "resolution": "1080p",
+    })
+
+    for duration in (4, 6, 8, 9, 11, 14, 15):
+        assert validate_video_duration(policy, duration) == duration

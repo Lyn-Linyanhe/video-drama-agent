@@ -59,3 +59,24 @@ def test_clean_environment_description_preserves_named_fixed_portrait_fixture():
     assert "中央长桌" in result
     assert "铜钟" in result
 
+
+
+def test_binding_includes_declared_character_even_when_text_uses_generic_noun():
+    # 场景 5-14 的教训：动作文本用"孩子"泛称主角，按名字面匹配会让
+    # 杨氏子在 12 个子镜里完全没有参考图。声明出镜的角色必须绑定，
+    # 漏绑（身份无锚）的代价远大于多绑（多占一个参考位）。
+    from src.schemas.script import DialogueLine, Scene, ScriptBreakdown
+    from src.utils.visual_asset_manifest import build_manifest_from_scenes
+
+    scene = Scene(
+        scene_id=5, duration_sec=10, location="杨家院子", characters=["杨氏子", "孔君平"],
+        action_description="孔君平看着孩子忙前忙后的身影，眼里露出赞许。",  # 只点名孔君平
+        dialogue=[DialogueLine(character="孔君平", line="你还真是个懂礼貌的孩子。")],
+        camera_direction="中景", emotion_tone="和蔼",
+    )
+    script = ScriptBreakdown(title="测试", genre="剧情", logline="", duration_sec=10, narration_style="无旁白", scenes=[scene])
+    manifest = build_manifest_from_scenes(script)
+    binding = next(b for b in manifest.shot_bindings if b.scene_id == 5)
+    names = {c.name for c in manifest.characters}
+    bound_names = {next(c.name for c in manifest.characters if c.asset_id == cid) for cid in binding.on_screen_character_ids}
+    assert bound_names == names == {"杨氏子", "孔君平"}

@@ -21,6 +21,9 @@ from src.schemas.prompt import GenerationPrompts, ShotPrompt
 from src.schemas.prompt import PromptPolicy
 from src.services.prompt_composer import compose_video_prompt, video_structure_instruction
 from src.services.timed_prompt_composer import apply_timed_prompt_structure, build_timed_shot_prompt
+from src.services.prompt_execution_context import build_execution_context, render_execution_prompt
+from src.services.shot_prompt_materializer import materialize_shot_prompts
+from src.services.video_capabilities import VIDEO_CAPABILITIES, duration_options_from_capability
 from src.services.media_quality import image_allows_automatic_reference
 from src.utils.visual_asset_manifest import (
     binding_for_scene,
@@ -54,6 +57,63 @@ class VideoGenerationAgent:
         mode = str(getattr(creative_profile, "audio_mode", "auto") or "auto").strip().lower()
         return mode != "external_tts"
 
+    def _provider_duration_cap(self) -> float | None:
+        """Return the selected client's verified maximum executable duration.
+
+        Model capabilities are the source of truth for providers that expose
+        model-specific limits.  A small provider-level fallback is retained
+        for historical clients (notably Kling) whose model metadata predates
+        the capability registry.  Unknown models are deliberately left
+        uncapped rather than guessing a limit that may reject a valid request.
+        """
+        provider = str(getattr(self.api_client, "provider_name", "") or "").strip().lower()
+        provider = "seedance" if provider == "seedence" else provider
+        model = str(getattr(self.api_client, "model", "") or "").strip()
+
+        capability = (
+            VIDEO_CAPABILITIES.get(provider, {}).get("models", {}).get(model)
+            if model
+            else None
+        )
+        if capability:
+            maximum = capability.get("duration_max")
+            if maximum is None:
+                durations = capability.get("durations") or []
+                maximum = max(durations) if durations else None
+            try:
+                return float(maximum) if maximum is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        # Compatibility for clients not represented in VIDEO_CAPABILITIES.
+        return {
+            "happyhorse": 15.0,
+            "wan": 15.0,
+            "kling": 10.0,
+        }.get(provider)
+
+    def _provider_duration_min(self) -> int:
+        """Return the selected client's verified minimum executable duration."""
+        provider = str(getattr(self.api_client, "provider_name", "") or "").strip().lower()
+        provider = "seedance" if provider == "seedence" else provider
+        model = str(getattr(self.api_client, "model", "") or "").strip()
+        capability = VIDEO_CAPABILITIES.get(provider, {}).get("models", {}).get(model, {})
+        minimum = capability.get("duration_min")
+        if minimum is None:
+            durations = capability.get("durations") or []
+            minimum = min(durations) if durations else 3
+        try:
+            return max(1, int(minimum))
+        except (TypeError, ValueError):
+            return 3
+
+    def _provider_duration_options(self) -> list[int]:
+        provider = str(getattr(self.api_client, "provider_name", "") or "").strip().lower()
+        provider = "seedance" if provider == "seedence" else provider
+        model = str(getattr(self.api_client, "model", "") or "").strip()
+        capability = VIDEO_CAPABILITIES.get(provider, {}).get("models", {}).get(model, {})
+        return duration_options_from_capability(capability)
+
     async def run(
         self,
         prompts: GenerationPrompts,
@@ -66,6 +126,7 @@ class VideoGenerationAgent:
         prop_images=None,
         prompt_policy: PromptPolicy | None = None,
         creative_profile=None,
+        video_generation_policy: dict | None = None,
     ) -> GeneratedAssets:
         start_time = time.time()
         total_cost = 0.0
@@ -80,11 +141,38 @@ class VideoGenerationAgent:
         if scene_vision_descriptions:
             self._inject_scene_descriptions(prompts, scene_vision_descriptions)
         self._inject_prop_descriptions(prompts, script)
-        apply_timed_prompt_structure(prompts.shots, script)
+        if video_generation_policy:
+            from src.services.video_capabilities import normalize_video_policy
 
+            selected_policy = normalize_video_policy(video_generation_policy)
+            capability = selected_policy.get("capability") or {}
+            duration_cap = capability.get("duration_max")
+            if duration_cap is None:
+                durations = capability.get("durations") or []
+                duration_cap = max(durations) if durations else None
+            duration_options = duration_options_from_capability(capability)
+            duration_min = int(capability.get("duration_min") or (min(duration_options) if duration_options else 3))
+        else:
+            duration_cap = self._provider_duration_cap()
+            duration_min = self._provider_duration_min()
+            duration_options = self._provider_duration_options()
         reference_map = self._build_reference_bundle(prompts, character_images, scene_images, script, prop_images)
-
-        for shot in prompts.shots:
+        executable_shots = materialize_shot_prompts(
+            prompts,
+            script,
+            provider_min_duration_sec=duration_min,
+            duration_cap_sec=duration_cap,
+            duration_options=duration_options,
+        )
+        # Parent prompts can be longer than one provider call when a ShotPlan
+        # exists.  Apply the timed contract only to executable units so an old
+        # over-capacity parent cannot be compressed before it is materialized.
+        apply_timed_prompt_structure(
+            executable_shots,
+            script,
+            duration_cap_sec=duration_cap,
+        )
+        for shot in executable_shots:
             if reference_map.get(shot.scene_id):
                 shot.motion_strength = self._motion_strength_for_shot(shot, has_references=True)
 
@@ -107,7 +195,7 @@ class VideoGenerationAgent:
                 )
 
         shot_assets = await asyncio.gather(
-            *[generate_single(shot) for shot in prompts.shots],
+            *[generate_single(shot) for shot in executable_shots],
             return_exceptions=True,
         )
 
@@ -117,13 +205,27 @@ class VideoGenerationAgent:
             if isinstance(asset, Exception):
                 results.append(
                     ShotAsset(
-                        scene_id=prompts.shots[i].scene_id,
+                        scene_id=executable_shots[i].scene_id,
+                        shot_id=executable_shots[i].shot_id,
+                        parent_scene_id=executable_shots[i].parent_scene_id,
+                        shot_order=executable_shots[i].shot_order,
+                        continuity_from_shot_id=executable_shots[i].continuity_from_shot_id,
+                        beat_ids=list(executable_shots[i].beat_ids),
+                        dialogue_ids=list(executable_shots[i].dialogue_ids),
                         success=False,
                         error_message=str(asset),
                     )
                 )
                 failed_indices.append(i)
             else:
+                asset = asset.model_copy(update={
+                    "shot_id": executable_shots[i].shot_id,
+                    "parent_scene_id": executable_shots[i].parent_scene_id or executable_shots[i].scene_id,
+                    "shot_order": executable_shots[i].shot_order,
+                    "continuity_from_shot_id": executable_shots[i].continuity_from_shot_id,
+                    "beat_ids": list(executable_shots[i].beat_ids),
+                    "dialogue_ids": list(executable_shots[i].dialogue_ids),
+                })
                 results.append(asset)
                 if not asset.success:
                     failed_indices.append(i)
@@ -133,7 +235,7 @@ class VideoGenerationAgent:
             for idx in failed_indices:
                 shot = self._composed_shot(
                     prompts,
-                    prompts.shots[idx],
+                    executable_shots[idx],
                     prompt_policy,
                     creative_profile=creative_profile,
                 )
@@ -143,7 +245,14 @@ class VideoGenerationAgent:
                     await asyncio.sleep(2)
                     asset = await self._retry_loop(shot, refs, None)
                     if asset.success:
-                        results[idx] = asset
+                        results[idx] = asset.model_copy(update={
+                            "shot_id": executable_shots[idx].shot_id,
+                            "parent_scene_id": executable_shots[idx].parent_scene_id or executable_shots[idx].scene_id,
+                            "shot_order": executable_shots[idx].shot_order,
+                            "continuity_from_shot_id": executable_shots[idx].continuity_from_shot_id,
+                            "beat_ids": list(executable_shots[idx].beat_ids),
+                            "dialogue_ids": list(executable_shots[idx].dialogue_ids),
+                        })
                         print(f"  镜头 {shot.scene_id} 重试成功")
                         break
                 if not results[idx].success:
@@ -165,6 +274,7 @@ class VideoGenerationAgent:
 
         return GeneratedAssets(
             shots=results,
+            expected_shot_ids=[str(shot.shot_id) for shot in executable_shots if shot.shot_id],
             total_cost=total_cost,
             generation_time_sec=elapsed,
             all_success=all(a.success for a in results),
@@ -257,10 +367,24 @@ class VideoGenerationAgent:
             scene_vision_descriptions,
             script,
         )
-        provider = (self.api_client.provider_name or "").lower()
-        provider_duration_cap = {"happyhorse": 15.0, "wan": 15.0, "kling": 10.0}.get(provider)
-        if provider_duration_cap is not None:
-            isolated.duration_sec = int(min(isolated.duration_sec, provider_duration_cap))
+        provider_duration_cap = self._provider_duration_cap()
+        provider_duration_min = self._provider_duration_min()
+        if (
+            float(isolated.duration_sec) < provider_duration_min
+            or (provider_duration_cap is not None and float(isolated.duration_sec) > provider_duration_cap)
+        ):
+            upper = int(provider_duration_cap) if provider_duration_cap is not None else "∞"
+            raise ValueError(
+                f"{self.api_client.provider_name} shot duration "
+                f"{isolated.duration_sec}s exceeds executable range {provider_duration_min}-{upper}s"
+            )
+        duration_options = self._provider_duration_options()
+        if duration_options and int(isolated.duration_sec) not in duration_options:
+            choices = ", ".join(str(item) for item in duration_options)
+            raise ValueError(
+                f"{self.api_client.provider_name} supports only durations {choices}s; "
+                f"received {isolated.duration_sec}s"
+            )
         isolated.prompt = build_timed_shot_prompt(
             isolated,
             script,
@@ -388,6 +512,10 @@ class VideoGenerationAgent:
         version_suffix = re.sub(r"[^a-zA-Z0-9_-]+", "_", version_id).strip("_")[:40]
         filename = f"{provider}_{source_id}{source.suffix.lower()}"
         destination_dir = OUTPUT_DIR / project_id / "assets" / "videos" / f"shot_{asset.scene_id:03d}"
+        if asset.shot_id:
+            safe_shot_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(asset.shot_id)).strip("_")[:80]
+            if safe_shot_id:
+                destination_dir = destination_dir / safe_shot_id
         if version_suffix:
             destination_dir = destination_dir / version_suffix
         destination = destination_dir / filename
@@ -522,6 +650,12 @@ class VideoGenerationAgent:
                 if result.success:
                     return ShotAsset(
                         scene_id=shot.scene_id,
+                        shot_id=shot.shot_id,
+                        parent_scene_id=shot.parent_scene_id,
+                        shot_order=shot.shot_order,
+                        continuity_from_shot_id=shot.continuity_from_shot_id,
+                        beat_ids=list(shot.beat_ids),
+                        dialogue_ids=list(shot.dialogue_ids),
                         video_url=result.video_url,
                         local_path=result.local_path,
                         duration_sec=result.duration_sec,
@@ -549,6 +683,12 @@ class VideoGenerationAgent:
 
         return ShotAsset(
             scene_id=shot.scene_id,
+            shot_id=shot.shot_id,
+            parent_scene_id=shot.parent_scene_id,
+            shot_order=shot.shot_order,
+            continuity_from_shot_id=shot.continuity_from_shot_id,
+            beat_ids=list(shot.beat_ids),
+            dialogue_ids=list(shot.dialogue_ids),
             success=False,
             error_message=last_error or "Max retries exceeded",
         )
@@ -897,11 +1037,10 @@ class VideoGenerationAgent:
 
             for name in on_screen_character_names(script, shot.scene_id):
                 candidate_by_view = char_paths.get(name, {})
-                for chosen in self._character_reference_paths(candidate_by_view):
+                for chosen in self._character_reference_paths(candidate_by_view, shot.prompt):
                     if chosen not in refs:
                         refs.append(chosen)
-                    if len(refs) >= 9:
-                        break
+                    break
                 if len(refs) >= 9:
                     break
 
@@ -917,11 +1056,10 @@ class VideoGenerationAgent:
 
             if not refs and not getattr(script, "asset_manifest", None):
                 for candidate_by_view in char_paths.values():
-                    for chosen in self._character_reference_paths(candidate_by_view):
+                    for chosen in self._character_reference_paths(candidate_by_view, shot.prompt):
                         if chosen not in refs:
                             refs.append(chosen)
-                        if len(refs) >= 9:
-                            break
+                        break
                     if refs:
                         break
 
@@ -992,11 +1130,10 @@ class VideoGenerationAgent:
                 else:
                     references.append(("scene", scene_asset_id, scene_reference.view_type))
             for name in on_screen_character_names(script, shot.scene_id):
-                for reference in self._character_reference_paths(character_refs.get(name, {})):
+                for reference in self._character_reference_paths(character_refs.get(name, {}), shot.prompt):
                     if reference and reference not in references:
                         references.append(reference)
-                    if len(references) >= 9:
-                        break
+                    break
                 if len(references) >= 9:
                     break
             for prop_id in prop_ids_for_scene(script, shot.scene_id):
@@ -1015,8 +1152,7 @@ class VideoGenerationAgent:
                     for reference in self._character_reference_paths(candidates):
                         if reference and reference not in references:
                             references.append(reference)
-                        if len(references) >= 9:
-                            break
+                        break
                     if references:
                         break
             bundle[shot.scene_id] = references
@@ -1034,24 +1170,27 @@ class VideoGenerationAgent:
         return next(iter(candidate_by_view.values()), None)
 
     @staticmethod
-    def _character_reference_paths(candidate_by_view: dict[str, str]) -> list[str]:
-        ordered: list[str] = []
-        for view_type in (
-            "front_half",
-            "front_full",
-            "left_profile",
-            "back_full",
-            "portrait",
-            "profile",
-            "full_body",
-        ):
+    def _character_reference_paths(candidate_by_view: dict[str, str], prompt: str = "") -> list[str]:
+        """Return the one identity reference that best matches the shot's view."""
+        from src.services.prompt_execution_context import extract_camera_scoped_text
+
+        camera_text = extract_camera_scoped_text(prompt)
+        if any(cue in camera_text for cue in ("背面跟拍", "背后跟拍", "背影", "背对镜头", "从背后拍", "背拍")):
+            preference = ("back_full", "left_profile", "profile", "front_full", "front_half", "full_body", "portrait")
+        elif any(cue in camera_text for cue in ("过肩", "侧后方", "三分之二侧", "四分之三侧", "侧面", "侧拍", "侧脸", "侧身")):
+            preference = ("left_profile", "profile", "back_full", "front_half", "front_full", "full_body", "portrait")
+        elif any(cue in camera_text for cue in ("全景", "远景", "wide", "拉远")):
+            preference = ("front_full", "front_half", "left_profile", "back_full", "portrait", "profile", "full_body")
+        else:
+            preference = ("front_half", "front_full", "left_profile", "back_full", "portrait", "profile", "full_body")
+        for view_type in preference:
             path = candidate_by_view.get(view_type)
-            if path and path not in ordered:
-                ordered.append(path)
+            if path:
+                return [path]
         for path in candidate_by_view.values():
-            if path and path not in ordered:
-                ordered.append(path)
-        return ordered
+            if path:
+                return [path]
+        return []
 
     @staticmethod
     def _is_scene_reference_view(view_type: str) -> bool:
@@ -1248,10 +1387,15 @@ class VideoGenerationAgent:
         # divergent binding block before the provider request.
         lines = ["竖屏9:16，电影级质感，柔和漫射光。", "[Reference binding]"]
         if continuity_tail:
-            lines.append("参考图1是上一镜尾帧，必须严格延续上一镜的机位、景别、人物站位、动作进度、光线和时间，不要重新起镜，不要跳切。")
+            lines.append("参考图1是上一镜尾帧，必须作为本镜第一帧：机位、景别、人物站位、门扇开合、动作进度、光线必须与尾帧连续，不要重新起镜，不要跳切。场景参考图只提供空间陈设，不得覆盖尾帧机位。")
         if reference_labels:
             for idx, label in enumerate(reference_labels[:len(reference_paths)], start=1):
-                lines.append(f"参考图{idx}：{label}。")
+                raw_label = str(label or "").strip()
+                # Structured labels already map their @ tokens in [Reference
+                # tags]. Show only the human-readable description here so each
+                # token occurs once in the provider prompt.
+                display_label = raw_label.split("=", 1)[1].strip() if "=" in raw_label else raw_label
+                lines.append(f"参考图{idx}：{display_label}。")
             tag_lines = []
             for idx, label in enumerate(reference_labels[:len(reference_paths)], start=1):
                 for tag in self._reference_tags_from_label(str(label or "")):
@@ -1264,7 +1408,10 @@ class VideoGenerationAgent:
             else:
                 lines.append(f"参考图1为{scene_desc or '背景'}全景。")
         if first_ref_is_scene or continuity_tail:
-            lines.append("镜头关系必须延续参考图的空间位置和运动方向，人物转身、回头、推门、举手等动作要和参考图一致。")
+            # The concrete spatial-continuity wording lives only in the merged
+            # hierarchy rule below, so it is not emitted as a separate,
+            # duplicative sentence.
+            pass
 
         char_descs = [] if reference_labels else self._character_reference_descriptions(shot, visual_design, script)
         max_character_refs = max(0, len(reference_paths) - 1) if (first_ref_is_scene or continuity_tail) else len(reference_paths)
@@ -1272,23 +1419,67 @@ class VideoGenerationAgent:
         for idx, desc in enumerate(char_descs, start=2 if (first_ref_is_scene or continuity_tail) else 1):
             lines.append(f"参考图{idx}为{desc}。")
 
-        lines.extend(
-            [
-                "[图层分工]",
-                "[Reference hierarchy]",
-                "Use the continuity tail or scene reference to lock camera position, spatial layout, lighting direction and action continuity.",
-                "Use character references only to lock identity, face structure, hairstyle, costume silhouette, colors and body proportion.",
-                "Use prop references only to lock object shape, material, color, scale, wear marks and current state.",
-                "Do not merge different reference views into one impossible face, costume, room layout or prop design.",
-                video_structure_instruction(shot),
-                "【原始时间轴提示词】",
-                (shot.prompt or "").strip(),
-                "[连续性约束]",
-                "同一角色在所有参考图中必须保持五官比例、发型、服装版型、颜色、材质、污渍和道具位置一致。",
-                "如果参考图里同时存在正面、侧面和背面，请严格按对应视角呈现，不要把正脸特征拼到背面，也不要把背面衣褶硬搬到正面。",
-                "背景与人物必须自然融合，禁止出现抠图边缘、换脸、换衣服、背景突变。",
-            ]
-        )
+        if continuity_tail:
+            reference_rules = (
+                "Reference 1 is the continuity tail and has highest priority: lock camera, framing, "
+                "blocking, door state, lighting and action progress to that first frame. "
+                "Scene references must not override the tail-frame camera. "
+                "Use character references only to lock identity, face, hairstyle, costume and body proportion; "
+                "use prop references to lock shape, material and state. "
+                "正面、侧面和背面只按对应视角使用，不得拼接成错误人物、房间或道具。"
+                "不要重新起镜，不要跳切，不要从远处重新跑向门口。"
+            )
+        else:
+            reference_rules = (
+                "Use the continuity tail or scene reference to lock camera position, spatial layout, "
+                "lighting and action continuity. Use character references only to lock identity, face, "
+                "hairstyle, costume and body proportion; use prop references to lock shape, material and "
+                "state. 正面、侧面和背面只按对应视角使用，不得拼接成错误人物、房间或道具。"
+                "镜头关系必须延续参考图的空间位置和运动方向，人物转身、回头、推门、举手等动作要和参考图一致。"
+            )
+        lines.extend(["[Reference hierarchy]", reference_rules])
+        shot_text = (shot.prompt or "").strip()
+        if not any(marker in shot_text for marker in ("【单镜头连续拍摄规则】", "【计划剪辑规则】")):
+            lines.append(video_structure_instruction(shot))
+        # Structured projects use a compact execution layer when the scene is
+        # available. Stable identity is carried by the actual reference bundle;
+        # the provider should see the current action and dialogue first. Keep the
+        # legacy raw-prompt path for callers that only have a standalone ShotPrompt.
+        if script is not None and bool(getattr(shot, "shot_id", None)):
+            structured_references = []
+            for path, label in zip(reference_paths, reference_labels or []):
+                raw = str(label or "")
+                lowered = raw.casefold()
+                if "character" in lowered or "角色" in raw:
+                    asset_type = "character"
+                elif "prop" in lowered or "道具" in raw:
+                    asset_type = "prop"
+                elif "scene" in lowered or "场景" in raw or "location" in lowered:
+                    asset_type = "scene"
+                else:
+                    asset_type = "reference"
+                structured_references.append({
+                    "asset_type": asset_type,
+                    "asset_id": raw,
+                    "label": raw,
+                    "image_path": path,
+                })
+            execution_context = build_execution_context(
+                shot=shot,
+                scene=scene,
+                valid_references=structured_references,
+            )
+            execution_prompt = render_execution_prompt(execution_context)
+            if execution_prompt:
+                lines.extend(["【执行提示词】", execution_prompt])
+            if execution_context.intentionally_omitted_sections:
+                lines.append(
+                    "【已由参考图承担】"
+                    + "；".join(execution_context.intentionally_omitted_sections)
+                    + "。"
+                )
+        else:
+            lines.extend(["【原始时间轴提示词】", shot_text])
 
         return " ".join(lines)
 

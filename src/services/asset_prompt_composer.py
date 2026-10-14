@@ -12,7 +12,7 @@ from typing import Any
 
 # Bump this whenever the canonical scene identity/state/view contract changes.
 # Existing versions remain readable, while newly generated assets are auditable.
-SCENE_PROMPT_TEMPLATE_VERSION = 10
+SCENE_PROMPT_TEMPLATE_VERSION = 11
 PROP_PROMPT_TEMPLATE_VERSION = 3
 
 
@@ -251,9 +251,41 @@ def _scene_scale_lock(location_name: str, identity_text: str, environment_text: 
         "书房", "教室", "会议室", "地下室", "地下通道", "医院", "急诊室", "候诊室", "后厨", "仓库", "车库", "电梯", "车厢", "实验室", "档案室",
     ))
     underground_entry = has_english_underground or _has_positive_term(source_text, (
-        "地下通道", "地下入口", "地下室入口", "铁门", "石阶", "门洞", "向下延伸",
-    ))
-    if explicitly_indoor and not explicitly_outdoor_identity:
+        "地下通道", "地下入口", "地下室入口", "地下室", "向下延伸",
+    )) or (
+        _has_positive_term(source_text, ("铁门",))
+        and _has_positive_term(source_text, ("地下", "向下"))
+    )
+    table_cues = ("石桌旁", "石桌区域")
+    path_cues = ("门外小路", "门前小路")
+    courtyard_cues = ("庭院", "院子", "院落")
+    gate_inside_cues = ("院门内侧", "门内侧")
+    gate_doorway_cues = ("院门口",)
+    gate_outside_cues = ("院门外", "宅门外")
+    # More specific courtyard fragments must win before the generic 院子/院门外
+    # tokens inside names such as 院子石桌旁 or 院门外小路.
+    if _has_positive_term(location_text, table_cues) or _has_positive_term(identity_source, table_cues):
+        spatial_scope = (
+            "庭院一角石桌石凳围合区域、桌面陈设与身后单面院墙，保留近景桌面和中景院墙关系，"
+            "不得改成整座院子、双侧门楼或厅堂全景"
+        )
+    elif _has_positive_term(location_text, path_cues) or _has_positive_term(identity_source, path_cues):
+        spatial_scope = (
+            "院墙之外的青石小路纵深、两侧外墙和远处缩小的院门，镜头位于门外沿路拍摄，"
+            "禁止拍成院内天井、内巷对门或正对门楼的中近景"
+        )
+    elif _has_positive_term(location_text, gate_inside_cues):
+        spatial_scope = "从院内望向院门的完整门体、门槛、青砖地面与两侧院墙，保留庭院纵深"
+    elif _has_positive_term(location_text, gate_doorway_cues):
+        spatial_scope = "院门外墙、半开双扇门体、门槛台阶与门前空地，镜头正对院门口"
+    elif _has_positive_term(location_text, gate_outside_cues):
+        spatial_scope = "院门外墙、闭合双扇门体、门槛台阶与门前空地纵深，镜头位于院外正对门楼"
+    elif _has_positive_term(location_text, courtyard_cues) or _has_positive_term(identity_source, courtyard_cues):
+        spatial_scope = (
+            "完整庭院边界、院墙、单侧一座双扇门体、石桌石凳等固定陈设和前中后景关系，"
+            "禁止左右两侧各设一座门楼"
+        )
+    elif explicitly_indoor and not explicitly_outdoor_identity:
         spatial_scope = "完整房间轮廓、墙体、门窗、家具和前中后景关系"
     elif explicitly_outdoor_identity:
         if underground_entry:
@@ -528,7 +560,11 @@ def build_scene_prompt_layers(
         state_label,
         *state_facts,
     ]
-    state_layer = _join([f"场景状态：{part}" for part in state_parts if str(part).strip()])
+    state_layer = _join([
+        f"场景状态：{part}"
+        for part in dict.fromkeys(str(item).strip() for item in state_parts)
+        if part
+    ])
     if not state_layer:
         state_layer = "场景状态：以剧本当前镜头的时间、天气、主光方向和可见临时状态为准。"
     scale_lock = _scene_scale_lock(

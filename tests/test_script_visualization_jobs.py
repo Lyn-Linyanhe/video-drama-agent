@@ -158,6 +158,46 @@ async def test_visual_task_accepts_persisted_signature_after_load_time_manifest_
 
 
 @pytest.mark.asyncio
+async def test_visual_task_passes_project_video_policy_to_prompt_agent(monkeypatch):
+    state = DramaState(
+        project_id="policy-project",
+        script=_script("policy"),
+        visual_stage="pending",
+        video_generation_policy={
+            "provider": "happyhorse",
+            "model": "happyhorse-1.1-r2v",
+            "resolution": "1080p",
+        },
+    )
+    visual = VisualDesign(overall_style="写实", color_palette="冷色", scenes=[])
+    prompts = GenerationPrompts(
+        api_provider="mock",
+        shots=[ShotPrompt(scene_id=1, prompt="prompt", duration_sec=5)],
+    )
+    captured = {}
+
+    async def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return visual, prompts
+
+    monkeypatch.setattr(jobs, "_load_project_state", lambda _project_id, **_kwargs: state)
+    monkeypatch.setattr(jobs, "_save_project_state", lambda _state: None)
+    monkeypatch.setattr(jobs.project_store, "set_visual_design", lambda *_args: None)
+    monkeypatch.setattr(jobs.project_store, "add_stage", lambda *_args: None)
+    monkeypatch.setattr(jobs.project_store, "update_status", lambda *_args: None)
+    monkeypatch.setattr(jobs, "_script_signature", lambda _script: "policy-signature")
+    monkeypatch.setattr(jobs.visual_prompt_agent, "run", fake_run)
+
+    result = await jobs._job_script_visualize(
+        _Context(state.project_id),
+        {"script_signature": "policy-signature"},
+    )
+
+    assert result["stale"] is False
+    assert captured["video_generation_policy"] == state.video_generation_policy
+
+
+@pytest.mark.asyncio
 async def test_canceled_visual_refresh_keeps_last_ready_prompt(monkeypatch):
     """Canceling a refresh must not invalidate the previous usable prompt set."""
     old_prompts = GenerationPrompts(
@@ -259,6 +299,8 @@ async def test_kimi_visual_prompt_generation_runs_scene_by_scene():
     assert len(agent.llm.calls) == 2
     assert [shot.scene_id for shot in prompts.shots] == [1, 2]
     assert [scene.scene_id for scene in visual.scenes] == [1, 2]
+    assert [plan.scene_id for plan in prompts.shot_plans] == [1, 2]
+    assert all(plan.units for plan in prompts.shot_plans)
     assert len(telemetry["requests"]) == 2
 
 

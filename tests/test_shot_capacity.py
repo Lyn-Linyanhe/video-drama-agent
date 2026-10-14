@@ -24,7 +24,10 @@ def test_capacity_diagnostic_warns_without_mutating_source():
     assert diagnostic.status == "warning"
     assert diagnostic.action_units >= 4
     assert diagnostic.dialogue_chars == len("快走，外面有人。")
+    # Overload may expand to the compact execution estimate, while remaining
+    # an advisory warning rather than a hard generation failure.
     assert diagnostic.suggested_shot_count >= 2
+    assert diagnostic.recommended_total_duration_sec >= diagnostic.required_total_duration_sec
     assert diagnostic.provider_max_duration_sec == 5
     assert scene.duration_sec == 5
     assert prompt.duration_sec == 5
@@ -66,3 +69,21 @@ def test_capacity_diagnostic_does_not_count_global_prompt_camera_noise():
     diagnostic = analyze_shot_capacity(scene, prompt)
     assert diagnostic.camera_changes == 1
     assert diagnostic.status == "clean"
+
+
+def test_capacity_recommendation_never_exceeds_provider_cap():
+    scene = _scene(duration=12, action="角色A缓慢站在窗边")
+    scene.dialogue = []
+    diagnostic = analyze_shot_capacity(scene, provider_max_duration_sec=10)
+
+    assert diagnostic.suggested_duration_sec <= 10
+    assert all(duration <= 10 for duration in diagnostic.recommended_durations_sec)
+
+
+def test_capacity_reports_unexecutable_provider_cap_below_three_seconds():
+    scene = _scene(duration=5, action="角色A站立")
+    scene.dialogue = []
+    diagnostic = analyze_shot_capacity(scene, provider_max_duration_sec=2)
+
+    assert diagnostic.status == "failed"
+    assert any("低于单镜头最小时长" in item for item in diagnostic.warnings)

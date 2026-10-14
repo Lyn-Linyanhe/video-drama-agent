@@ -63,7 +63,7 @@ def _job_hooks(context) -> GenerationHooks:
     )
 
 
-def _validate_video_job_target(context, scene_id: int) -> None:
+def _validate_video_job_target(context, scene_id: int, shot_id: str | None = None) -> None:
     """Bind a video payload to the persisted job target before provider work."""
     manager = getattr(context, "manager", None)
     store = getattr(manager, "store", None)
@@ -71,10 +71,23 @@ def _validate_video_job_target(context, scene_id: int) -> None:
     if not callable(getter):
         return
     job = getter(getattr(context, "job_id", "")) or {}
-    if job.get("target_type") != "shot" or not str(job.get("target_id") or "").strip():
+    target_type = str(job.get("target_type") or "")
+    target_id = str(job.get("target_id") or "").strip()
+    if target_type not in {"shot", "shot_unit"} or not target_id:
+        return
+    if target_type == "shot_unit":
+        payload = job.get("payload") or job.get("request") or {}
+        expected_shot_id = str(payload.get("shot_id") or shot_id or "").strip()
+        if not shot_id or target_id != shot_id or (expected_shot_id and expected_shot_id != shot_id):
+            raise ValueError("视频任务目标子镜头与请求子镜头不一致")
+        payload_scene_id = int(payload.get("scene_id") or scene_id)
+        if payload_scene_id != int(scene_id):
+            raise ValueError(
+                f"视频任务目标镜头与请求镜头不一致：任务目标为 {payload_scene_id}，请求为 {scene_id}"
+            )
         return
     try:
-        target_scene_id = int(job["target_id"])
+        target_scene_id = int(target_id)
     except (TypeError, ValueError) as exc:
         raise ValueError("视频任务持久化目标镜头编号无效") from exc
     if target_scene_id != int(scene_id):
@@ -747,6 +760,7 @@ async def _job_script_visualize(context, payload: dict) -> dict:
         _save_project_state(state)
         script = state.script.model_copy(deep=True)
         profile = state.creative_profile
+        video_generation_policy = dict(state.video_generation_policy or {})
         source_text = state.script_draft_text or (
             state.user_input if state.input_mode == "script" else ""
         )
@@ -760,6 +774,7 @@ async def _job_script_visualize(context, payload: dict) -> dict:
             telemetry=llm_metrics,
             progress_callback=context.progress,
             source_text=source_text,
+            video_generation_policy=video_generation_policy,
         )
     except asyncio.CancelledError:
         async with context.project_lock:
@@ -1045,22 +1060,44 @@ async def _job_scene_reference_edit(context, payload: dict) -> dict:
     return result
 
 
-async def _mark_video_job_stopped(project_id: str, scene_id: int, message: str) -> None:
+async def _mark_video_job_stopped(project_id: str, scene_id: int, message: str, shot_id: str | None = None) -> None:
     try:
         state = _load_project_state(project_id)
         production = _ensure_shot_production(state, scene_id)
-        if production.generation_status == "generating":
+        now = datetime.now().isoformat(timespec="seconds")
+        if shot_id:
+            production.generation_status_by_shot_id[shot_id] = "canceled"
+            production.generation_error_by_shot_id[shot_id] = str(message or "")
+            expected = {
+                str(item.shot_id) for item in _materialized_shot_prompts(state, scene_id)
+                if getattr(item, "shot_id", None)
+            }
+            active_child = any(status == "generating" for status in production.generation_status_by_shot_id.values())
+            completed = {
+                str(item.shot_id) for item in production.video_versions
+                if getattr(item, "shot_id", None) and item.success
+            }
+            if active_child:
+                production.generation_status = "generating"
+            elif expected and expected.issubset(completed):
+                production.generation_status = "success"
+            else:
+                production.generation_status = "partial_failed"
+            production.error_message = f"{shot_id}: {message}"
+            production.completed_at = now
+        elif production.generation_status == "generating":
             production.generation_status = "canceled"
             production.error_message = message
-            production.completed_at = datetime.now().isoformat(timespec="seconds")
-            _save_project_state(state)
+            production.completed_at = now
+        _save_project_state(state)
     except Exception:
         pass
 
 
 async def _job_video_generate(context, payload: dict) -> dict:
     scene_id = int(payload.get("scene_id") or 0)
-    _validate_video_job_target(context, scene_id)
+    shot_id = str(payload.get("shot_id") or "").strip() or None
+    _validate_video_job_target(context, scene_id, shot_id)
     context.progress("preparing", 0, 1, "正在准备分镜参考图")
     snapshot = payload.get("generation_snapshot") or {}
     async with context.project_lock:
@@ -1079,8 +1116,13 @@ async def _job_video_generate(context, payload: dict) -> dict:
         if not snapshot:
             await _prepare_auto_references(state)
             policy = normalize_video_policy(state.video_generation_policy, payload.get("video_policy") or production.video_override)
-            snapshot = _build_video_generation_snapshot(state, scene_id, policy)
+            snapshot = (
+                    _build_video_generation_snapshot(state, scene_id, policy, shot_id=shot_id)
+                    if shot_id else _build_video_generation_snapshot(state, scene_id, policy)
+                )
             production.last_generation_snapshot = snapshot
+            if shot_id:
+                production.generation_snapshots_by_shot_id[shot_id] = snapshot
             _save_project_state(state)
         else:
             if int(snapshot.get("scene_id") or 0) != scene_id:
@@ -1094,7 +1136,10 @@ async def _job_video_generate(context, payload: dict) -> dict:
                 # the current state.  Only the pending-reference marker is
                 # trusted from the queued request; otherwise a forged/old
                 # prepared_shot could survive the refresh.
-                snapshot = _build_video_generation_snapshot(state, scene_id, policy)
+                snapshot = (
+                    _build_video_generation_snapshot(state, scene_id, policy, shot_id=shot_id)
+                    if shot_id else _build_video_generation_snapshot(state, scene_id, policy)
+                )
                 snapshot["references_pending"] = False
                 refreshed_report = audit_generation_snapshot(state, snapshot, scene_id)
                 refreshed_detail = prompt_fidelity_gate_detail(refreshed_report)
@@ -1117,10 +1162,9 @@ async def _job_video_generate(context, payload: dict) -> dict:
         "scene_id": scene_id,
         "prompt": snapshot.get("provider_prompt") or snapshot.get("raw_prompt") or "",
         "negative_prompt": snapshot.get("provider_negative_prompt") or "",
-        "duration_sec": _shot_prompt(state, scene_id).duration_sec,
+        "duration_sec": _shot_prompt(state, scene_id, shot_id=shot_id).duration_sec,
     })
-    if policy.get("provider") == "seedance":
-        validate_video_duration(policy, prompt.duration_sec)
+    validate_video_duration(policy, prompt.duration_sec)
     effective_prompt = {
         "effective_prompt": snapshot.get("effective_prompt") or prompt.prompt,
         "effective_negative_prompt": snapshot.get("effective_negative_prompt") or prompt.negative_prompt,
@@ -1171,6 +1215,10 @@ async def _job_video_generate(context, payload: dict) -> dict:
             return {"scene_id": scene_id, "version_id": version_id, "already_saved": True}
         latest_production.generation_status = "generating"
         latest_production.error_message = ""
+        if shot_id:
+            latest_production.generation_status_by_shot_id[shot_id] = "generating"
+            latest_production.generation_error_by_shot_id.pop(shot_id, None)
+
         latest_production.started_at = datetime.now().isoformat(timespec="seconds")
         latest_production.completed_at = ""
         _save_project_state(latest)
@@ -1197,6 +1245,12 @@ async def _job_video_generate(context, payload: dict) -> dict:
                      generate_audio=bool(snapshot.get("native_audio_requested")),
                  )
             asset.api_used = policy["model"]
+            asset.shot_id = shot_id or getattr(prompt, "shot_id", None)
+            asset.parent_scene_id = scene_id
+            asset.shot_order = getattr(prompt, "shot_order", None)
+            asset.continuity_from_shot_id = getattr(prompt, "continuity_from_shot_id", None)
+            asset.beat_ids = list(getattr(prompt, "beat_ids", []) or [])
+            asset.dialogue_ids = list(getattr(prompt, "dialogue_ids", []) or [])
             context.check_cancelled()
             if not asset.success or not asset.local_path:
                 native_asr = None
@@ -1274,7 +1328,13 @@ async def _job_video_generate(context, payload: dict) -> dict:
                     version.tail_frame_path = provider_tail
                 extract_tail_frame(context.project_id, scene_id, version)
                 latest_production.video_versions.append(version)
-            latest_production.active_version_id = version_id
+            if shot_id:
+                latest_production.active_version_by_shot_id[shot_id] = version_id
+                latest_production.generation_status_by_shot_id[shot_id] = "success"
+                latest_production.generation_error_by_shot_id.pop(shot_id, None)
+                latest_production.generation_snapshots_by_shot_id[shot_id] = snapshot
+            else:
+                latest_production.active_version_id = version_id
             latest_production.generation_status = "success"
             latest_production.error_message = ""
             latest_production.completed_at = now
@@ -1299,10 +1359,15 @@ async def _job_video_generate(context, payload: dict) -> dict:
                     scene_audio.asr_changed_lines = list(native_asr.get("changed_lines") or [])
                     scene_audio.asr_error = str(native_asr.get("error") or "")
                     latest_audio.subtitle_correction_status = scene_audio.subtitle_correction_status
-            mark_dependents_stale(latest, scene_id, version_id)
+            if shot_id:
+                mark_dependents_stale(latest, scene_id, version_id, shot_id)
+            else:
+                # Preserve the three-argument legacy integration path.
+                mark_dependents_stale(latest, scene_id, version_id)
             _save_project_state(latest)
         return {
             "scene_id": scene_id,
+            "shot_id": shot_id or getattr(prompt, "shot_id", None),
             "version_id": version_id,
             "video_path": asset.local_path,
             "generation_snapshot": snapshot,
@@ -1310,9 +1375,9 @@ async def _job_video_generate(context, payload: dict) -> dict:
         }
     except (asyncio.CancelledError, BaseException) as exc:
         if isinstance(exc, asyncio.CancelledError) or context.cancel_event.is_set():
-            await asyncio.shield(_mark_video_job_stopped(context.project_id, scene_id, "任务已由用户终止"))
+            await asyncio.shield(_mark_video_job_stopped(context.project_id, scene_id, "任务已由用户终止", shot_id))
         else:
-            await _mark_video_job_stopped(context.project_id, scene_id, str(exc)[:300])
+            await _mark_video_job_stopped(context.project_id, scene_id, str(exc)[:300], shot_id)
         raise
 
 
@@ -1375,11 +1440,22 @@ async def _refresh_native_asr(state: DramaState) -> None:
         if not getattr(asset, "native_audio_enabled", False) or not asset.local_path:
             continue
         production = state.shot_productions.get(asset.scene_id)
+        versions = (production.video_versions if production else []) or []
+        shot_id = str(getattr(asset, "shot_id", "") or "")
+        active_id = (
+            str((getattr(production, "active_version_by_shot_id", {}) or {}).get(shot_id, "") or "")
+            if shot_id else str(getattr(production, "active_version_id", "") or "")
+        )
         active = next(
-            (item for item in (production.video_versions if production else [])
-             if item.version_id == (production.active_version_id if production else "")),
+            (item for item in versions if str(getattr(item, "version_id", "")) == active_id),
             None,
         )
+        if active is None and shot_id:
+            active = next(
+                (item for item in reversed(versions)
+                 if str(getattr(item, "shot_id", "") or "") == shot_id and item.success),
+                None,
+            )
         snapshot = active.generation_snapshot if active else {}
         result = await asyncio.to_thread(
             align_native_subtitles,
@@ -1841,32 +1917,69 @@ async def create_project_job(project_id: str, req: JobCreateRequest):
             raise HTTPException(409, detail=fidelity_detail)
         if _prompt_review_blocks_generation(state):
             raise HTTPException(409, "Kimi 审核发现确定性结构错误；请修复后重新审核再生成视频")
-        scene_id = int(req.payload.get("scene_id") or req.target_id or 0)
-        scenes = [scene_id] if scene_id else [scene.scene_id for scene in state.script.scenes]
+        requested_scene_id = int(req.payload.get("scene_id") or 0)
+        requested_shot_id = str(req.payload.get("shot_id") or "").strip() or None
+        scene_ids = [requested_scene_id] if requested_scene_id else [scene.scene_id for scene in state.script.scenes]
         skipped_video_shots: list[dict[str, object]] = []
-        for selected_scene_id in scenes:
+        for selected_scene_id in scene_ids:
             production = _ensure_shot_production(state, selected_scene_id)
             policy = normalize_video_policy(state.video_generation_policy, production.video_override)
-            if production.continuity_enabled and not policy["capability"].get("continuity"):
-                raise HTTPException(409, f"{policy['model']} 不支持首帧参考，无法生成连续镜头")
-            if scene_id or production.generation_status in {"idle", "failed", "canceled"} or not production.video_versions:
+            duration_cap_sec = _duration_cap_from_policy(policy)
+            duration_options = _duration_options_from_policy(policy)
+            prompts = (
+                [_shot_prompt(
+                    state,
+                    selected_scene_id,
+                    shot_id=requested_shot_id,
+                    duration_cap_sec=duration_cap_sec,
+                    duration_options=duration_options,
+                )]
+                if requested_shot_id
+                else (
+                    _materialized_shot_prompts(
+                        state,
+                        selected_scene_id,
+                        duration_cap_sec=duration_cap_sec,
+                        duration_options=duration_options,
+                    )
+                    or [_shot_prompt(state, selected_scene_id)]
+                )
+            )
+            for selected_prompt in prompts:
+                selected_shot_id = str(getattr(selected_prompt, "shot_id", "") or "").strip() or None
+                target_type = "shot_unit" if selected_shot_id else "shot"
+                target_id = selected_shot_id or str(selected_scene_id)
+                if selected_shot_id and any(item.shot_id == selected_shot_id and item.success for item in production.video_versions):
+                    continue
+                if not selected_shot_id and production.video_versions and not requested_scene_id:
+                    continue
+                if production.continuity_enabled and not policy["capability"].get("continuity"):
+                    raise HTTPException(409, f"{policy['model']} 不支持首帧参考，无法生成连续镜头")
+                if selected_prompt.duration_sec < 3:
+                    skipped_video_shots.append({"scene_id": selected_scene_id, "shot_id": selected_shot_id or "", "reason": "子镜头时长低于 3 秒"})
+                    continue
                 try:
-                    snapshot = _build_video_generation_snapshot(state, selected_scene_id, policy)
+                    snapshot = (
+                        _build_video_generation_snapshot(state, selected_scene_id, policy, shot_id=selected_shot_id)
+                        if selected_shot_id else _build_video_generation_snapshot(state, selected_scene_id, policy)
+                    )
                 except ValueError as exc:
-                    if scene_id:
+                    if requested_scene_id:
                         raise HTTPException(409, str(exc)) from exc
-                    skipped_video_shots.append({"scene_id": selected_scene_id, "reason": str(exc)})
+                    skipped_video_shots.append({"scene_id": selected_scene_id, "shot_id": selected_shot_id or "", "reason": str(exc)})
                     continue
                 if requires_reference_image(policy) and not snapshot["references"]:
                     snapshot["references_pending"] = True
                 production.last_generation_snapshot = snapshot
                 specs.append({
                     "job_type": "video.generate",
-                    "target_type": "shot",
-                    "target_id": str(selected_scene_id),
+                    "target_type": target_type,
+                    "target_id": target_id,
                     "provider": policy["provider"],
                     "payload": {
+                        **req.payload,
                         "scene_id": selected_scene_id,
+                        "shot_id": selected_shot_id,
                         "video_policy": {key: value for key, value in policy.items() if key != "capability"},
                         "generation_snapshot": snapshot,
                     },

@@ -384,3 +384,305 @@ def test_repair_keeps_negation_inside_quoted_line():
     scene = script.scenes[0]
     assert [d.line for d in scene.dialogue] == ["不是这样的。"]
     assert "不是这样的。" not in scene.action_description
+
+
+def test_repair_restores_source_only_dialogue_for_known_scene():
+    script = ScriptBreakdown(
+        title="t", genre="悬疑", logline="l", duration_sec=5, narration_style="无",
+        scenes=[_scene(
+            1,
+            characters=["苏眠"],
+            dialogue=[],
+            action_description="苏眠推门进来。",
+        )],
+    )
+    source_text = """《测试》
+1. 苏眠推门进来。
+对白：苏眠：别走。
+"""
+
+    ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+
+    assert [(line.character, line.line) for line in script.scenes[0].dialogue] == [
+        ("苏眠", "别走。"),
+    ]
+
+
+def test_source_dialogue_repair_ignores_prompt_placeholder_and_unknown_speaker():
+    script = ScriptBreakdown(
+        title="t", genre="悬疑", logline="l", duration_sec=5, narration_style="无",
+        scenes=[_scene(
+            1,
+            characters=["苏眠"],
+            dialogue=[],
+            action_description="苏眠推门进来。",
+        )],
+    )
+    source_text = """《测试》
+1. 苏眠推门进来。
+对白：PROMPT:
+未知人物：别走。
+"""
+
+    ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+
+    assert script.scenes[0].dialogue == []
+
+
+def test_source_dialogue_repair_does_not_duplicate_existing_line():
+    line = "别走。"
+    script = ScriptBreakdown(
+        title="t", genre="悬疑", logline="l", duration_sec=5, narration_style="无",
+        scenes=[_scene(
+            1,
+            characters=["苏眠"],
+            dialogue=[DialogueLine(character="苏眠", line=line)],
+            action_description="苏眠推门进来。",
+        )],
+    )
+    source_text = "《测试》\n1. 苏眠推门进来。\n对白：苏眠：别走。"
+
+    ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+
+    assert [(item.character, item.line) for item in script.scenes[0].dialogue] == [("苏眠", line)]
+
+
+def test_source_dialogue_repair_inserts_missing_line_at_its_source_order():
+    existing = "吉姆，亲爱的，别那样盯着我。"
+    missing = "求求上帝，让他觉得我还是漂亮的吧。"
+    script = ScriptBreakdown(
+        title="t", genre="剧情", logline="l", duration_sec=5, narration_style="无",
+        scenes=[_scene(
+            1,
+            characters=["德拉"],
+            dialogue=[DialogueLine(character="德拉", line=existing)],
+            action_description="德拉站起向吉姆解释。",
+        )],
+    )
+    source_text = (
+        "《测试》\n1. 德拉站起向吉姆解释。\n"
+        f"对白：德拉：{missing} / 德拉：{existing}"
+    )
+
+    ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+
+    assert [item.line for item in script.scenes[0].dialogue] == [missing, existing]
+
+
+def test_source_dialogue_repair_preserves_duplicate_source_lines():
+    script = ScriptBreakdown(
+        title="t", genre="剧情", logline="l", duration_sec=5, narration_style="无",
+        scenes=[_scene(
+            1,
+            characters=["苏眠"],
+            dialogue=[],
+            action_description="苏眠站在门口。",
+        )],
+    )
+    source_text = "《测试》\n1. 苏眠站在门口。\n对白：苏眠：重复。 / 苏眠：重复。"
+
+    ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+
+    assert [(item.character, item.line, item.order) for item in script.scenes[0].dialogue] == [
+        ("苏眠", "重复。", 1),
+        ("苏眠", "重复。", 2),
+    ]
+
+
+def test_source_dialogue_repair_reorders_existing_lines_to_source_order():
+    first = "第一句。"
+    second = "第二句。"
+    third = "第三句。"
+    script = ScriptBreakdown(
+        title="t", genre="剧情", logline="l", duration_sec=5, narration_style="无",
+        scenes=[_scene(
+            1,
+            characters=["苏眠"],
+            dialogue=[
+                DialogueLine(character="苏眠", line=third),
+                DialogueLine(character="苏眠", line=first),
+            ],
+            action_description="苏眠站在门口。",
+        )],
+    )
+    source_text = (
+        "《测试》\n1. 苏眠站在门口。\n"
+        f"对白：苏眠：{first} / 苏眠：{second} / 苏眠：{third}"
+    )
+
+    ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+
+    assert [item.line for item in script.scenes[0].dialogue] == [first, second, third]
+    assert [item.order for item in script.scenes[0].dialogue] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_analyze_existing_script_restores_source_dialogue_before_manifest_build():
+    class FakeLLM:
+        provider = "deepseek"
+
+        async def generate_structured(self, **kwargs):
+            return kwargs["output_schema"](
+                title="测试",
+                genre="剧情",
+                logline="测试",
+                duration_sec=5,
+                narration_style="无",
+                scenes=[
+                    Scene(
+                        scene_id=1,
+                        duration_sec=5,
+                        location="室内",
+                        characters=["德拉"],
+                        dialogue=[DialogueLine(character="德拉", line="吉姆，亲爱的。")],
+                        action_description="德拉站在门口。",
+                        camera_direction="中景",
+                        emotion_tone="紧张",
+                    ),
+                ],
+            )
+
+    source_text = (
+        "《测试》\n1. 德拉站在门口。\n"
+        "对白：德拉：求求上帝，让他觉得我还是漂亮的吧。 / 德拉：吉姆，亲爱的。"
+    )
+    agent = ScriptAgent()
+    agent.llm = FakeLLM()
+
+    result = await agent.analyze_existing_script(source_text)
+
+    assert [item.line for item in result.scenes[0].dialogue] == [
+        "求求上帝，让他觉得我还是漂亮的吧。",
+        "吉姆，亲爱的。",
+    ]
+    assert [item.order for item in result.scenes[0].dialogue] == [1, 2]
+    assert result.asset_manifest is not None
+
+
+
+def test_source_dialogue_repair_moves_misassigned_lines_back_to_their_numbered_source_scene():
+    first = "你要买我的头发吗？"
+    second = "我买头发。揭掉帽子，让我看看发样。"
+    third = "二十美元。"
+    fourth = "快给我钱。"
+    script = ScriptBreakdown(
+        title="t", genre="剧情", logline="l", duration_sec=10, narration_style="无",
+        scenes=[
+            _scene(
+                1,
+                characters=["德拉"],
+                dialogue=[
+                    DialogueLine(character="德拉", line=first),
+                    DialogueLine(character="德拉", line=fourth),
+                ],
+                action_description="德拉停在头发店门口。",
+            ),
+            _scene(
+                2,
+                characters=["德拉", "索弗罗妮夫人"],
+                dialogue=[
+                    DialogueLine(character="德拉", line=first),
+                    DialogueLine(character="索弗罗妮夫人", line=second),
+                    DialogueLine(character="索弗罗妮夫人", line=third),
+                    DialogueLine(character="德拉", line=fourth),
+                ],
+                action_description="两人后来在珠宝柜台前。",
+            ),
+        ],
+    )
+    source_text = (
+        "《测试》\n"
+        "1. 德拉在头发店与索弗罗妮夫人交谈。\n"
+        f"对白：德拉：{first} / 索弗罗妮夫人：{second} / "
+        f"索弗罗妮夫人：{third} / 德拉：{fourth}\n"
+        "2. 德拉离开头发店。"
+    )
+
+    ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+
+    assert script.scenes[0].characters == ["德拉", "索弗罗妮夫人"]
+    assert [(item.character, item.line, item.order) for item in script.scenes[0].dialogue] == [
+        ("德拉", first, 1),
+        ("索弗罗妮夫人", second, 2),
+        ("索弗罗妮夫人", third, 3),
+        ("德拉", fourth, 4),
+    ]
+    assert script.scenes[1].dialogue == []
+
+
+@pytest.mark.asyncio
+async def test_numbered_source_scene_omission_retries_before_returning_a_partial_parse():
+    calls = []
+
+    def parsed_scene(scene_id: int) -> Scene:
+        return Scene(
+            scene_id=scene_id,
+            duration_sec=5,
+            location=f"房间{scene_id}",
+            characters=["苏眠"],
+            action_description=f"苏眠完成第{scene_id}个动作。",
+            camera_direction="中景",
+            emotion_tone="紧张",
+        )
+
+    class FakeLLM:
+        provider = "deepseek"
+
+        async def generate_structured(self, **kwargs):
+            calls.append(kwargs["user_prompt"])
+            scenes = [parsed_scene(1)] if len(calls) == 1 else [parsed_scene(1), parsed_scene(2)]
+            return kwargs["output_schema"](
+                title="测试",
+                genre="剧情",
+                logline="测试",
+                duration_sec=5 * len(scenes),
+                narration_style="无",
+                scenes=scenes,
+            )
+
+    agent = ScriptAgent()
+    agent.llm = FakeLLM()
+
+    result = await agent.analyze_existing_script("《测试》\n1. 苏眠站在门口。\n2. 苏眠走进房间。")
+
+    assert len(calls) == 2
+    assert [scene.scene_id for scene in result.scenes] == [1, 2]
+    assert "不得遗漏、合并或跳过" in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_numbered_source_scene_omission_fails_instead_of_silently_returning_partial_parse():
+    calls = 0
+
+    class FakeLLM:
+        provider = "deepseek"
+
+        async def generate_structured(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return kwargs["output_schema"](
+                title="测试",
+                genre="剧情",
+                logline="测试",
+                duration_sec=5,
+                narration_style="无",
+                scenes=[
+                    Scene(
+                        scene_id=1,
+                        duration_sec=5,
+                        location="门口",
+                        characters=["苏眠"],
+                        action_description="苏眠站在门口。",
+                        camera_direction="中景",
+                        emotion_tone="紧张",
+                    ),
+                ],
+            )
+
+    agent = ScriptAgent()
+    agent.llm = FakeLLM()
+
+    with pytest.raises(ValueError, match="遗漏原始编号场景"):
+        await agent.analyze_existing_script("《测试》\n1. 苏眠站在门口。\n2. 苏眠走进房间。")
+
+    assert calls == 2

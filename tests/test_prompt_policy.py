@@ -1,3 +1,4 @@
+import pytest
 import json
 import asyncio
 import re
@@ -2692,7 +2693,7 @@ def test_authored_timeline_rebalances_dense_segments_to_exact_total():
     assert round(sum(duration for duration, _ in result), 1) == 2.0
 
 
-def test_provider_prompt_can_use_provider_duration_cap_without_changing_shot_duration():
+def test_provider_prompt_rejects_provider_duration_cap_mismatch_before_render():
     script = ScriptBreakdown(
         title="test",
         genre="test",
@@ -2713,13 +2714,13 @@ def test_provider_prompt_can_use_provider_duration_cap_without_changing_shot_dur
     )
     shot = ShotPrompt(scene_id=1, prompt="甲整理桌面，再打开盒子。", duration_sec=20)
 
-    rendered = build_timed_shot_prompt(shot, script, duration_cap_sec=15)
+    with pytest.raises(ValueError, match="exceeds provider duration cap"):
+        build_timed_shot_prompt(shot, script, duration_cap_sec=15)
 
-    assert "总时长约15s" in rendered
     assert shot.duration_sec == 20
 
 
-def test_finalized_prompt_applies_provider_duration_cap():
+def test_finalized_prompt_rejects_provider_duration_cap_mismatch():
     script = ScriptBreakdown(
         title="test",
         genre="test",
@@ -2745,15 +2746,12 @@ def test_finalized_prompt_applies_provider_duration_cap():
         "【连续锁定】"
     )
 
-    rendered = build_timed_shot_prompt(
-        ShotPrompt(scene_id=1, prompt=prompt, duration_sec=20),
-        script,
-        duration_cap_sec=15,
-    )
-
-    assert "总时长约15s" in rendered
-    assert "总时长约20s" not in rendered
-    assert "7.5s" in rendered
+    with pytest.raises(ValueError, match="exceeds provider duration cap"):
+        build_timed_shot_prompt(
+            ShotPrompt(scene_id=1, prompt=prompt, duration_sec=20),
+            script,
+            duration_cap_sec=15,
+        )
 
 
 def test_authored_timeline_accepts_period_delimited_segments():
@@ -2846,7 +2844,7 @@ def test_complex_authored_timeline_keeps_every_authored_action_beat():
     assert "甲读完信后哭泣" in rendered
 
 
-def test_provider_duration_cap_rewrites_range_timeline_endpoints():
+def test_provider_duration_cap_rejects_range_timeline_mismatch():
     script = ScriptBreakdown(
         title="test",
         genre="test",
@@ -2870,19 +2868,15 @@ def test_provider_duration_cap_rewrites_range_timeline_endpoints():
         "0s-10s，甲整理桌面。\n10s-20s，甲打开盒子。\n【连续锁定】"
     )
 
-    rendered = build_timed_shot_prompt(
-        ShotPrompt(scene_id=1, prompt=prompt, duration_sec=20),
-        script,
-        duration_cap_sec=15,
-    )
-
-    assert "总时长约15s" in rendered
-    assert "0s-7.5s" in rendered
-    assert "7.5s-15s" in rendered
-    assert "20s" not in rendered
+    with pytest.raises(ValueError, match="exceeds provider duration cap"):
+        build_timed_shot_prompt(
+            ShotPrompt(scene_id=1, prompt=prompt, duration_sec=20),
+            script,
+            duration_cap_sec=15,
+        )
 
 
-def test_provider_cap_for_kling_uses_ten_second_prompt_limit():
+def test_provider_cap_for_kling_rejects_over_cap_prompt_instead_of_truncating():
     script = ScriptBreakdown(
         title="test",
         genre="test",
@@ -2908,12 +2902,30 @@ def test_provider_cap_for_kling_uses_ten_second_prompt_limit():
 
     agent = VideoGenerationAgent.__new__(VideoGenerationAgent)
     agent.api_client = _Kling()
-    prepared, _ = agent.prepare_shot_request(
-        shot,
-        generation_prompts=GenerationPrompts(api_provider="kling", shots=[shot]),
-        prompt_policy=PromptPolicy(),
-        script=script,
-    )
+    with pytest.raises(ValueError, match=r"15.*10|10"):
+        agent.prepare_shot_request(
+            shot,
+            generation_prompts=GenerationPrompts(api_provider="kling", shots=[shot]),
+            prompt_policy=PromptPolicy(),
+            script=script,
+        )
 
-    assert "总时长约10s" in prepared.prompt
-    assert prepared.duration_sec == 10
+
+def test_provider_prompt_strips_capacity_diagnostics_without_mutating_storyboard():
+    shot = ShotPrompt(
+        scene_id=1,
+        duration_sec=5,
+        prompt=(
+            "【动作时间轴】0-5s 甲拿起信。\n"
+            "【时间容量诊断】预计完整执行需要约9s，但场景只有5s。\n"
+            "【对白】甲：\n“我回来了。”"
+        ),
+    )
+    prompts = GenerationPrompts(api_provider="happyhorse", shots=[shot])
+
+    result = compose_video_prompt("happyhorse", prompts, shot)
+
+    assert "【时间容量诊断】" not in result["provider_prompt"]
+    assert "甲拿起信" in result["provider_prompt"]
+    assert "我回来了" in result["provider_prompt"]
+    assert "【时间容量诊断】" in shot.prompt

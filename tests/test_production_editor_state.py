@@ -167,3 +167,29 @@ def test_mention_picker_merges_catalog_and_current_manual_references():
     assert "const merged = new Map()" in source
     assert "current.forEach(item" in source
     assert "explicit @ mentions survive reloads" in source
+
+def test_reference_removal_persists_automatic_exclusion_in_editor_payload():
+    source = Path("web/js/pages/production-actions.js").read_text(encoding="utf-8")
+
+    assert "excluded_automatic_reference_ids" in source
+    assert "reference.source === 'asset'" in source
+    assert "productionRemoveReference(index)" in source
+    assert "current.production.excluded_automatic_reference_ids" in source
+
+
+def test_expanded_secondary_timeline_cannot_expand_workspace_grid():
+    import re
+
+    css = Path("web/css/production.css").read_text(encoding="utf-8")
+    workspace_rules = re.findall(r"#shot-production-workspace\s*\{([^}]+)\}", css)
+    assert "grid-template-columns: minmax(0, 1fr);" in workspace_rules[-1]
+    assert "min-width: 0;" in workspace_rules[-1]
+    secondary = re.search(r"\.production-secondary-section\s*\{([^}]+)\}", css)
+    assert secondary is not None
+    assert "min-width: 0;" in secondary.group(1)
+    assert "max-width: 100%;" in secondary.group(1)
+    timeline = re.search(r"\.production-timeline-section \.production-timeline\s*\{([^}]+)\}", css)
+    assert timeline is not None
+    assert "overflow-x: auto;" in timeline.group(1)
+    assert "overflow-y: hidden;" in timeline.group(1)
+

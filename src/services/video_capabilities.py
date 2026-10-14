@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from fastapi import HTTPException
@@ -63,7 +64,9 @@ VIDEO_CAPABILITIES: dict[str, dict[str, Any]] = {
             "text_to_video": False, "image_to_video": True, "multi_reference": False,
             "continuity": True, "max_reference_images": 1,
             "reference_modes": ["first_frame"],
-            "resolutions": ["720p", "1080p"], "durations": [3, 5, 10, 15],
+            "resolutions": ["720p", "1080p"],
+            "duration_min": 4, "duration_max": 15,
+            "durations": [], "discrete_durations": False,
             "cost_tier": "economy",
             "supports_native_audio": True,
             "supports_native_dialogue": True,
@@ -74,7 +77,9 @@ VIDEO_CAPABILITIES: dict[str, dict[str, Any]] = {
             "text_to_video": False, "image_to_video": True, "multi_reference": True,
             "continuity": True, "max_reference_images": 9,
             "reference_modes": ["multi_reference"],
-            "resolutions": ["720p", "1080p"], "durations": [3, 5, 10, 15],
+            "resolutions": ["720p", "1080p"],
+            "duration_min": 4, "duration_max": 15,
+            "durations": [], "discrete_durations": False,
             "cost_tier": "balanced",
             "supports_native_audio": True,
             "supports_native_dialogue": True,
@@ -192,6 +197,48 @@ def _normalize_provider(provider: str) -> str:
     return "seedance" if provider == "seedence" else provider
 
 
+def parse_integral_duration(value: object, *, field_name: str = "duration_sec") -> int:
+    """Parse an executable duration without silently rounding fractional input."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer number of seconds; received {value!r}")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a number; received {value!r}") from exc
+    if not math.isfinite(numeric) or abs(numeric - round(numeric)) > 1e-6:
+        raise ValueError(
+            f"{field_name} must be an integer number of seconds; received {value!r}"
+        )
+    return int(round(numeric))
+
+
+def duration_options_from_capability(capability: dict | None) -> list[int]:
+    """Return the provider's discrete executable durations, if declared.
+
+    A ``duration_min``/``duration_max`` range is intentionally not converted to
+    a list here: models such as Seedance accept every integer in that range.
+    Only capabilities explicitly marked ``discrete_durations`` expose a
+    finite set that the planner and final request validator must honor.
+    """
+    data = dict(capability or {})
+    if not data.get("discrete_durations"):
+        return []
+    values: list[int] = []
+    for value in data.get("durations") or []:
+        try:
+            parsed = parse_integral_duration(value, field_name="duration option")
+        except ValueError:
+            continue
+        if parsed >= 1 and parsed not in values:
+            values.append(parsed)
+    return sorted(values)
+
+
+def duration_options_for_policy(policy: dict | None) -> list[int]:
+    """Return finite duration choices for a normalized or raw policy."""
+    return duration_options_from_capability((policy or {}).get("capability") or {})
+
+
 def default_video_policy() -> dict[str, Any]:
     import src.config as config
 
@@ -266,9 +313,9 @@ def requires_reference_image(policy: dict[str, Any]) -> bool:
 def validate_video_duration(policy: dict[str, Any], duration_sec: int | float) -> int:
     """Validate a shot duration against the selected provider capability."""
     try:
-        duration = int(round(float(duration_sec)))
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(422, "duration_sec must be a number") from exc
+        duration = parse_integral_duration(duration_sec)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     capability = policy.get("capability") or {}
     minimum = int(capability.get("duration_min", 3))
     maximum = int(capability.get("duration_max", 15))
@@ -277,6 +324,14 @@ def validate_video_duration(policy: dict[str, Any], duration_sec: int | float) -
         raise HTTPException(
             422,
             f"{model} supports duration {minimum}-{maximum} seconds; received {duration}",
+        )
+    supported = duration_options_from_capability(capability)
+    if supported and duration not in supported:
+        model = policy.get("model") or "selected model"
+        choices = "、".join(str(item) for item in supported)
+        raise HTTPException(
+            422,
+            f"{model} 仅支持 {choices} 秒时长；收到 {duration} 秒",
         )
     return duration
 

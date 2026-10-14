@@ -25,6 +25,11 @@ import httpx
 from .base import VideoAPIClient, VideoGenResult
 from src.config import OUTPUT_DIR
 from src.services.generation_hooks import get_generation_hooks
+from src.services.video_capabilities import (
+    VIDEO_CAPABILITIES,
+    duration_options_from_capability,
+    parse_integral_duration,
+)
 
 # ============================================================
 # Polling config
@@ -125,8 +130,10 @@ class HappyHorseVideoClient(VideoAPIClient):
             reference_paths = reference_paths[:9]
             image_data_uris = [self._encode_image_to_data_uri(p) for p in reference_paths]
 
-            # Clamp duration: Happy Horse supports 3-15 seconds
-            duration = max(3, min(duration_sec, 15))
+            # Validate before any provider call. Silent clamping would make a
+            # prompt planned for a longer shot look successful while the model
+            # actually receives a shorter request and drops story content.
+            duration = self._validate_duration(duration_sec)
 
             # 1. Submit task
             task_id = await self._submit_task(
@@ -219,6 +226,25 @@ class HappyHorseVideoClient(VideoAPIClient):
             query  = "/api/v1/tasks"
         return create, query
 
+    def _validate_duration(self, value) -> int:
+        try:
+            duration = parse_integral_duration(value, field_name="Happy Horse duration")
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if duration < 4 or duration > 15:
+            raise ValueError(
+                f"Happy Horse supports duration 4-15 seconds; received {duration}"
+            )
+        capability = VIDEO_CAPABILITIES.get("happyhorse", {}).get("models", {}).get(self.model, {})
+        supported = duration_options_from_capability(capability)
+        if supported and duration not in supported:
+            choices = ", ".join(str(item) for item in supported)
+            raise ValueError(
+                f"Happy Horse only supports durations {choices} seconds; "
+                f"received {duration}"
+            )
+        return duration
+
     async def _submit_task(
         self,
         prompt: str,
@@ -228,7 +254,7 @@ class HappyHorseVideoClient(VideoAPIClient):
         image_data_uris: list[str] | None = None,
     ) -> str:
         """Submit a generation task. Returns task_id."""
-        duration = max(3, min(duration, 15))
+        duration = self._validate_duration(duration)
         image_data_uris = image_data_uris or []
 
         if self._format == "wavespeed":

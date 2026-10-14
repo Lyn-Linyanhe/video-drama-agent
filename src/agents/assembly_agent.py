@@ -14,6 +14,57 @@ from src.services.audio_timeline import build_bgm_segments
 from src.utils.video import run_ffmpeg, run_ffmpeg_shell
 
 
+DEFAULT_SUBTITLE_STYLE = {
+    "font_name": "Microsoft YaHei",
+    # 34pt reads correctly at 1080p; 46pt overpowers the frame on wide shots.
+    "font_size": 34,
+    "primary_colour": "&H00FFFFFF",
+    "outline_colour": "&H00101010",
+    "outline": 2.4,
+    "shadow": 0.6,
+    "margin_v": 48,
+}
+
+
+def normalize_subtitle_style(style: dict | None) -> dict:
+    """Fill a subtitle style with defaults, ignoring blank/None overrides."""
+    resolved = dict(DEFAULT_SUBTITLE_STYLE)
+    for key, value in (style or {}).items():
+        if key not in DEFAULT_SUBTITLE_STYLE or value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        resolved[key] = value
+    return resolved
+
+
+def subtitle_force_style(style: dict | None) -> str:
+    """Render a libass force_style string from a resolved style dict."""
+    resolved = normalize_subtitle_style(style)
+    return (
+        f"FontName={resolved['font_name']},"
+        f"FontSize={resolved['font_size']},"
+        f"PrimaryColour={resolved['primary_colour']},"
+        f"OutlineColour={resolved['outline_colour']},"
+        f"BorderStyle=1,"
+        f"Outline={resolved['outline']},"
+        f"Shadow={resolved['shadow']},"
+        f"Alignment=2,"
+        f"MarginV={resolved['margin_v']}"
+    )
+
+
+def subtitle_filter(subtitle_path, style: dict | None = None) -> str:
+    """Build the `subtitles=` video filter, escaping the platform path.
+
+    Shared by full assembly and the standalone burn endpoint so the Windows
+    drive-letter escaping only has to be right in one place.
+    """
+    escaped = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
+    escaped = escaped.replace("'", r"\'")
+    return f"subtitles='{escaped}':force_style='{subtitle_force_style(style)}'"
+
+
 class AssemblyAgent:
     """Agent that assembles all generated assets into the final video.
 
@@ -40,6 +91,8 @@ class AssemblyAgent:
         subtitle_enabled: bool = True,
         subtitle_mode: str | None = None,
         audio_override: str = "",
+        generation_prompts=None,
+        subtitle_style: dict | None = None,
     ) -> str:
         """Assemble all assets into the final video file.
 
@@ -51,6 +104,18 @@ class AssemblyAgent:
         Returns:
             Path to the final assembled video file.
         """
+        if generation_prompts is not None:
+            expected_from_plan = [
+                str(unit.shot_id)
+                for plan in (getattr(generation_prompts, "shot_plans", []) or [])
+                for unit in (getattr(plan, "units", []) or [])
+                if getattr(unit, "shot_id", None)
+            ]
+            if expected_from_plan:
+                existing = list(getattr(assets, "expected_shot_ids", []) or [])
+                merged_expected = list(dict.fromkeys(existing + expected_from_plan))
+                assets = assets.model_copy(update={"expected_shot_ids": merged_expected})
+
         silent_dialogue = audio_override == "no_dialogue_confirmed"
         if silent_dialogue:
             subtitle_mode = "off"
@@ -99,16 +164,89 @@ class AssemblyAgent:
         # The FFmpeg path is the authoritative renderer for timeline offsets,
         # selected BGM/SFX, and subtitle timestamps.
         if audio and audio.timeline_version >= 1:
-            return await self._assemble_with_ffmpeg(script, assets, audio, output_path, output_dir, subtitle_enabled, subtitle_mode=subtitle_mode)
+            return await self._assemble_with_ffmpeg(script, assets, audio, output_path, output_dir, subtitle_enabled, subtitle_mode=subtitle_mode, subtitle_style=subtitle_style)
 
         try:
             return await self._assemble_with_moviepy(script, assets, audio, output_path, subtitle_enabled)
         except ImportError:
             # Fallback: simple FFmpeg concatenation
-            return await self._assemble_with_ffmpeg(script, assets, audio, output_path, output_dir, subtitle_enabled, subtitle_mode=subtitle_mode)
+            return await self._assemble_with_ffmpeg(script, assets, audio, output_path, output_dir, subtitle_enabled, subtitle_mode=subtitle_mode, subtitle_style=subtitle_style)
         except Exception as e:
             print(f"  ⚠️ MoviePy 合成失败: {e}, 尝试 FFmpeg 回退...")
-            return await self._assemble_with_ffmpeg(script, assets, audio, output_path, output_dir, subtitle_enabled, subtitle_mode=subtitle_mode)
+            return await self._assemble_with_ffmpeg(script, assets, audio, output_path, output_dir, subtitle_enabled, subtitle_mode=subtitle_mode, subtitle_style=subtitle_style)
+
+    @staticmethod
+    def _shot_order(asset) -> tuple[int, str]:
+        explicit_order = getattr(asset, "shot_order", None)
+        if explicit_order is not None:
+            try:
+                return (int(explicit_order), str(getattr(asset, "shot_id", "") or ""))
+            except (TypeError, ValueError):
+                pass
+        # Legacy projects may not have persisted order yet.
+        shot_id = str(getattr(asset, "shot_id", "") or "")
+        match = __import__("re").search(r"(?:shot|unit)-(\d+)$", shot_id)
+        return (int(match.group(1)) if match else 10**9, shot_id)
+
+    def _expanded_video_clips(self, script: ScriptBreakdown, assets: GeneratedAssets):
+        """Expand child-shot assets into an ordered render list.
+
+        A scene can now own several executable ShotUnits.  Assembly must not
+        collapse them into one ``scene_id`` map: doing so silently discards all
+        but the last child.  The returned synthetic scene ids are render-only;
+        the third tuple element retains the original scene id for audio/timeline
+        binding.
+        """
+        expected = {str(item) for item in (getattr(assets, "expected_shot_ids", []) or []) if str(item)}
+        expanded = []
+        for source_scene in script.scenes:
+            scene_expected = {
+                shot_id for shot_id in expected
+                if shot_id.startswith(f"scene-{source_scene.scene_id}-")
+            }
+            candidates = [
+                asset for asset in (assets.shots or [])
+                if int(getattr(asset, "scene_id", 0) or 0) == int(source_scene.scene_id)
+            ]
+            child_candidates = [asset for asset in candidates if getattr(asset, "shot_id", None)]
+            if child_candidates or scene_expected:
+                # Repeated ids are retained generations of one executable
+                # unit. Last-write-wins matches the active version persisted
+                # by the production state and prevents duplicate rendering.
+                latest_by_shot: dict[str, object] = {}
+                for asset in child_candidates:
+                    shot_id = str(asset.shot_id)
+                    usable = bool(asset.success and asset.local_path and os.path.exists(asset.local_path))
+                    if usable or shot_id not in latest_by_shot:
+                        latest_by_shot[shot_id] = asset
+                child_candidates = list(latest_by_shot.values())
+                successful_ids = {
+                    str(asset.shot_id) for asset in child_candidates
+                    if asset.success and asset.local_path and os.path.exists(asset.local_path)
+                }
+                if scene_expected:
+                    missing = sorted(scene_expected - successful_ids)
+                    if missing:
+                        raise ValueError("子镜头未完成：" + "、".join(missing))
+                failed = [
+                    str(asset.shot_id) for asset in child_candidates
+                    if not asset.success or not asset.local_path or not os.path.exists(asset.local_path)
+                ]
+                if failed:
+                    raise ValueError("子镜头未完成：" + "、".join(sorted(set(failed))))
+                candidates = [asset for asset in child_candidates if asset.success and asset.local_path and os.path.exists(asset.local_path)]
+                candidates.sort(key=self._shot_order)
+            else:
+                candidates = [asset for asset in candidates if asset.success and asset.local_path and os.path.exists(asset.local_path)]
+            for order, asset in enumerate(candidates, start=1):
+                render_scene_id = int(source_scene.scene_id) * 1000 + order
+                render_scene = source_scene.model_copy(update={
+                    "scene_id": render_scene_id,
+                    "transition_from_prev": source_scene.transition_from_prev if order == 1 else "cut",
+                    "transition_duration_sec": source_scene.transition_duration_sec if order == 1 else 0.25,
+                })
+                expanded.append((render_scene, asset, int(source_scene.scene_id)))
+        return expanded
 
     async def _assemble_with_moviepy(
         self,
@@ -122,33 +260,20 @@ class AssemblyAgent:
         from moviepy import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip, concatenate_videoclips
         from moviepy.video.fx import CrossFadeIn, CrossFadeOut
 
-        asset_map = {a.scene_id: a for a in assets.shots}
+        expanded = self._expanded_video_clips(script, assets)
         audio_map = {a.scene_id: a for a in (audio.scenes if audio else [])}
 
         clips = []
-        for i, scene in enumerate(script.scenes):
-            asset = asset_map.get(scene.scene_id)
-            if asset is None or not asset.success or not asset.local_path:
-                # Show a subtle transition card instead of raw black screen
-                print(f"  ⚠️  场景 {scene.scene_id} 无视频，使用过渡画面")
-                clip = self._create_text_clip(
-                    f"{scene.location}\n{scene.emotion_tone}",
-                    duration=scene.duration_sec,
-                )
-            else:
-                try:
-                    clip = VideoFileClip(asset.local_path)
-                    # Trim if longer than target, keep as-is if shorter
-                    if clip.duration > scene.duration_sec:
-                        clip = clip.subclipped(0, scene.duration_sec)
-                except Exception as e:
-                    print(f"  ⚠️ 无法加载 {asset.local_path}: {e}")
-                    clip = self._create_text_clip(
-                        f"[场景 {scene.scene_id}]\n{scene.action_description}",
-                        duration=scene.duration_sec,
-                    )
+        for index, (scene, asset, parent_scene_id) in enumerate(expanded):
+            try:
+                clip = VideoFileClip(asset.local_path)
+                if clip.duration > scene.duration_sec:
+                    clip = clip.subclipped(0, scene.duration_sec)
+            except Exception as e:
+                print(f"  ⚠️ 无法加载 {asset.local_path}: {e}")
+                continue
 
-            scene_audio = audio_map.get(scene.scene_id)
+            scene_audio = audio_map.get(parent_scene_id)
             clip = self._attach_dialogue_audio(clip, scene_audio)
             if subtitle_enabled:
                 clip = self._add_scene_subtitles(clip, scene, scene_audio)
@@ -190,7 +315,7 @@ class AssemblyAgent:
                     print(f"  ⚠️ 字幕生成失败: {e}")
 
             # Add transition (crossfade) between scenes
-            if i > 0 and scene.transition_from_prev == "fade":
+            if index > 0 and scene.transition_from_prev == "fade":
                 clip = clip.with_effects([CrossFadeIn(0.3), CrossFadeOut(0.3)])
 
             clips.append(clip)
@@ -294,15 +419,19 @@ class AssemblyAgent:
         try:
             from moviepy import AudioFileClip, CompositeAudioClip, concatenate_audioclips
 
-            dialogue_clips = [AudioFileClip(track.audio_path) for track in tracks]
-            speech = concatenate_audioclips(dialogue_clips).with_volume_scaled(
+            dialogue_clips = []
+            for track in tracks:
+                audio_clip = AudioFileClip(track.audio_path)
+                start_ms = int(getattr(track, "start_ms", 0) or 0)
+                dialogue_clips.append(audio_clip.with_start(max(0.0, start_ms / 1000.0)))
+            speech = CompositeAudioClip(dialogue_clips).with_volume_scaled(
                 scene_audio.volume_mix.get("tts", 1.0)
             )
             if speech.duration > clip.duration:
                 # MoviePy holds the final frame for an extended clip, avoiding truncated dialogue.
                 clip = clip.with_duration(speech.duration)
             if clip.audio:
-                source = clip.audio.with_volume_scaled(scene_audio.volume_mix.get("sfx", 0.3))
+                source = clip.audio.with_volume_scaled(1.0)
                 return clip.with_audio(CompositeAudioClip([source, speech]))
             return clip.with_audio(speech)
         except Exception as exc:
@@ -366,15 +495,12 @@ class AssemblyAgent:
         output_dir: Path,
         subtitle_enabled: bool = True,
         subtitle_mode: str | None = None,
+        subtitle_style: dict | None = None,
     ) -> str:
         """Render video boundaries first, then place the project audio timeline."""
-        asset_map = {a.scene_id: a for a in assets.shots}
-
-        clips = [
-            (scene, asset_map.get(scene.scene_id)) for scene in script.scenes
-            if asset_map.get(scene.scene_id) and asset_map[scene.scene_id].success
-            and asset_map[scene.scene_id].local_path and os.path.exists(asset_map[scene.scene_id].local_path)
-        ]
+        expanded = self._expanded_video_clips(script, assets)
+        clips = [(scene, asset) for scene, asset, _parent_scene_id in expanded]
+        parent_by_render_id = {scene.scene_id: parent_id for scene, _asset, parent_id in expanded}
         if not clips:
             return self._create_empty_output(output_path)
 
@@ -388,10 +514,12 @@ class AssemblyAgent:
             )
             if result.returncode != 0 or not os.path.isfile(output_path):
                 raise RuntimeError(f"FFmpeg single-shot render failed: {result.stderr[-500:]}")
+            parent_id = parent_by_render_id[clips[0][0].scene_id]
             return self._mux_ffmpeg_audio_and_subtitles(
                 script, audio, output_path, output_dir, subtitle_enabled,
-                {clips[0][0].scene_id: 0}, subtitle_mode,
-                {clips[0][0].scene_id: int(max(0.1, self._media_duration(source_path) or clips[0][0].duration_sec) * 1000)},
+                {parent_id: 0}, subtitle_mode,
+                {parent_id: int(max(0.1, self._media_duration(source_path) or clips[0][0].duration_sec) * 1000)},
+                subtitle_style,
             )
 
         rendered_video, scene_starts = self._render_transition_video(clips, output_path, output_dir)
@@ -399,12 +527,23 @@ class AssemblyAgent:
             scene.scene_id: max(0.1, self._media_duration(asset.local_path) or float(asset.duration_sec or scene.duration_sec))
             for scene, asset in clips
         }
-        scene_durations = build_render_timeline(
-            [scene for scene, _ in clips], actual_durations,
-        ).scene_durations_ms
+        render_timeline = build_render_timeline([scene for scene, _ in clips], actual_durations)
+        parent_starts: dict[int, int] = {}
+        parent_ends: dict[int, int] = {}
+        for scene, _asset in clips:
+            parent_id = parent_by_render_id[scene.scene_id]
+            start = render_timeline.scene_starts_ms[scene.scene_id]
+            end = start + render_timeline.scene_durations_ms[scene.scene_id]
+            parent_starts.setdefault(parent_id, start)
+            parent_ends[parent_id] = max(parent_ends.get(parent_id, 0), end)
+        parent_durations = {
+            parent_id: max(1, parent_ends[parent_id] - parent_starts[parent_id])
+            for parent_id in parent_starts
+        }
         result_path = self._mux_ffmpeg_audio_and_subtitles(
             script, audio, rendered_video, output_dir, subtitle_enabled,
-            scene_starts, subtitle_mode, scene_durations,
+            {parent_id: parent_starts[parent_id] for parent_id in parent_starts},
+            subtitle_mode, parent_durations, subtitle_style,
         )
         if result_path != output_path:
             os.replace(result_path, output_path)
@@ -415,11 +554,9 @@ class AssemblyAgent:
         temp_path = str(output_dir / f"transitions_{uuid.uuid4().hex[:8]}.mp4")
         command = ["-y"]
         durations = []
-        source_audio = True
         for _, asset in clips:
             command.extend(["-i", asset.local_path])
             durations.append(max(0.1, self._media_duration(asset.local_path) or float(asset.duration_sec or 3)))
-            source_audio = source_audio and self._has_audio_stream(asset.local_path)
 
         timeline = build_render_timeline(
             [scene for scene, _ in clips],
@@ -427,18 +564,31 @@ class AssemblyAgent:
         )
 
         filters = []
+        clip_audio = [self._has_audio_stream(asset.local_path) for _, asset in clips]
         for index, duration in enumerate(durations):
             filters.append(f"[{index}:v]setpts=PTS-STARTPTS,format=yuv420p[v{index}]")
-            if source_audio:
-                fade = min(0.08, duration / 2)
+            fade = min(0.08, duration / 2)
+            if clip_audio[index]:
+                audio_source = f"[{index}:a]"
+            else:
+                # Keep the audio timeline present even when one provider clip
+                # has no native track; otherwise the old all-or-nothing gate
+                # silently discarded audio from every other child shot.
+                audio_source = f"anullsrc=r=44100:cl=stereo,atrim=duration={duration:.3f},"
+            if clip_audio[index]:
                 filters.append(
-                    f"[{index}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=0.22,"
+                    f"{audio_source}aformat=sample_rates=44100:channel_layouts=stereo,volume=0.22,"
+                    f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={duration-fade:.3f}:d={fade:.3f}[a{index}]"
+                )
+            else:
+                filters.append(
+                    f"{audio_source}asetpts=PTS-STARTPTS,volume=0.22,"
                     f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={duration-fade:.3f}:d={fade:.3f}[a{index}]"
                 )
 
         scene_starts = dict(timeline.scene_starts_ms)
         video_label = "v0"
-        audio_label = "a0" if source_audio else ""
+        audio_label = "a0"
         for index in range(1, len(clips)):
             scene, _ = clips[index]
             transition = str(getattr(scene, "transition_from_prev", "cut") or "cut").lower()
@@ -448,21 +598,17 @@ class AssemblyAgent:
                 effect = "fade" if transition == "fade" else "dissolve"
                 offset = scene_starts[scene.scene_id] / 1000.0
                 filters.append(f"[{video_label}][v{index}]xfade=transition={effect}:duration={duration:.3f}:offset={offset:.3f}[{next_video}]")
-                if source_audio:
-                    next_audio = f"ax{index}"
-                    filters.append(f"[{audio_label}][a{index}]acrossfade=d={duration:.3f}:c1=tri:c2=tri[{next_audio}]")
-                    audio_label = next_audio
+                next_audio = f"ax{index}"
+                filters.append(f"[{audio_label}][a{index}]acrossfade=d={duration:.3f}:c1=tri:c2=tri[{next_audio}]")
+                audio_label = next_audio
             else:
                 filters.append(f"[{video_label}][v{index}]concat=n=2:v=1:a=0[{next_video}]")
-                if source_audio:
-                    next_audio = f"ax{index}"
-                    filters.append(f"[{audio_label}][a{index}]concat=n=2:v=0:a=1[{next_audio}]")
-                    audio_label = next_audio
+                next_audio = f"ax{index}"
+                filters.append(f"[{audio_label}][a{index}]concat=n=2:v=0:a=1[{next_audio}]")
+                audio_label = next_audio
             video_label = next_video
 
-        command.extend(["-filter_complex", ";".join(filters), "-map", f"[{video_label}]"])
-        if source_audio:
-            command.extend(["-map", f"[{audio_label}]"])
+        command.extend(["-filter_complex", ";".join(filters), "-map", f"[{video_label}]", "-map", f"[{audio_label}]"])
         command.extend(["-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p", temp_path])
         result = run_ffmpeg(command, timeout=180)
         if result.returncode != 0 or not os.path.isfile(temp_path) or os.path.getsize(temp_path) == 0:
@@ -508,6 +654,7 @@ class AssemblyAgent:
         scene_starts: dict[int, int] | None = None,
         subtitle_mode: str | None = None,
         scene_durations: dict[int, int] | None = None,
+        subtitle_style: dict | None = None,
     ) -> str:
         """Apply real dialogue audio and optional SRT subtitles after concat fallback."""
         timeline = build_render_timeline(script.scenes) if scene_starts is None else None
@@ -663,13 +810,42 @@ class AssemblyAgent:
         else:
             command.extend(["-map", "0:a?"] if has_source_audio else ["-an"])
         if subtitle_path:
-            escaped = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
-            command.extend(["-vf", f"subtitles={escaped}"])
+            command.extend(["-vf", subtitle_filter(subtitle_path, subtitle_style)])
         command.extend(["-c:v", "libx264", "-c:a", "aac", temp_path])
         result = run_ffmpeg(command, timeout=180)
         if result.returncode != 0 or not os.path.isfile(temp_path) or os.path.getsize(temp_path) == 0:
             raise RuntimeError(f"FFmpeg audio/subtitle pass failed: {result.stderr[-500:]}")
         os.replace(temp_path, output_path)
+        return output_path
+
+    def burn_subtitles_into_video(
+        self,
+        video_path: str,
+        subtitle_path,
+        output_path: str,
+        subtitle_style: dict | None = None,
+    ) -> str:
+        """Burn an existing SRT onto an existing video without re-mixing audio.
+
+        Assembly only burns subtitles as a side effect of its full render, so
+        there was no way to caption a video that was already produced. This
+        keeps the audio streams untouched and always writes a new file.
+        """
+        if not os.path.isfile(video_path):
+            raise FileNotFoundError(f"video not found: {video_path}")
+        if not subtitle_path or not os.path.isfile(str(subtitle_path)):
+            raise FileNotFoundError(f"subtitle file not found: {subtitle_path}")
+        command = [
+            "-y", "-i", video_path,
+            "-vf", subtitle_filter(subtitle_path, subtitle_style),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-c:a", "copy", "-pix_fmt", "yuv420p",
+            output_path,
+        ]
+        result = run_ffmpeg(command, timeout=600)
+        if result.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError(f"FFmpeg subtitle burn failed: {result.stderr[-500:]}")
         return output_path
 
     @staticmethod
@@ -697,14 +873,94 @@ class AssemblyAgent:
         except Exception:
             return 0.0
 
-    def _write_subtitle_file(self, script, audio_by_scene, output_dir: Path, scene_starts: dict[int, int] | None = None, subtitle_mode: str = "dialogue") -> Path | None:
+    SUBTITLE_MODES = ("dialogue", "speaker", "narration", "all")
+
+    def _script_dialogue_entries(self, scene, scene_start: float, subtitle_mode: str, scene_duration: float | None = None):
+        """Time script dialogue across a scene's own window.
+
+        Used when a scene has native provider dialogue and therefore no
+        per-line audio tracks to measure against.
+        """
+        lines = [item for item in (getattr(scene, "dialogue", None) or []) if str(item.line or "").strip()]
+        if not lines:
+            return []
+        scene_duration = max(1.0, float(scene_duration or scene.duration_sec or 0.0))
+        slot = scene_duration / len(lines)
+        entries = []
+        for index, item in enumerate(lines):
+            text = f"{item.character}: {item.line}".strip(": ") if subtitle_mode == "speaker" else item.line.strip()
+            if subtitle_mode != "speaker" and self.is_voiceover_line(item):
+                text = f"{self.NARRATION_PREFIX}：{item.line}".strip()
+            start = scene_start + slot * index
+            entries.append((start, min(start + max(1.0, slot - 0.15), scene_start + scene_duration), text))
+        return entries
+
+    def measured_scene_durations(self, script, audio_by_scene) -> dict[int, float]:
+        """Measure each scene from its real active clips, in seconds.
+
+        `scene.duration_sec` is a planning estimate: a scene planned at 7s can
+        render as 12s once its child shots come back, so anything timed against
+        the estimate drifts and overlaps. Callers that burn onto an existing
+        file need the measured value instead.
+        """
+        durations: dict[int, float] = {}
+        for scene in script.scenes:
+            scene_audio = (audio_by_scene or {}).get(scene.scene_id)
+            # Native-dialogue scenes carry the rendered video path, TTS scenes
+            # carry an audio path; either gives a real length.
+            candidates = []
+            if scene_audio:
+                candidates.append(getattr(scene_audio, "native_audio_path", ""))
+                candidates.extend(getattr(scene_audio, "video_paths", None) or [])
+            measured = 0.0
+            for path in candidates:
+                if path and os.path.isfile(str(path)):
+                    measured = self._media_duration(str(path))
+                    if measured > 0:
+                        break
+            durations[scene.scene_id] = measured or float(scene.duration_sec or 0.1)
+        return durations
+
+    def _measure_scene_starts(self, script, audio_by_scene) -> dict[int, int]:
+        """Time each scene from the real active clip lengths, in milliseconds."""
+        durations = self.measured_scene_durations(script, audio_by_scene)
+        timeline = build_render_timeline(script.scenes, durations)
+        return dict(timeline.scene_starts_ms)
+
+    def _write_subtitle_file(self, script, audio_by_scene, output_dir: Path, scene_starts: dict[int, int] | None = None, subtitle_mode: str = "dialogue", narration_lines: dict[int, list] | None = None, scene_durations: dict[int, float] | None = None) -> Path | None:
+        """Write an SRT from script dialogue, optionally including narration.
+
+        Narration has no audio of its own in this pipeline, so it is emitted
+        from text alone and spread across the scene it belongs to.
+        `scene_durations` should carry measured lengths when the SRT must line
+        up with an already-rendered video.
+        """
+        include_dialogue = subtitle_mode in {"dialogue", "speaker", "all"}
+        include_narration = subtitle_mode in {"narration", "all"}
         if scene_starts is None:
             scene_starts = build_render_timeline(script.scenes).scene_starts_ms
+
+        def scene_length(scene) -> float:
+            measured = (scene_durations or {}).get(scene.scene_id)
+            # The script estimate can be several seconds short of the rendered
+            # scene, which is what makes subtitle slots overlap.
+            return max(1.0, float(measured or scene.duration_sec or 0.0))
+
         entries = []
         cursor = 0.0
         for scene in script.scenes:
             scene_start = (scene_starts.get(scene.scene_id, int(cursor * 1000)) / 1000)
             scene_audio = audio_by_scene.get(scene.scene_id)
+            if include_narration:
+                entries.extend(
+                    self._narration_entries(
+                        scene, (narration_lines or {}).get(scene.scene_id) or [],
+                        scene_start, scene_length(scene),
+                    )
+                )
+            if not include_dialogue:
+                cursor = max(cursor, scene_start + scene_length(scene))
+                continue
             if scene_audio and getattr(scene_audio, "asr_segments", None) and getattr(scene_audio, "subtitle_correction_status", "") in {"ready", "changed"}:
                 speaker_by_line = {
                     (line.line_id or f"{scene.scene_id}:{line.dialogue_index}"): line.character
@@ -723,22 +979,35 @@ class AssemblyAgent:
                         end = start + 0.3
                     entries.append((start, end, text))
                     cursor = max(cursor, end)
-                cursor = max(cursor, scene_start + float(scene.duration_sec))
+                cursor = max(cursor, scene_start + scene_length(scene))
                 continue
             tracks = (
                 [item for item in (scene_audio.dialogue_audios if scene_audio else []) if item.success]
                 if scene_audio and getattr(scene_audio, "native_audio_enabled", False)
                 else self._dialogue_tracks(scene_audio)
             )
+            if not tracks and getattr(scene, "dialogue", None):
+                # Provider-native dialogue is baked into the video and produces
+                # no dialogue_audios at all (unlike TTS lines). Without this the
+                # whole native-dialogue project writes an empty SRT.
+                entries.extend(self._script_dialogue_entries(scene, scene_start, subtitle_mode, scene_length(scene)))
+                cursor = max(cursor, scene_start + scene_length(scene))
+                continue
             for track in tracks:
                 duration = float(track.duration_sec or 0.0) or max(1.0, len(track.text) / 4)
-                text = (f"{track.character}: {track.text}".strip(": ")
-                        if subtitle_mode == "speaker" else track.text.strip())
+                if subtitle_mode == "speaker":
+                    text = f"{track.character}: {track.text}".strip(": ")
+                elif self.is_voiceover_line(track):
+                    # Off-screen lines read as narration, not as a second take of
+                    # the same line by a character who is visibly silent.
+                    text = f"{self.NARRATION_PREFIX}：{track.text}".strip()
+                else:
+                    text = track.text.strip()
                 start = scene_start + ((getattr(track, "start_ms", 0) or 0) / 1000)
                 if text:
                     entries.append((start, start + duration, text))
                 cursor = max(cursor, start + duration + (getattr(track, "tail_silence_ms", 0) / 1000))
-            cursor = max(cursor, scene_start + float(scene.duration_sec))
+            cursor = max(cursor, scene_start + scene_length(scene))
         if not entries:
             return None
         path = output_dir / f"subtitles_{uuid.uuid4().hex[:8]}.srt"
@@ -747,8 +1016,44 @@ class AssemblyAgent:
                 handle.write(f"{index}\n{self._srt_timestamp(start)} --> {self._srt_timestamp(end)}\n{text}\n\n")
         return path
 
-    @staticmethod
-    def _srt_timestamp(seconds: float) -> str:
+    NARRATION_PREFIX = "旁白"
+
+    VOICEOVER_MARKERS = ("画外音", "内心独白", "独白", "voiceover", "voice_over")
+
+    @classmethod
+    def is_voiceover_line(cls, track) -> bool:
+        """Detect a line the script marks as off-screen narration.
+
+        The storyboard tags these in the emotion field (e.g. 「内心独白（画外音）」).
+        They are currently burned as ordinary dialogue, which makes a character
+        look like they repeat a joke their inner voice just told.
+        """
+        emotion = str(getattr(track, "emotion", "") or "").lower()
+        return any(marker in emotion for marker in cls.VOICEOVER_MARKERS)
+
+    def _narration_entries(self, scene, lines, scene_start: float, scene_duration: float | None = None):
+        """Lay narration text into the scene's own window.
+
+        Narration has no recorded audio, so it is timed by splitting the scene
+        duration across its lines rather than measuring anything.
+        """
+        texts = []
+        for item in lines:
+            text = str(item or "").strip()
+            if text:
+                texts.append(text)
+        if not texts:
+            return []
+        scene_duration = max(1.0, float(scene_duration or scene.duration_sec or 0.0))
+        slot = scene_duration / len(texts)
+        entries = []
+        for index, text in enumerate(texts):
+            start = scene_start + slot * index
+            end = start + max(1.0, slot - 0.15)
+            entries.append((start, min(end, scene_start + scene_duration), f"{self.NARRATION_PREFIX}：{text}"))
+        return entries
+
+    def _srt_timestamp(self, seconds: float) -> str:
         total_ms = max(0, round(seconds * 1000))
         hours, remainder = divmod(total_ms, 3_600_000)
         minutes, remainder = divmod(remainder, 60_000)

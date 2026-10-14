@@ -103,6 +103,55 @@
   gap: 12px;
 }
 
+.audio-scope-note {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid #334155;
+  border-left: 3px solid #60a5fa;
+  border-radius: 5px;
+  background: #111827;
+  color: #dbeafe;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.audio-scope-note span { color: #a1a1aa; }
+.audio-dialogue-visual-track {
+  position: relative;
+  min-height: 58px;
+  overflow-x: auto;
+  padding: 8px 0;
+  border: 1px solid #303036;
+  border-radius: 5px;
+  background: repeating-linear-gradient(90deg, rgba(148, 163, 184, .07) 0, rgba(148, 163, 184, .07) 1px, transparent 1px, transparent 10%);
+}
+.audio-dialogue-visual-track::after {
+  content: '';
+  display: block;
+  min-width: 560px;
+  height: 40px;
+}
+.audio-dialogue-visual-clip {
+  position: absolute;
+  left: var(--clip-left);
+  top: 8px;
+  width: max(var(--clip-width), 44px);
+  min-width: 44px;
+  height: 40px;
+  padding: 4px 6px;
+  overflow: hidden;
+  border: 1px solid var(--clip-color, #60a5fa);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--clip-color, #60a5fa) 20%, #111827);
+  color: #f8fafc;
+  text-align: left;
+  cursor: pointer;
+}
+.audio-dialogue-visual-clip:hover, .audio-dialogue-visual-clip:focus-visible { z-index: 1; outline: 2px solid #f8fafc; outline-offset: 1px; }
+.audio-dialogue-visual-clip span, .audio-dialogue-visual-clip small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audio-dialogue-visual-clip span { font-size: 10px; font-weight: 650; }
+.audio-dialogue-visual-clip small { color: #cbd5e1; font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; }
+
 .audio-track-heading { justify-content: space-between; }
 .audio-track-heading h4,
 .audio-track-title strong,
@@ -201,6 +250,9 @@
 .subtitle-preview-row span:first-child { color: #71717a; font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .audio-native-note { color: #93c5fd; font-size: 11px; }
 .audio-asr-control { color: #a1a1aa; font-size: 11px; margin-left: 8px; }
+.audio-narration-block { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: end; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #27272a; background: #1c1c1f; }
+.audio-narration-block label { display: grid; gap: 4px; color: #a1a1aa; font-size: 11px; }
+.audio-narration-block textarea { width: 100%; resize: vertical; background: #131316; border: 1px solid #303036; border-radius: 4px; color: #e4e4e7; font: 11px/1.5 inherit; padding: 6px 8px; }
 
 @media (max-width: 1100px) {
   .audio-workspace-grid { grid-template-columns: minmax(0, 1fr); }

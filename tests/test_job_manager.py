@@ -225,3 +225,31 @@ async def test_manager_adds_job_provider_context_to_provider_timeout(tmp_path: P
     assert finished["error"]["category"] == "timeout"
     assert finished["error"]["provider"] == "seedance"
     assert finished["error"]["model"] == "doubao-seedance-2-0-fast-260128"
+
+@pytest.mark.asyncio
+async def test_video_retry_does_not_reuse_stale_generation_snapshot(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.sqlite3", recover=False)
+    manager = JobManager(store)
+    async def handler(_context, _payload):
+        return {}
+
+    manager.register("video.generate", handler)
+    # This test exercises the retry payload contract without running the handler.
+    old = store.create_job(
+        "a" * 12,
+        "video.generate",
+        target_type="shot_unit",
+        target_id="scene-7-shot-1",
+        request={
+            "scene_id": 7,
+            "shot_id": "scene-7-shot-1",
+            "generation_snapshot": {"source_prompt": "旧提示词", "effective_duration_sec": 5},
+        },
+        provider="happyhorse",
+    )
+    store.transition(old["job_id"], "running", "running", "开始旧任务")
+    store.transition(old["job_id"], "failed", "failed", "旧任务失败")
+    retried = manager.retry("a" * 12, old["job_id"])
+    assert retried["request"]["shot_id"] == "scene-7-shot-1"
+    assert "generation_snapshot" not in retried["request"]
+
