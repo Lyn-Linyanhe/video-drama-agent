@@ -68,6 +68,20 @@ function audioLineStatus(line) {
   return [line.error_message ? `失败：${line.error_message}` : '待生成', '#fbbf24'];
 }
 
+function audioDialogueVisualTrack(current, scene) {
+  const lines = scene.dialogue_audios || [];
+  const totalMs = Math.max(1, Number(current.scene.duration_sec || 3) * 1000);
+  if (!lines.length) return '<div class="audio-empty">暂无可视对白片段。</div>';
+  return `<div class="audio-dialogue-visual-track" role="list" aria-label="对白时间轨道">${lines.map(line => {
+    const start = Math.max(0, Number(line.start_ms || 0));
+    const end = Math.max(start + 120, Number(line.end_ms || start + (line.duration_sec || 0.8) * 1000));
+    const left = Math.max(0, Math.min(100, start / totalMs * 100));
+    const width = Math.max(4, Math.min(100 - left, (end - start) / totalMs * 100));
+    const [status, color] = audioLineStatus(line);
+    return `<button type="button" class="audio-dialogue-visual-clip" data-audio-visual-line="${escapeHtml(line.line_id)}" style="--clip-left:${left}%;--clip-width:${width}%;--clip-color:${color}" title="${escapeHtml(`${line.character || '旁白'} · ${(start / 1000).toFixed(2)}-${(end / 1000).toFixed(2)} 秒`)}" onclick="document.getElementById('audio-text-${escapeHtml(line.line_id)}')?.scrollIntoView({behavior:'smooth',block:'center'});document.getElementById('audio-text-${escapeHtml(line.line_id)}')?.focus({preventScroll:true})"><span>${escapeHtml(line.character || '旁白')}</span><small>${(start / 1000).toFixed(1)}s</small></button>`;
+  }).join('')}</div>`;
+}
+
 function audioLineRows(current, scene) {
   const lines = scene.dialogue_audios || [];
   const totalMs = Math.max(1, Number(current.scene.duration_sec || 3) * 1000);
@@ -149,7 +163,26 @@ function audioStatusBar(audio, summary) {
     ? `<label class="audio-asr-control"><input type="checkbox" ${audio?.asr_enabled ? 'checked' : ''} onchange="StudioActions.productionSetAsr(this.checked)"> ASR 字幕校正</label>`
     : '';
   sourceMode = `${sourceMode}${asrControl}`;
-  return `<header class="audio-status-bar"><div><strong>项目音频</strong><span class="audio-status-count">音色 ${summary?.confirmed_voice_count || 0}/${summary?.voice_count || 0}</span><span class="audio-status-count">${sourceMode}</span>${nativeMode}${warning}</div><div class="audio-status-actions"><label>字幕<select id="production-subtitle-mode" onchange="StudioActions.productionSetSubtitleMode(this.value)"><option value="off" ${subtitleMode === 'off' ? 'selected' : ''}>关闭</option><option value="dialogue" ${subtitleMode === 'dialogue' ? 'selected' : ''}>只显示台词</option><option value="speaker" ${subtitleMode === 'speaker' ? 'selected' : ''}>角色名 + 台词</option></select></label><button class="btn-secondary btn-sm" onclick="StudioActions.productionPreviewAudioMix()">试听混音</button><button class="btn-secondary btn-sm" onclick="StudioActions.productionExportSubtitles()">导出 SRT</button></div></header>${productionAudioDraftDirty ? '<div class="audio-draft-notice">本地音频草稿尚未保存，后台更新不会覆盖当前编辑。</div>' : ''}${audio.preview_mix_path ? `<audio controls preload="metadata" class="audio-preview" src="${mediaUrl(audio.preview_mix_path)}"></audio>` : ''}${subtitleExportPath ? `<a class="btn-secondary btn-sm audio-srt-link" href="${mediaUrl(subtitleExportPath)}" download>下载当前 SRT</a>` : ''}`;
+  return `<header class="audio-status-bar"><div><strong>项目音频</strong><span class="audio-status-count">音色 ${summary?.confirmed_voice_count || 0}/${summary?.voice_count || 0}</span><span class="audio-status-count">${sourceMode}</span>${nativeMode}${warning}</div><div class="audio-status-actions"><label>字幕<select id="production-subtitle-mode" onchange="StudioActions.productionSetSubtitleMode(this.value)"><option value="off" ${subtitleMode === 'off' ? 'selected' : ''}>关闭</option><option value="dialogue" ${subtitleMode === 'dialogue' ? 'selected' : ''}>只显示台词</option><option value="speaker" ${subtitleMode === 'speaker' ? 'selected' : ''}>角色名 + 台词</option><option value="narration" ${subtitleMode === 'narration' ? 'selected' : ''}>只显示旁白</option><option value="all" ${subtitleMode === 'all' ? 'selected' : ''}>台词 + 旁白</option></select></label><button class="btn-secondary btn-sm" onclick="StudioActions.productionPreviewAudioMix()">试听混音</button><button class="btn-secondary btn-sm" onclick="StudioActions.productionExportSubtitles()">导出 SRT</button><button class="btn-secondary btn-sm" onclick="StudioActions.productionBurnSubtitles()">烧录到成片</button></div></header>${subtitleNarrationControl()}${productionAudioDraftDirty ? '<div class="audio-draft-notice">本地音频草稿尚未保存，后台更新不会覆盖当前编辑。</div>' : ''}${audio.preview_mix_path ? `<audio controls preload="metadata" class="audio-preview" src="${mediaUrl(audio.preview_mix_path)}"></audio>` : ''}${subtitleExportPath ? `<a class="btn-secondary btn-sm audio-srt-link" href="${mediaUrl(subtitleExportPath)}" download>下载当前 SRT</a>` : ''}`;
+}
+
+const SUBTITLE_MODE_LABELS = {
+  off: '已关闭',
+  dialogue: '只显示台词',
+  speaker: '角色名 + 台词',
+  narration: '只显示旁白',
+  all: '台词 + 旁白',
+};
+
+function subtitleModeLabel(mode) {
+  return SUBTITLE_MODE_LABELS[mode] || SUBTITLE_MODE_LABELS.dialogue;
+}
+
+function subtitleNarrationControl() {
+  const mode = productionData?.subtitle_mode || 'dialogue';
+  if (mode !== 'narration' && mode !== 'all') return '';
+  const text = productionData?.subtitle_narration_text || '';
+  return `<div class="audio-narration-block"><label>旁白文本<textarea id="production-subtitle-narration" rows="3" placeholder="每行一句旁白，按顺序铺到无台词的镜头">${escapeHtml(text)}</textarea></label><button class="btn-secondary btn-sm" onclick="StudioActions.productionSaveNarration()">保存旁白</button><span class="audio-status-count">旁白没有配音，只作为字幕叠加</span></div>`;
 }
 
 function audioBgmTrack(scene, bgm) {
@@ -174,7 +207,7 @@ function productionAudioTimelineHtml(current) {
   const bgm = library.filter(item => item.kind === 'bgm');
   const sfx = library.filter(item => item.kind === 'sfx');
   const summary = productionData?.audio_summary || {};
-  return `<section id="production-audio-timeline" class="audio-timeline"><div class="audio-workspace-scroll">${audioStatusBar(audio, summary)}<div class="audio-workspace-grid"><main class="audio-track-panel"><div class="audio-track-heading"><div><h4>镜头 ${current.scene.scene_id} 音频时间轴</h4><span>${escapeHtml(current.scene.location || '')} · ${Number(current.scene.duration_sec || 0).toFixed(1)} 秒</span></div><span class="audio-ruler-label">台词使用真实音频时长</span></div><div class="audio-ruler"><span>0s</span><span>${(Number(current.scene.duration_sec || 3) / 2).toFixed(1)}s</span><span>${Number(current.scene.duration_sec || 3).toFixed(1)}s</span></div><section class="audio-track-block"><div class="audio-track-title"><strong>台词</strong><span>保存后按真实音频时长重新排布</span></div><div class="audio-dialogue-list">${audioLineRows(current, scene)}</div></section>${audioBgmTrack(scene, bgm)}${audioSfxTrack(scene, sfx)}<section class="audio-track-block audio-subtitle-block"><div class="audio-track-title"><strong>字幕预览</strong><span>${productionData?.subtitle_mode === 'speaker' ? '角色名 + 台词' : productionData?.subtitle_mode === 'off' ? '已关闭' : '只显示台词'}</span></div>${subtitlePreviewRows(scene)}</section></main>${audioProjectSidebar(audio)}</div></div></section>`;
+  return `<section id="production-audio-timeline" class="audio-timeline"><div class="audio-workspace-scroll">${audioStatusBar(audio, summary)}<div class="audio-scope-note"><strong>父场景音频时间轴</strong><span>镜头 ${current.scene.scene_id} 的对白、BGM 和 SFX 按父场景管理；当前视频子镜头沿用此音频范围。</span></div><div class="audio-workspace-grid"><main class="audio-track-panel"><div class="audio-track-heading"><div><h4>镜头 ${current.scene.scene_id} 音频时间轴</h4><span>${escapeHtml(current.scene.location || '')} · ${Number(current.scene.duration_sec || 0).toFixed(1)} 秒</span></div><span class="audio-ruler-label">台词使用真实音频时长</span></div><div class="audio-ruler"><span>0s</span><span>${(Number(current.scene.duration_sec || 3) / 2).toFixed(1)}s</span><span>${Number(current.scene.duration_sec || 3).toFixed(1)}s</span></div><section class="audio-track-block"><div class="audio-track-title"><strong>对白轨道</strong><span>点击片段定位到下方编辑行</span></div>${audioDialogueVisualTrack(current, scene)}</section><section class="audio-track-block"><div class="audio-track-title"><strong>台词编辑</strong><span>保存后按真实音频时长重新排布</span></div><div class="audio-dialogue-list">${audioLineRows(current, scene)}</div></section>${audioBgmTrack(scene, bgm)}${audioSfxTrack(scene, sfx)}<section class="audio-track-block audio-subtitle-block"><div class="audio-track-title"><strong>字幕预览</strong><span>${subtitleModeLabel(productionData?.subtitle_mode)}</span></div>${subtitlePreviewRows(scene)}</section></main>${audioProjectSidebar(audio)}</div></div></section>`;
 }
 
 function captureProductionAudioDraft(panel) {
@@ -328,6 +361,33 @@ async function productionExportSubtitles() {
   } catch (error) { alert(error.message); }
 }
 
+async function productionBurnSubtitles() {
+  const mode = productionData?.subtitle_mode || 'dialogue';
+  if (mode === 'off') return alert('请先选择一种字幕模式。');
+  if (!productionData?.output_video_path) return alert('请先合成成片，再烧录字幕。');
+  if (!confirm('将按当前字幕模式生成一份新的成片（原成片不会被覆盖），继续？')) return;
+  try {
+    const data = await projectJsonRequest(
+      `${API_BASE}/api/projects/${appState.projectId}/subtitles/burn?mode=${encodeURIComponent(mode)}`,
+      {method:'POST'}, '烧录字幕失败',
+    );
+    subtitleExportPath = data.subtitle_path || subtitleExportPath;
+    if (data.output_video_path) productionData.output_video_path = data.output_video_path;
+    alert(`已生成带字幕成片：${data.output_video_path}`);
+  } catch (error) { alert(error.message); }
+}
+
+async function productionSaveNarration() {
+  const field = document.getElementById('production-subtitle-narration');
+  if (!field) return;
+  try {
+    const data = await projectJsonRequest(`${API_BASE}/api/projects/${appState.projectId}/production/settings`, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({subtitle_narration_text:field.value})}, '保存旁白失败');
+    if (!data) return;
+    productionData = data;
+    renderProductionAudioTimeline();
+  } catch (error) { alert(error.message); }
+}
+
 async function productionSaveAudioBgm() {
   const assetId = document.getElementById('audio-bgm-asset').value;
   const payload = {asset_id:assetId,muted:!assetId,volume:Number(document.getElementById('audio-bgm-volume').value),fade_ms:Number(document.getElementById('audio-bgm-fade').value)};
@@ -360,7 +420,7 @@ function productionAddAudioSfx() {
 
 function productionRemoveAudioSfx(index) { productionSaveAudioSfx(productionAudioSfxTracks().filter((_, itemIndex) => itemIndex !== index)); }
 
-const __moduleActions = {productionAudioTimelineHtml,productionMarkAudioDraft,resetProductionAudioDraft,captureProductionAudioDraft,restoreProductionAudioDraft,renderProductionAudioTimeline,productionSaveAudioLine,productionGenerateAudioLine,productionActivateAudioVersion,productionSaveVoiceProfile,productionUploadAudioLibrary,productionDeleteAudioLibrary,productionAutoSelectAudio,productionPreviewAudioMix,productionExportSubtitles,productionSaveAudioBgm,productionAudioSfxTracks,productionSaveAudioSfx,productionAddAudioSfx,productionRemoveAudioSfx};
+const __moduleActions = {productionAudioTimelineHtml,audioDialogueVisualTrack,productionMarkAudioDraft,resetProductionAudioDraft,captureProductionAudioDraft,restoreProductionAudioDraft,renderProductionAudioTimeline,productionSaveAudioLine,productionGenerateAudioLine,productionActivateAudioVersion,productionSaveVoiceProfile,productionUploadAudioLibrary,productionDeleteAudioLibrary,productionAutoSelectAudio,productionPreviewAudioMix,productionExportSubtitles,productionBurnSubtitles,productionSaveNarration,productionSaveAudioBgm,productionAudioSfxTracks,productionSaveAudioSfx,productionAddAudioSfx,productionRemoveAudioSfx};
 Object.assign(globalThis.StudioActions, __moduleActions);
 Object.defineProperties(globalThis, {productionAudioDraftDirty:{configurable:true,get:() => productionAudioDraftDirty,set:value => {productionAudioDraftDirty = value;}}});
 export {__moduleActions};

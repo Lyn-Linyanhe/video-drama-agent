@@ -134,7 +134,7 @@ def _assembly_script():
     )
 
 
-async def _fake_ffmpeg(self, script, assets, audio, output_path, output_dir, subtitle_enabled=True, subtitle_mode=None):
+async def _fake_ffmpeg(self, script, assets, audio, output_path, output_dir, subtitle_enabled=True, subtitle_mode=None, subtitle_style=None):
     assert subtitle_enabled is False
     assert subtitle_mode == "off"
     assert all(not scene.dialogue_audios for scene in audio.scenes)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from copy import deepcopy
 import re
 import uuid
 from collections import defaultdict
@@ -290,12 +291,19 @@ class JobManager:
             raise KeyError(job_id)
         if job["state"] not in TERMINAL_JOB_STATES:
             raise ValueError("只有终止、失败或中断的任务可以重试")
+        payload = job["request"]
+        # A video retry must be rebuilt from the current project state. The
+        # generation snapshot is an immutable capture of the failed attempt
+        # and may point at an older prompt, duration, references, or policy.
+        if job["job_type"] == "video.generate":
+            payload = deepcopy(payload or {})
+            payload.pop("generation_snapshot", None)
         return self.create_job(
             project_id=project_id,
             job_type=job["job_type"],
             target_type=job["target_type"],
             target_id=job["target_id"],
-            payload=job["request"],
+            payload=payload,
             attempt=int(job["attempt"]) + 1,
             retry_of_job_id=job_id,
             provider=job["provider"],

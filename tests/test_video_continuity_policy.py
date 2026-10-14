@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from src.agents.assembly_agent import AssemblyAgent
 from src.api_clients.happyhorse import HappyHorseVideoClient
 from src.schemas.assets import GeneratedAssets, ShotAsset
 from src.schemas.script import Scene, ScriptBreakdown
+from src.services.video_continuity import continuity_reference, mark_dependents_stale
 from src.services.video_capabilities import (
     VIDEO_CAPABILITIES,
     default_video_policy,
@@ -171,3 +173,87 @@ def test_transition_renderer_uses_xfade_and_low_source_audio(tmp_path, monkeypat
 
 def command_value(command, flag):
     return command[command.index(flag) + 1]
+
+
+def test_child_shot_without_explicit_dependency_does_not_inherit_previous_tail(tmp_path, monkeypatch):
+    from src.schemas.assets import ShotProductionState, ShotVideoVersion
+
+    state = SimpleNamespace(
+        project_id="child-no-continuity",
+        shot_productions={
+            1: ShotProductionState(
+                scene_id=1,
+                video_versions=[
+                    ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path=str(tmp_path / "one.mp4"), success=True, version_id="v1", created_at=""),
+                ],
+            )
+        },
+    )
+    (tmp_path / "one.mp4").write_bytes(b"video")
+    monkeypatch.setattr("src.services.video_continuity.extract_tail_frame", lambda *_args: (_ for _ in ()).throw(AssertionError("tail must not be read")))
+
+    path, label = continuity_reference(
+        state, 1, {"model": "mock", "capability": {"continuity": True}},
+        shot_id="scene-1-shot-2",
+    )
+
+    assert (path, label) == ("", "")
+
+
+def test_child_dependents_are_marked_stale_when_source_version_changes():
+    from src.schemas.assets import ShotProductionState, ShotVideoVersion
+
+    state = SimpleNamespace(
+        shot_productions={
+            1: ShotProductionState(
+                scene_id=1,
+                video_versions=[
+                    ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path="one.mp4", success=True, version_id="new-source", created_at=""),
+                    ShotVideoVersion(
+                        scene_id=1,
+                        shot_id="scene-1-shot-2",
+                        continuity_from_shot_id="scene-1-shot-1",
+                        continuity_source_version_id="old-source",
+                        local_path="two.mp4",
+                        success=True,
+                        version_id="dependent",
+                        created_at="",
+                    ),
+                ],
+            )
+        }
+    )
+
+    mark_dependents_stale(state, 1, "new-source", source_shot_id="scene-1-shot-1")
+
+    assert state.shot_productions[1].continuity_stale is True
+
+
+def test_child_shot_continuity_uses_previous_child_tail(tmp_path, monkeypatch):
+    from src.graph.state import DramaState
+    from src.schemas.assets import ShotProductionState, ShotVideoVersion
+
+    state = SimpleNamespace(
+        project_id="child-continuity",
+        shot_productions={
+            1: ShotProductionState(
+                scene_id=1,
+                video_versions=[
+                    ShotVideoVersion(scene_id=1, shot_id="scene-1-shot-1", local_path=str(tmp_path / "one.mp4"), success=True, version_id="v1", created_at=""),
+                ],
+                active_version_id="v1",
+            )
+        },
+    )
+    (tmp_path / "one.mp4").write_bytes(b"video")
+    tail = tmp_path / "tail.jpg"
+    tail.write_bytes(b"image")
+    monkeypatch.setattr("src.services.video_continuity.extract_tail_frame", lambda *_args: str(tail))
+
+    path, label = continuity_reference(
+        state, 1, {"model": "mock", "capability": {"continuity": True}},
+        shot_id="scene-1-shot-2", continuity_from_shot_id="scene-1-shot-1",
+    )
+
+    assert path == str(tail)
+    assert "子镜头" in label

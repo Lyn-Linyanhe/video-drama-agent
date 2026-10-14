@@ -204,25 +204,51 @@ def ensure_project_voice_profiles(state: Any):
 
 def validate_project_voice_profiles(state: Any) -> dict:
     audio = ensure_project_voice_profiles(state)
+    native_scene_ids = {
+        scene.scene_id
+        for scene in getattr(audio, "scenes", [])
+        if getattr(scene, "native_audio_enabled", False)
+    }
+    # A speaker only needs a confirmed TTS voice when at least one line of
+    # theirs plays in a non-native scene. Purely native speakers are voiced by
+    # the video provider, so voice confirmation must not block them.
+    native_speakers: set[str] = set()
+    tts_speakers: set[str] = set()
+    script = getattr(state, "script", None)
+    for scene in (script.scenes if script else []):
+        for line in scene.dialogue:
+            name = str(line.character or "").strip()
+            if not name:
+                continue
+            if scene.scene_id in native_scene_ids:
+                native_speakers.add(name)
+            else:
+                tts_speakers.add(name)
     speakers = []
     for character in speaking_characters(state):
         profile = audio.voice_profiles[character]
         provider = "minimax" if profile.provider == "dashscope-minimax" else profile.provider
         reason = ""
-        if not profile.confirmed:
+        needs_tts = character in tts_speakers
+        if not native_scene_ids and not needs_tts:
             reason = "请确认角色音色"
-        elif provider == "minimax" and not profile.voice.strip():
+        elif needs_tts and not profile.confirmed:
+            reason = "请确认角色音色"
+        elif needs_tts and provider == "minimax" and not profile.voice.strip():
             reason = "MiniMax 必须填写音色 ID"
-        elif provider not in {"qwen3", "minimax", "edge"}:
+        elif needs_tts and provider not in {"qwen3", "minimax", "edge"}:
             reason = "不支持的配音服务商"
-        speakers.append({
+        entry = {
             "character": character,
             "provider": provider,
             "voice": profile.voice,
             "confirmed": profile.confirmed,
             "ready": not reason,
             "reason": reason,
-        })
+        }
+        if character in native_speakers and not needs_tts:
+            entry["audio_source"] = "native"
+        speakers.append(entry)
     return {"ready": all(item["ready"] for item in speakers), "speakers": speakers}
 
 

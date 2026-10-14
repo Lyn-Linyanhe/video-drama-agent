@@ -20,6 +20,8 @@ from src.graph.state import DramaState
 from src.schemas.assets import GeneratedAssets, ShotAsset
 from src.schemas.audio import AudioAssets, AudioLibraryAsset, DialogueAudio, SceneAudio, SoundEffectTrack, VoiceProfile
 from src.schemas.script import DialogueLine, Scene, ScriptBreakdown
+from src.schemas.prompt import GenerationPrompts
+from src.schemas.shot_plan import ShotPlan, ShotUnit, SceneCapacityReport
 from src.services.tts_provider import (
     TTSProviderError,
     describe_dashscope_tts_error,
@@ -454,6 +456,37 @@ def test_state_round_trip_uses_dialogue_subtitles_by_default_and_keeps_legacy_fl
     assert legacy.subtitle_enabled is False
 
 
+def test_audio_preflight_skips_voice_confirmation_for_native_audio_speakers():
+    state = DramaState(
+        project_id="project-a",
+        script=_script(),
+        audio_assets=AudioAssets(scenes=[SceneAudio(scene_id=1, native_audio_enabled=True)]),
+    )
+    result = validate_project_voice_profiles(state)
+    assert result["ready"] is True
+    assert {item["character"] for item in result["speakers"]} == {"A", "B"}
+    assert all(item["ready"] for item in result["speakers"])
+    assert all(item.get("audio_source") == "native" for item in result["speakers"])
+
+
+def test_audio_preflight_still_requires_voices_for_non_native_speakers():
+    state = DramaState(
+        project_id="project-a",
+        script=_two_scene_script(),
+        audio_assets=AudioAssets(scenes=[
+            SceneAudio(scene_id=1, native_audio_enabled=True),
+            SceneAudio(scene_id=2, native_audio_enabled=False),
+        ]),
+    )
+    result = validate_project_voice_profiles(state)
+    by_name = {item["character"]: item for item in result["speakers"]}
+    assert by_name["A"]["ready"] is True
+    assert by_name["A"].get("audio_source") == "native"
+    assert by_name["B"]["ready"] is False
+    assert by_name["B"]["reason"] == "请确认角色音色"
+    assert result["ready"] is False
+
+
 def test_audio_preflight_requires_confirmed_voice_profiles():
     state = DramaState(project_id="project-a", script=_script())
     ensure_project_voice_profiles(state)
@@ -583,3 +616,133 @@ def test_ffmpeg_audio_and_subtitles_use_the_same_scene_start(tmp_path, monkeypat
     assert "[2:a]adelay=2750:all=1" in filter_graph
     subtitle_text = next(tmp_path.glob("subtitles_*.srt")).read_text(encoding="utf-8")
     assert "00:00:02,750 --> 00:00:03,750" in subtitle_text
+
+
+def test_assembly_orders_multiple_child_shots_without_collapsing_scene(tmp_path):
+    from src.schemas.assets import GeneratedAssets, ShotAsset
+
+    script = _script()
+    script.scenes[0].duration_sec = 6
+    first = tmp_path / "child-1.mp4"
+    second = tmp_path / "child-2.mp4"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    assets = GeneratedAssets(shots=[
+        ShotAsset(scene_id=1, shot_id="scene-1-shot-2", parent_scene_id=1, local_path=str(second), success=True, duration_sec=3),
+        ShotAsset(scene_id=1, shot_id="scene-1-shot-1", parent_scene_id=1, local_path=str(first), success=True, duration_sec=3),
+    ])
+
+    clips = AssemblyAgent()._expanded_video_clips(script, assets)
+
+    assert [asset.shot_id for _, asset, _ in clips] == ["scene-1-shot-1", "scene-1-shot-2"]
+    assert len({scene.scene_id for scene, _, _ in clips}) == 2
+
+
+def test_assembly_rejects_incomplete_child_shot_set(tmp_path):
+    from src.schemas.assets import GeneratedAssets, ShotAsset
+
+    script = _script()
+    first = tmp_path / "child-1.mp4"
+    first.write_bytes(b"one")
+    assets = GeneratedAssets(shots=[
+        ShotAsset(scene_id=1, shot_id="scene-1-shot-1", parent_scene_id=1, local_path=str(first), success=True, duration_sec=3),
+    ])
+
+    # The explicit child-shot metadata makes an incomplete set observable.
+    assets = assets.model_copy(update={"expected_shot_ids": ["scene-1-shot-1", "scene-1-shot-2"]})
+
+    with pytest.raises(ValueError, match="子镜头未完成"):
+        AssemblyAgent()._expanded_video_clips(script, assets)
+
+
+def test_assembly_rejects_child_set_missing_an_entire_scene(tmp_path):
+    from src.schemas.assets import GeneratedAssets, ShotAsset
+
+    script = _two_scene_script()
+    first = tmp_path / "first.mp4"
+    first.write_bytes(b"one")
+    assets = GeneratedAssets(
+        shots=[ShotAsset(scene_id=1, shot_id="scene-1-shot-1", parent_scene_id=1, local_path=str(first), success=True, duration_sec=3)],
+        expected_shot_ids=["scene-1-shot-1", "scene-2-shot-1"],
+    )
+
+    with pytest.raises(ValueError, match="scene-2-shot-1"):
+        AssemblyAgent()._expanded_video_clips(script, assets)
+
+
+def test_assembly_deduplicates_duplicate_child_assets(tmp_path):
+    from src.schemas.assets import GeneratedAssets, ShotAsset
+
+    script = _script()
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    assets = GeneratedAssets(shots=[
+        ShotAsset(scene_id=1, shot_id="scene-1-shot-1", local_path=str(first), success=True, duration_sec=3),
+        ShotAsset(scene_id=1, shot_id="scene-1-shot-1", local_path=str(second), success=True, duration_sec=3),
+    ])
+
+    clips = AssemblyAgent()._expanded_video_clips(script, assets)
+
+    assert len(clips) == 1
+    assert clips[0][1].local_path == str(second)
+
+
+def test_transition_renderer_keeps_audio_when_only_some_clips_have_audio(tmp_path, monkeypatch):
+    first = tmp_path / "silent.mp4"
+    second = tmp_path / "spoken.mp4"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    captured = []
+
+    def fake_ffmpeg(command, timeout):
+        captured.append(command)
+        Path(command[-1]).write_bytes(b"video")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("src.agents.assembly_agent.run_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(AssemblyAgent, "_media_duration", staticmethod(lambda _path: 3.0))
+    monkeypatch.setattr(AssemblyAgent, "_has_audio_stream", staticmethod(lambda path: str(path).endswith("spoken.mp4")))
+    script = _two_scene_script()
+    clips = [
+        (script.scenes[0], ShotAsset(scene_id=1, local_path=str(first), success=True, duration_sec=3)),
+        (script.scenes[1], ShotAsset(scene_id=2, local_path=str(second), success=True, duration_sec=3)),
+    ]
+
+    _, starts = AssemblyAgent()._render_transition_video(clips, str(tmp_path / "out.mp4"), tmp_path)
+
+    assert starts[1] == 0
+    graph = captured[0][captured[0].index("-filter_complex") + 1]
+    assert "anullsrc" in graph
+    assert "[a0]" in graph
+
+
+def test_assembly_uses_current_shot_plan_when_expected_ids_are_missing(tmp_path):
+    first = tmp_path / "first.mp4"
+    first.write_bytes(b"one")
+    assets = GeneratedAssets(shots=[
+        ShotAsset(scene_id=1, shot_id="scene-1-shot-1", parent_scene_id=1, local_path=str(first), success=True, duration_sec=3),
+    ])
+    prompts = GenerationPrompts(
+        api_provider="mock",
+        shots=[],
+        shot_plans=[ShotPlan(
+            scene_id=1,
+            parent_duration_sec=6,
+            capacity=SceneCapacityReport(
+                scene_id=1, required_total_duration_sec=6, available_duration_sec=6,
+                recommended_total_duration_sec=6, recommended_durations_sec=[3, 3],
+                recommended_shot_count=2, status="auto_split", warnings=[],
+            ),
+            units=[
+                ShotUnit(shot_id="scene-1-shot-1", parent_scene_id=1, order=1, duration_sec=3),
+                ShotUnit(shot_id="scene-1-shot-2", parent_scene_id=1, order=2, duration_sec=3),
+            ],
+        )],
+    )
+
+    with pytest.raises(ValueError, match="scene-1-shot-2"):
+        asyncio.run(AssemblyAgent().run(
+            _script(), assets, AudioAssets(scenes=[]), generation_prompts=prompts,
+        ))

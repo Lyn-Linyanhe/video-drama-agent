@@ -20,13 +20,76 @@ from src.utils.visual_asset_manifest import (
     extract_static_environment_facts,
 )
 from src.services.timed_prompt_composer import apply_timed_prompt_structure
+from src.services.prop_state_sanitize import sanitize_end_state, sanitize_prop_state
 from src.services.shot_capacity import analyze_shot_capacity
+from src.services.beat_planner import estimate_dialogue_duration_sec
+from src.services.shot_planner import build_shot_plan
 from src.config import DEFAULT_API
 
 
 def _job_canceled_type():
     from src.services.job_manager import JobCanceled
     return JobCanceled
+
+
+def _provider_duration_cap(video_generation_policy: dict | None) -> int | None:
+    """Resolve the selected model's max duration from the normalized capability snapshot."""
+    if not video_generation_policy:
+        return None
+    capability = dict(video_generation_policy.get("capability") or {})
+    if not capability:
+        try:
+            from src.services.video_capabilities import normalize_video_policy
+            capability = normalize_video_policy(video_generation_policy).get("capability") or {}
+        except Exception:
+            capability = {}
+    maximum = capability.get("duration_max")
+    if maximum is None:
+        durations = capability.get("durations") or []
+        maximum = max(durations) if durations else None
+    try:
+        return int(maximum) if maximum is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _provider_duration_min(video_generation_policy: dict | None) -> int:
+    """Resolve the selected model's minimum executable duration."""
+    if not video_generation_policy:
+        return 3
+    capability = dict(video_generation_policy.get("capability") or {})
+    if not capability:
+        try:
+            from src.services.video_capabilities import normalize_video_policy
+            capability = normalize_video_policy(video_generation_policy).get("capability") or {}
+        except Exception:
+            capability = {}
+    minimum = capability.get("duration_min")
+    if minimum is None:
+        durations = capability.get("durations") or []
+        minimum = min(durations) if durations else 3
+    try:
+        return max(1, int(minimum))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _provider_duration_options(video_generation_policy: dict | None) -> list[int]:
+    """Resolve a finite duration set when the selected model declares one."""
+    if not video_generation_policy:
+        return []
+    capability = dict(video_generation_policy.get("capability") or {})
+    if not capability:
+        try:
+            from src.services.video_capabilities import normalize_video_policy, duration_options_for_policy
+            return duration_options_for_policy(normalize_video_policy(video_generation_policy))
+        except Exception:
+            return []
+    try:
+        from src.services.video_capabilities import duration_options_from_capability
+        return duration_options_from_capability(capability)
+    except Exception:
+        return []
 
 
 def _apply_profile_repair_metadata(visual_design, telemetry: dict | None, status: str, errors: list[str] | None = None) -> None:
@@ -175,41 +238,197 @@ _CHARACTER_STATE_TERMS = (
 )
 
 
+# Mutable appearance state must follow the structured scene order.  Model
+# compact outputs frequently leak prop or hairstyle states from neighbouring
+# scenes (hat visible before it is put on, hat removed twice, curled hair
+# before the curling scene).  The filter below replays scene actions in order
+# and drops state clauses that contradict the established timeline.
+_STATE_ON_VERBS = ("戴上", "带上", "穿上", "换上", "披上", "系上", "围上", "套上")
+_STATE_OFF_VERBS = ("摘下", "取下", "脱下", "摘掉", "脱掉", "褪下", "揭掉", "拔掉", "解开")
+_STATE_WEARABLE_TOKENS = (
+    "帽子", "圆帽", "礼帽", "鸭舌帽", "草帽", "毛线帽",
+    "手套", "围巾", "口罩", "眼镜", "面具", "面纱", "头巾",
+    "外衣", "大衣", "外套", "雨衣", "制服", "婚纱", "旗袍", "西装",
+)
+_STATE_STYLE_TOKENS = ("长发", "中长发", "短发", "卷发", "卷曲", "直发", "马尾", "发髻", "盘发")
+
+
+def _scene_state_timeline(script, upto_scene_id: int) -> tuple[dict, dict]:
+    """Replay scene actions in order; return (prior_state, first_mention_scene).
+
+    prior_state maps a wearable token to its last established transition
+    ("on"/"off") before ``upto_scene_id``; first_mention_scene maps every
+    mutable-appearance token to the first scene whose evidence mentions it.
+    """
+    prior_state: dict[str, str] = {}
+    first_mention: dict[str, int] = {}
+    scenes = sorted(getattr(script, "scenes", []) or [], key=lambda item: int(item.scene_id))
+    for scene in scenes:
+        scene_id = int(scene.scene_id)
+        if scene_id >= int(upto_scene_id):
+            break
+        evidence = " ".join([
+            str(getattr(scene, "action_description", "") or ""),
+            str(getattr(scene, "camera_direction", "") or ""),
+            " ".join(str(line.line or "") for line in getattr(scene, "dialogue", []) or []),
+        ])
+        for token in _STATE_WEARABLE_TOKENS + _STATE_STYLE_TOKENS:
+            if token in evidence and token not in first_mention:
+                first_mention[token] = scene_id
+        for token in _STATE_WEARABLE_TOKENS:
+            if token not in evidence:
+                continue
+            positions: list[tuple[int, str]] = []
+            for verb in _STATE_ON_VERBS:
+                index = evidence.find(verb)
+                while index >= 0:
+                    if evidence.find(token, index, index + 14) >= 0:
+                        positions.append((index, "on"))
+                    index = evidence.find(verb, index + 1)
+            for verb in _STATE_OFF_VERBS:
+                index = evidence.find(verb)
+                while index >= 0:
+                    if evidence.find(token, index, index + 14) >= 0:
+                        positions.append((index, "off"))
+                    index = evidence.find(verb, index + 1)
+            if positions:
+                positions.sort()
+                prior_state[token] = positions[-1][1]
+    return prior_state, first_mention
+
+
+def _drop_disordered_state_clauses(script, scene_id: int, state_text: str, current_scene=None) -> str:
+    """Remove state clauses that contradict the cross-shot appearance timeline.
+
+    Drops: future-leak clauses (object first appears in a later scene),
+    repeated don/removal clauses (hat removed twice), while keeping
+    legitimately persistent states (short hair after the haircut scene).
+    """
+    state_text = str(state_text or "").strip()
+    if not state_text or script is None or not getattr(script, "scenes", None):
+        return state_text
+    prior_state, first_mention = _scene_state_timeline(script, scene_id)
+    current_action = ""
+    if current_scene is not None:
+        current_action = str(getattr(current_scene, "action_description", "") or "")
+    kept_groups: list[str] = []
+    for raw_group in re.split(r"[。；;\n]+", state_text):
+        group = raw_group.strip()
+        if not group:
+            continue
+        kept: list[str] = []
+        for clause in (part.strip() for part in re.split(r"[，,、]", group)):
+            if not clause:
+                continue
+            drop = False
+            for token in _STATE_WEARABLE_TOKENS:
+                if token not in clause:
+                    continue
+                mentioned_here = token in current_action
+                if not mentioned_here and first_mention.get(token, int(scene_id)) > int(scene_id):
+                    drop = True
+                    break
+                if not mentioned_here and prior_state.get(token) == "off" and any(verb in clause for verb in _STATE_OFF_VERBS):
+                    drop = True
+                    break
+                if not mentioned_here and prior_state.get(token) == "on" and any(verb in clause for verb in _STATE_ON_VERBS):
+                    drop = True
+                    break
+            if not drop:
+                for token in _STATE_STYLE_TOKENS:
+                    if token in clause and first_mention.get(token, int(scene_id)) > int(scene_id):
+                        drop = True
+                        break
+            if not drop:
+                kept.append(clause)
+        if kept:
+            kept_groups.append("，".join(kept))
+    return "；".join(kept_groups)
+
+
+_PROP_MATERIAL_PREFIXES = ("白金", "黄金", "玫瑰金", "纯金", "金", "银", "铜", "铁", "锡", "玉")
+
+
+def _normalize_prop_mentions(text: str, bound_props: list) -> str:
+    """Rewrite drifted material variants (金表链) back to the bound canonical name (白金表链)."""
+    normalized = str(text or "")
+    names = [str(getattr(prop, "name", "") or "").strip() for prop in (bound_props or [])]
+    for canonical in names:
+        if len(canonical) < 3:
+            continue
+        suffix = canonical[-2:]
+        for prefix in _PROP_MATERIAL_PREFIXES:
+            variant = prefix + suffix
+            if variant == canonical or variant in names:
+                continue
+            normalized = normalized.replace(variant, canonical)
+    return normalized
+
+
 def _character_scoped_clauses(
     text: str,
     character_name: str,
     character_names: tuple[str, ...] | list[str] = (),
 ) -> list[str]:
-    """Return only clauses that can be attributed to one named character.
+    """Return only clauses attributable to one named character.
 
-    For a single-character shot, un-named clauses remain usable. For a multi-character
-    shot, an appearance clause without an explicit subject is deliberately ignored rather
-    than copied to every role.
+    Multi-character shots use subject propagation: a clause without an explicit
+    subject belongs to the last named subject in the same sentence, so
+    "吉姆松开德拉，从大衣口袋里掏出一个小包" attributes the coat clause to
+    吉姆 only, and "德拉脱下帽子，褐色长发垂散下来" never leaks onto other
+    roles.  Single-character shots keep un-named clauses usable.
     """
     normalized = str(text or "")
     names = [str(name).strip() for name in character_names if str(name).strip()]
     if character_name and character_name not in names:
         names.append(character_name)
     names = list(dict.fromkeys(names))
+    if not character_name:
+        return []
+    if len(names) <= 1:
+        return [
+            re.sub(r"\s+", " ", raw).strip(" ，,、")
+            for raw in re.split(r"[。；;，,、\n]+", normalized)
+            if raw.strip()
+        ]
+
+    ordered_names = sorted(names, key=len, reverse=True)
     clauses: list[str] = []
-    for raw in re.split(r"[。；;，,、\n]+", normalized):
-        clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
-        if not clause:
+    for sentence in re.split(r"[。；;\n]+", normalized):
+        sentence = sentence.strip()
+        if not sentence:
             continue
-        present = [name for name in names if name and name in clause]
-        if character_name in present:
-            if len(present) == 1:
-                clauses.append(clause)
+        current_subject = ""
+        for raw in re.split(r"[，,、]+", sentence):
+            clause = re.sub(r"\s+", " ", raw).strip(" ，,、")
+            if not clause:
+                continue
+            present = [name for name in ordered_names if name in clause]
+            if not present:
+                if current_subject == character_name:
+                    clauses.append(clause)
+                continue
+            if character_name in present:
+                if len(present) == 1:
+                    current_subject = character_name
+                    clauses.append(clause)
+                else:
+                    # Compact clauses such as "甲穿红衣，乙穿蓝衣" after
+                    # normalization: split at name boundaries and keep only
+                    # fragments owned by the target character.  The earliest
+                    # name in the clause becomes the running subject so the
+                    # following un-named clauses are not broadcast.
+                    earliest = min(present, key=lambda name: clause.index(name))
+                    current_subject = earliest
+                    pattern = r"(?=(?:" + "|".join(re.escape(name) for name in ordered_names) + r"))"
+                    fragments = [part.strip(" ，,、") for part in re.split(pattern, clause) if part.strip(" ，,、")]
+                    for fragment in fragments:
+                        if character_name in fragment and not any(
+                            other != character_name and other in fragment for other in ordered_names
+                        ):
+                            clauses.append(fragment)
             else:
-                # Handle compact clauses such as “甲穿红衣，乙穿蓝衣” after
-                # punctuation normalization or model-generated name runs.
-                pattern = r"(?=(?:" + "|".join(re.escape(name) for name in names) + r"))"
-                fragments = [part.strip(" ，,、") for part in re.split(pattern, clause) if part.strip(" ，,、")]
-                clauses.extend(fragment for fragment in fragments if character_name in fragment and not any(
-                    other != character_name and other in fragment for other in names
-                ))
-        elif len(names) <= 1:
-            clauses.append(clause)
+                current_subject = present[0]
     return clauses
 
 
@@ -229,7 +448,7 @@ def split_character_identity_and_state(
                 continue
             matches = []
             for term in _CHARACTER_STATE_TERMS:
-                matches.extend(re.findall(r"(?:[\u4e00-\u9fffA-Za-z0-9]{0,8}" + re.escape(term) + r"[\u4e00-\u9fffA-Za-z0-9]{0,8})", clause))
+                matches.extend(re.findall(r"(?:[\u4e00-\u9fffA-Za-z0-9]{0,16}" + re.escape(term) + r"[\u4e00-\u9fffA-Za-z0-9]{0,16})", clause))
             if matches:
                 state_parts.extend(matches)
     state = "；".join(dict.fromkeys(item.strip() for item in state_parts if item.strip()))
@@ -331,27 +550,12 @@ def _stable_character_identity_description(description: str) -> str:
 
 
 def _current_prop_anchor(name: str, description: str) -> str:
-    """Keep reusable prop identity without leaking future plot states into early shots."""
-    text = re.sub(r"\s+", " ", str(description or "")).strip("。；; ")
-    if not text:
-        return name
-    # Prop descriptions often contain the whole story lifecycle. A per-shot prompt
-    # should keep only stable identity; the current state belongs in prop_state.
-    future_cues = (
-        "遇水后", "遇水", "泡开", "裂开", "露出", "打开后", "最终", "之后",
-        "后期", "后续", "随后", "后来", "掉进", "滑落", "取出",
-    )
-    cut_at = len(text)
-    for cue in future_cues:
-        index = text.find(cue)
-        if index >= 0:
-            cut_at = min(cut_at, index)
-    stable = text[:cut_at].rstrip("，,；; 。")
-    if not stable:
-        stable = text
+    """Keep reusable prop identity without leaking handling process or future states."""
+    raw = re.sub(r"\s+", " ", str(description or "")).strip("。；; ")
+    stable = sanitize_prop_state(raw)
+    if not stable or stable == name:
+        return f"{name}；本镜头具体位置和状态以【关键道具】为准"
     return f"{name}：{stable}；本镜头具体位置和状态以【关键道具】为准"
-
-
 def _visual_text_for_duration(scene, shot) -> str:
     parts = [
         getattr(scene, "location", ""),
@@ -402,11 +606,17 @@ def _declared_timeline_segment_count(text: str) -> int:
 
 
 def _dialogue_duration(scene) -> float:
-    lines = getattr(scene, "dialogue", []) or []
-    if not lines:
-        return 0.0
-    text_len = sum(len(re.sub(r"[，。！？、,.!?“”\"：:\s]", "", line.line or "")) for line in lines)
-    return 1.2 + text_len / 4.2 + len(lines) * 0.55
+    """Use the beat planner's single speech clock for visual duration hints."""
+    return round(
+        sum(
+            estimate_dialogue_duration_sec(
+                line.line or "",
+                inner_monologue=bool(re.search(r"独白|内心|心里|心想|旁白", line.emotion or "")),
+            )
+            for line in (getattr(scene, "dialogue", []) or [])
+        ),
+        2,
+    )
 
 
 def _estimated_content_duration(scene, shot) -> float:
@@ -567,6 +777,8 @@ def _sanitize_shot_output(shot, script: ScriptBreakdown, scene) -> None:
         normalized = _compact_compare_text(value)
         if normalized and any(phrase in normalized for phrase in stale_phrases):
             value = ""
+        if field == "prop_state":
+            value = sanitize_prop_state(value)
         setattr(shot, field, value)
 
     if "key_elements" not in model_fields:
@@ -675,39 +887,27 @@ def _fit_duration_budget(
     script: ScriptBreakdown,
     source_scene_durations: dict[int, int],
     source_total: int,
+    *,
+    provider_max_duration_sec: int | None = None,
 ) -> None:
-    """Use confirmed script durations as the visual stage's schedule of record."""
-    if not prompts or source_total <= 0:
-        return
-    target_total = max(3 * len(prompts), min(30 * len(prompts), int(source_total)))
-    # A generated action timeline may be compressed into the source window, but
-    # it must never change the window or the downstream subtitle/audio budget.
+    """Copy the source scene schedule onto prompts without rewriting the script.
+
+    The source scene schedule is authoritative.  The visual stage may normalize
+    each generated prompt to its scene window, but it must not rebalance the
+    whole project or write derived values back into the caller-owned
+    ScriptBreakdown.  A mismatch between the project total and the sum of scene
+    windows is an upstream timing diagnostic, not permission to silently
+    compress authored scenes.
+    """
+    del script, source_total
+    if provider_max_duration_sec is not None and int(provider_max_duration_sec) < 3:
+        raise ValueError(
+            f"provider duration cap {int(provider_max_duration_sec)}s is below the executable 3s minimum"
+        )
     for item in prompts:
-        item.duration_sec = max(3, min(30, int(source_scene_durations.get(item.scene_id, item.duration_sec or 3))))
-    normalized_total = sum(int(item.duration_sec or 0) for item in prompts)
-    if normalized_total > target_total:
-        overflow = normalized_total - target_total
-        for item in reversed(prompts):
-            reducible = max(0, int(item.duration_sec or 0) - 3)
-            reduction = min(reducible, overflow)
-            item.duration_sec -= reduction
-            overflow -= reduction
-            if overflow <= 0:
-                break
-    elif normalized_total < target_total:
-        remaining = target_total - normalized_total
-        for item in reversed(prompts):
-            capacity = max(0, 30 - int(item.duration_sec or 0))
-            increase = min(capacity, remaining)
-            item.duration_sec += increase
-            remaining -= increase
-            if remaining <= 0:
-                break
-    duration_by_scene = {item.scene_id: int(item.duration_sec or 3) for item in prompts}
-    for scene in script.scenes:
-        if scene.scene_id in duration_by_scene:
-            scene.duration_sec = duration_by_scene[scene.scene_id]
-    script.duration_sec = target_total
+        source_duration = source_scene_durations.get(item.scene_id, item.duration_sec or 3)
+        item.duration_sec = max(3, int(source_duration))
+
 
 SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提示词工程师。你的任务是一次性完成两项工作：
 
@@ -790,6 +990,8 @@ COMPACT_SYSTEM_PROMPT = """你是专业的影视视觉设计师和 AI 视频提�
 - 动作时间轴需按镜头时长清晰描述，每个时间戳段落必须同时写出镜头运动与主体动作（禁止只写其一，只写一样模型会自由发挥）；一镜可以推进多个按顺序发生的动作节拍，必须完整保留当前镜头明确的动作链；负面约束使用中文短语并按具体错误品类写（如“人物凭空消失”“道具变形”“服装变色”），不要只写抽象否定。
 - 所有字段使用中文，保持同一地点的空间、陈设、时间天气和主光方向连续。
 - environment_delta 只能写本镜头静态/持续的环境事实（建筑结构、固定陈设、天气、时间、地形、空间关系、整体光线氛围）。严禁写入人物的动作、情绪、心理状态、对白、人物在场、道具交互或剧情结果。若无静态环境差异，environment_delta 必须留空字符串。 也禁止写入本镜头尚未发生的未来状态或属于后续镜头的事件（例如道具被撞倒、暗道开启等提前出现）。
+- prop_state 只写本镜道具的外观、位置、在谁手里；禁止写入拿起、打开、取出、递给、入袋、贴胸等动作过程。动作过程只允许出现在 action_timeline。
+- 不要把上一镜的动作过程写进本镜差异字段；上一镜结束状态由后端组装顺承，模型不得复述过程链。
 """
 
 
@@ -797,19 +999,22 @@ _PARALLEL_VISUALIZE_CONCURRENCY = 4
 
 
 def _build_continuity_segment(prev_shot) -> str:
-    """Build a deterministic carry-over segment from the previous shot's state fields."""
+    """Build a deterministic carry-over segment from the previous shot's end state."""
     prev_state = []
-    for label, value in (
-        ("主体状态", getattr(prev_shot, "subject_state", "")),
-        ("环境", getattr(prev_shot, "environment_delta", "")),
-        ("光线", getattr(prev_shot, "lighting_delta", "")),
-        ("关键道具", getattr(prev_shot, "prop_state", "")),
+    for label, value, sanitizer in (
+        ("主体状态", getattr(prev_shot, "subject_state", ""), sanitize_end_state),
+        ("环境", getattr(prev_shot, "environment_delta", ""), str.strip),
+        ("光线", getattr(prev_shot, "lighting_delta", ""), str.strip),
+        ("关键道具", getattr(prev_shot, "prop_state", ""), sanitize_prop_state),
     ):
-        value = str(value or "").strip()
+        value = sanitizer(str(value or "").strip())
         if value:
             prev_state.append(f"{label}：{value}")
     if prev_state:
-        return f"【顺承上一镜】本镜承接上一镜结尾画面状态，开头保持与上一镜一致——{'；'.join(prev_state)}。"
+        return (
+            "【顺承上一镜】本镜承接上一镜结尾画面状态，开头保持与上一镜一致——"
+            f"{'；'.join(prev_state)}。"
+        )
     return "【顺承上一镜】本镜承接上一镜结尾画面状态，开场保持与上一镜一致的姿态、站位、空间与光线。"
 
 
@@ -862,6 +1067,7 @@ class VisualPromptAgent:
         progress_callback=None,
         source_text: str = "",
         _repair_character_profiles: bool = True,
+        video_generation_policy: dict | None = None,
     ) -> tuple[VisualDesign, GenerationPrompts]:
         """Generate visual design and API prompts from the script.
 
@@ -874,6 +1080,9 @@ class VisualPromptAgent:
         Returns:
             Tuple of (VisualDesign, GenerationPrompts).
         """
+        provider_max_duration_sec = _provider_duration_cap(video_generation_policy)
+        provider_min_duration_sec = _provider_duration_min(video_generation_policy)
+        provider_duration_options = _provider_duration_options(video_generation_policy)
         provider_now = getattr(self.llm, "provider", "")
         if provider_now == "kimi" and len(script.scenes) > 1:
             return await self._run_stepwise(
@@ -884,6 +1093,9 @@ class VisualPromptAgent:
                 progress_callback=progress_callback,
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
+                provider_max_duration_sec=provider_max_duration_sec,
+                provider_min_duration_sec=provider_min_duration_sec,
+                provider_duration_options=provider_duration_options,
             )
         if provider_now == "deepseek" and len(script.scenes) > 1:
             return await self._run_parallel_visualize(
@@ -894,6 +1106,9 @@ class VisualPromptAgent:
                 progress_callback=progress_callback,
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
+                provider_max_duration_sec=provider_max_duration_sec,
+                provider_min_duration_sec=provider_min_duration_sec,
+                provider_duration_options=provider_duration_options,
             )
         return await self._run_single_shot(
             script,
@@ -902,6 +1117,9 @@ class VisualPromptAgent:
             telemetry=telemetry,
             source_text=source_text,
             _repair_character_profiles=_repair_character_profiles,
+            provider_max_duration_sec=provider_max_duration_sec,
+            provider_min_duration_sec=provider_min_duration_sec,
+            provider_duration_options=provider_duration_options,
         )
 
     async def _run_single_shot(
@@ -913,6 +1131,9 @@ class VisualPromptAgent:
         telemetry: dict | None = None,
         source_text: str = "",
         _repair_character_profiles: bool = True,
+        provider_max_duration_sec: int | None = None,
+        provider_min_duration_sec: int = 3,
+        provider_duration_options: list[int] | None = None,
     ) -> tuple[VisualDesign, GenerationPrompts]:
         """Generate the whole script in a single structured call (original path)."""
         scenes_text = self._format_scenes(script)
@@ -983,7 +1204,16 @@ class VisualPromptAgent:
             profile_repair_errors = list(repair_result.errors or [])
             output.global_character_descriptions = repaired_en
             output.global_character_descriptions_cn = repaired_cn
-        result = self._split_output(output, script, prompt_overrides, creative_profile)
+        split_kwargs = {}
+        if provider_max_duration_sec is not None:
+            split_kwargs["provider_max_duration_sec"] = provider_max_duration_sec
+        if provider_min_duration_sec != 3:
+            split_kwargs["provider_min_duration_sec"] = provider_min_duration_sec
+        if provider_duration_options:
+            split_kwargs["provider_duration_options"] = provider_duration_options
+        result = self._split_output(
+            output, script, prompt_overrides, creative_profile, **split_kwargs
+        )
         _apply_profile_repair_metadata(
             result[0], telemetry, profile_repair_status, profile_repair_errors
         )
@@ -1020,7 +1250,18 @@ class VisualPromptAgent:
             phase="script.visualize.global",
         )
 
-    async def _run_parallel_scene_deltas(self, script, manifest_text, global_out, profile, telemetry=None, progress_callback=None):
+    async def _run_parallel_scene_deltas(
+        self,
+        script,
+        manifest_text,
+        global_out,
+        profile,
+        telemetry=None,
+        progress_callback=None,
+        provider_max_duration_sec: int | None = None,
+        provider_min_duration_sec: int = 3,
+        provider_duration_options: list[int] | None = None,
+    ):
         """Phase 2: per-scene compact deltas, run concurrently with bounded retry."""
         global_cn = global_out.global_character_descriptions_cn or {}
         global_cn_text = "\n".join(f"- {k}: {v}" for k, v in global_cn.items()) or ("\u65e0")
@@ -1109,7 +1350,7 @@ class VisualPromptAgent:
                 _merge_visualize_telemetry(telemetry, metric)
         return [shot for shot, _metric in results]
 
-    async def _run_parallel_visualize(self, script, *, prompt_overrides, creative_profile, telemetry, source_text, _repair_character_profiles, progress_callback=None):
+    async def _run_parallel_visualize(self, script, *, prompt_overrides, creative_profile, telemetry, source_text, _repair_character_profiles, progress_callback=None, provider_max_duration_sec: int | None = None, provider_min_duration_sec: int = 3, provider_duration_options: list[int] | None = None):
         """Plan B: two-phase parallel; falls back to single-shot on persistent failure."""
         try:
             manifest_text = self._format_manifest(script)
@@ -1132,7 +1373,21 @@ class VisualPromptAgent:
                     "transport_retries": gmetrics.get("transport_retries", 0),
                     "timeout_sec": gmetrics.get("timeout_sec", 0),
                 })
-            shots = await self._run_parallel_scene_deltas(script, manifest_text, global_out, profile, telemetry, progress_callback=progress_callback)
+            scene_delta_kwargs = {
+                "progress_callback": progress_callback,
+                "provider_max_duration_sec": provider_max_duration_sec,
+                "provider_duration_options": provider_duration_options,
+            }
+            if provider_min_duration_sec != 3:
+                scene_delta_kwargs["provider_min_duration_sec"] = provider_min_duration_sec
+            shots = await self._run_parallel_scene_deltas(
+                script,
+                manifest_text,
+                global_out,
+                profile,
+                telemetry,
+                **scene_delta_kwargs,
+            )
             if telemetry is not None:
                 _merge_visualize_telemetry(telemetry, gmetrics)
             profile_repair_status = "not_needed"
@@ -1157,7 +1412,16 @@ class VisualPromptAgent:
                 profile_repair_errors = list(repair_result.errors or [])
                 output.global_character_descriptions = repaired_en
                 output.global_character_descriptions_cn = repaired_cn
-            result = self._split_output(output, script, prompt_overrides, creative_profile)
+            split_kwargs = {}
+            if provider_max_duration_sec is not None:
+                split_kwargs["provider_max_duration_sec"] = provider_max_duration_sec
+            if provider_min_duration_sec != 3:
+                split_kwargs["provider_min_duration_sec"] = provider_min_duration_sec
+            if provider_duration_options:
+                split_kwargs["provider_duration_options"] = provider_duration_options
+            result = self._split_output(
+                output, script, prompt_overrides, creative_profile, **split_kwargs
+            )
             _apply_profile_repair_metadata(
                 result[0], telemetry, profile_repair_status, profile_repair_errors
             )
@@ -1186,6 +1450,9 @@ class VisualPromptAgent:
                 telemetry=fallback_metrics,
                 source_text=source_text,
                 _repair_character_profiles=_repair_character_profiles,
+                provider_max_duration_sec=provider_max_duration_sec,
+                provider_min_duration_sec=provider_min_duration_sec,
+                provider_duration_options=provider_duration_options,
             )
             if telemetry is not None:
                 prior_attempts = int(telemetry.get("attempts") or 0)
@@ -1204,6 +1471,9 @@ class VisualPromptAgent:
         progress_callback=None,
         source_text: str = "",
         _repair_character_profiles: bool = True,
+        provider_max_duration_sec: int | None = None,
+        provider_min_duration_sec: int = 3,
+        provider_duration_options: list[int] | None = None,
     ) -> tuple[VisualDesign, GenerationPrompts]:
         """For Kimi, generate one scene per request to reduce provider timeout risk."""
         if telemetry is not None:
@@ -1219,6 +1489,7 @@ class VisualPromptAgent:
         total = len(script.scenes)
         merged_scene_visuals: list[SceneVisual] = []
         merged_shots: list[ShotPrompt] = []
+        merged_shot_plans = []
         global_en: dict[str, str] = {}
         global_cn: dict[str, str] = {}
         merged_assembly_diagnostics: list[PromptAssemblyDiagnostic] = []
@@ -1247,6 +1518,15 @@ class VisualPromptAgent:
                 telemetry=call_metrics,
                 source_text=source_text,
                 _repair_character_profiles=False,
+                video_generation_policy=(
+                    {"capability": {
+                        "duration_min": provider_min_duration_sec,
+                        "duration_max": provider_max_duration_sec,
+                        "durations": list(provider_duration_options or []),
+                        "discrete_durations": bool(provider_duration_options),
+                    }}
+                    if provider_max_duration_sec is not None else None
+                ),
             )
 
             if not overall_style:
@@ -1263,10 +1543,8 @@ class VisualPromptAgent:
                 profile_repair_status = visual.profile_repair_status
             merged_scene_visuals.extend(visual.scenes)
             merged_shots.extend(prompts.shots)
+            merged_shot_plans.extend(prompts.shot_plans or [])
             merged_assembly_diagnostics.extend(prompts.assembly_diagnostics)
-            if prompts.shots:
-                scene.duration_sec = prompts.shots[0].duration_sec
-
             if telemetry is not None:
                 telemetry["attempts"] += call_metrics.get("attempts", 0)
                 telemetry["repair_attempts"] += call_metrics.get("repair_attempts", 0)
@@ -1293,7 +1571,6 @@ class VisualPromptAgent:
             global_en.update(repaired_en)
             global_cn.update(repaired_cn)
 
-        script.duration_sec = sum(int(scene.duration_sec or 0) for scene in script.scenes)
         return (
             VisualDesign(
                 overall_style=overall_style or "写实",
@@ -1311,6 +1588,7 @@ class VisualPromptAgent:
                 needs_refresh=False,
                 global_negative_prompt=global_negative_prompt,
                 shots=merged_shots,
+                shot_plans=merged_shot_plans,
                 assembly_diagnostics=merged_assembly_diagnostics,
             ),
         )
@@ -1593,6 +1871,10 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         script: ScriptBreakdown,
         prompt_overrides: dict | None,
         creative_profile=None,
+        video_generation_policy: dict | None = None,
+        provider_max_duration_sec: int | None = None,
+        provider_min_duration_sec: int = 3,
+        provider_duration_options: list[int] | None = None,
     ) -> tuple[VisualDesign, GenerationPrompts]:
         """Split the combined LLM output into VisualDesign and GenerationPrompts."""
 
@@ -1609,11 +1891,26 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
         # Build VisualDesign
         scene_visuals = []
         prompt_shots = []
+        resolved_cap = provider_max_duration_sec or _provider_duration_cap(video_generation_policy)
+        resolved_min = provider_min_duration_sec or _provider_duration_min(video_generation_policy)
+        resolved_duration_options = (
+            list(provider_duration_options or [])
+            or _provider_duration_options(video_generation_policy)
+        )
         source_scene_durations = {
-            scene.scene_id: max(3, min(30, int(scene.duration_sec or 3)))
+            scene.scene_id: max(3, int(scene.duration_sec or 3))
             for scene in script.scenes
         }
         source_total = int(script.duration_sec or sum(source_scene_durations.values()))
+        shot_plans = [
+            build_shot_plan(
+                scene.model_copy(deep=True),
+                provider_max_duration_sec=resolved_cap,
+                provider_min_duration_sec=resolved_min,
+                provider_durations=resolved_duration_options or None,
+            )
+            for scene in script.scenes
+        ]
 
         # Index only the first record for each source scene. Duplicate model
         # records must not silently replace an otherwise valid shot.
@@ -1650,7 +1947,8 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             ))
 
             duration = _planned_scene_duration(scene, shot)
-            scene.duration_sec = duration
+            # Keep the authored scene schedule immutable; the derived duration
+            # belongs only to the generated ShotPrompt and diagnostics.
             seed = None if shot is None else shot.seed
             if seed is None:
                 # Derive seed from the main character name so the same
@@ -1682,7 +1980,13 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
 
         assembly_diagnostics: list[PromptAssemblyDiagnostic] = []
 
-        _fit_duration_budget(prompt_shots, script, source_scene_durations, source_total)
+        _fit_duration_budget(
+            prompt_shots,
+            script,
+            source_scene_durations,
+            source_total,
+            provider_max_duration_sec=resolved_cap,
+        )
 
         allowed_global_names = visual_character_names(script)
         global_en = output.global_character_descriptions or {}
@@ -1710,10 +2014,8 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             ),
             shots=prompt_shots,
             assembly_diagnostics=assembly_diagnostics,
+            shot_plans=shot_plans,
         )
-        if source_total <= 0:
-            script.duration_sec = sum(int(scene.duration_sec or 0) for scene in script.scenes)
-
         protected_scene_ids: set[int] = set()
 
         # Apply user prompt overrides
@@ -1727,6 +2029,10 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             prompts.shots,
             script,
             protected_scene_ids=protected_scene_ids,
+            # The records in ``prompts.shots`` are parent storyboard prompts.
+            # A parent may legitimately exceed a provider's single-shot limit;
+            # executable child units are materialized and validated later.
+            duration_cap_sec=None,
         )
 
         # The timed composer rewrites each shot prompt, so carry-over segments
@@ -1765,6 +2071,9 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             analyze_shot_capacity(
                 scene,
                 next((item for item in prompts.shots if item.scene_id == scene.scene_id), None),
+                provider_max_duration_sec=provider_max_duration_sec or _provider_duration_cap(video_generation_policy),
+                provider_min_duration_sec=resolved_min,
+                provider_durations=resolved_duration_options or None,
             )
             for scene in script.scenes
         ]
@@ -1801,10 +2110,16 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             character.name: character
             for character in (script.asset_manifest.characters if script.asset_manifest else [])
         }
+        def _no_trailing_period(value: str) -> str:
+            # DeepSeek 输出的风格/色彩句常自带句号；拼接"；画幅"前剥掉，
+            # 避免"层次柔和。；9:16画幅。"式连标点。
+            return str(value or "").strip().rstrip("。；;，, ")
+
         parts = [
-            f"【项目视觉】{legacy_style or output.overall_style}；{output.color_palette}；{output.aspect_ratio}画幅。",
+            f"【项目视觉】{_no_trailing_period(legacy_style or output.overall_style)}；"
+            f"{_no_trailing_period(output.color_palette)}；{output.aspect_ratio}画幅。",
             style_block,
-            f"【主体状态】{getattr(shot, 'subject_state', '') or scene.action_description}。",
+            f"【主体状态】{_drop_disordered_state_clauses(script, scene.scene_id, getattr(shot, 'subject_state', '') or '', scene) or scene.action_description}。",
             f"【动作时间轴】{getattr(shot, 'action_timeline', '') or scene.action_description}。",
             (
                 "【环境】" + build_shot_environment_context(
@@ -1824,7 +2139,20 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 stable_description, inferred_state = split_character_identity_and_state(
                     name, description, getattr(binding, "visible_state_notes", "") if binding else "",
                     getattr(scene, "action_description", ""),
+                    character_names=tuple(visible_names),
                 )
+                # Mutable-appearance clauses that contradict the established
+                # cross-shot timeline (hat before it is put on, hat removed
+                # twice, curled hair before the curling scene) are dropped here
+                # so per-shot state order follows the structured scene sequence
+                # instead of model drift.
+                inferred_state = _drop_disordered_state_clauses(script, scene.scene_id, inferred_state, scene)
+                # The stored parent prompt keeps the full stable identity so it
+                # stays the editable source of truth and the fidelity gate can
+                # audit it.  The execution layer (render_execution_prompt) is
+                # the place that collapses identity to "以参考图为准" once a
+                # valid character reference actually covers the role.
+                stable_description = str(stable_description or "").strip()
                 appearances.append(f"{name}：{stable_description}" if stable_description else name)
                 if inferred_state:
                     scene_states.append(f"{name}：{inferred_state}")
@@ -1832,7 +2160,9 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
             if scene_states and not (binding and binding.visible_state_notes):
                 parts.insert(2, f"【角色状态】{'；'.join(scene_states)}。")
         if binding and binding.visible_state_notes:
-            parts.insert(2, f"【角色状态】{binding.visible_state_notes}。")
+            bound_note = _drop_disordered_state_clauses(script, scene.scene_id, binding.visible_state_notes, scene)
+            if bound_note:
+                parts.insert(2, f"【角色状态】{bound_note}。")
         bound_props = props_for_scene(script, scene.scene_id)
         if bound_props:
             prop_anchors = "；".join(
@@ -1840,26 +2170,13 @@ description_cn 必须为 80-180 个汉字，完整覆盖性别与年龄段、身
                 for prop in bound_props
             )
             parts.append(f"【绑定道具】{prop_anchors}。")
-        prop_state = getattr(shot, 'prop_state', '')
+        prop_state = sanitize_prop_state(
+            _normalize_prop_mentions(getattr(shot, "prop_state", ""), bound_props)
+        )
         if prop_state:
             parts.append(f"【关键道具】{prop_state}。")
-        prev_state = []
         if getattr(scene, "continuity_from_prev", False) and prev_shot is not None:
-            for label, value in (
-                ("主体状态", getattr(prev_shot, "subject_state", "")),
-                ("环境", getattr(prev_shot, "environment_delta", "")),
-                ("光线", getattr(prev_shot, "lighting_delta", "")),
-                ("关键道具", getattr(prev_shot, "prop_state", "")),
-            ):
-                value = str(value or "").strip()
-                if value:
-                    prev_state.append(f"{label}：{value}")
-        if prev_state:
-            parts.append(f"【顺承上一镜】本镜承接上一镜结尾画面状态，开头保持与上一镜一致——{'；'.join(prev_state)}。")
-        elif getattr(scene, "continuity_from_prev", False) and prev_shot is not None:
-            # 旧契约镜头（single-shot 回落）没有结构化画面状态字段时，
-            # 仍保留承接语义，但不泄露上一镜动作/剧情细节。
-            parts.append("【顺承上一镜】本镜承接上一镜结尾画面状态，开场保持与上一镜一致的姿态、站位、空间与光线。")
+            parts.append(_build_continuity_segment(prev_shot))
         return "\n".join(part for part in parts if part.strip())
 
     @staticmethod
@@ -1946,7 +2263,7 @@ class _ShotVisualPrompt(BaseModel):
     environment_delta: str = Field(default="", description="仅静态/持续的环境差异（建筑、陈设、天气、地形、空间、整体光线）；禁止人物动作、情绪、在场、对白或道具交互；无则留空")
     camera_motion: str = Field(default="", description="Camera framing or movement unique to this shot")
     lighting_delta: str = Field(default="", description="Lighting details unique to this shot")
-    prop_state: str = Field(default="", description="Bound prop position, material, or interaction state")
+    prop_state: str = Field(default="", description="本镜道具外观、位置、在谁手里；禁止拿起/打开/取出/递给/入袋等动作过程")
     prompt: str = Field(default="", description="Legacy complete Chinese prompt; optional for backward compatibility")
     negative_prompt: str = Field(
         default="低清晰度，模糊，水印，文字，畸形五官，错误肢体，多余手指，动作抖动，道具变形"

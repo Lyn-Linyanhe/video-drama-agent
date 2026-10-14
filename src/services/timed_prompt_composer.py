@@ -8,6 +8,7 @@ from typing import Literal
 
 from src.schemas.prompt import ShotPrompt
 from src.schemas.script import DialogueLine, Scene, ScriptBreakdown
+from src.services.beat_planner import estimate_scene_capacity
 from src.services.prompt_composer import has_planned_editing
 from src.utils.visual_asset_manifest import binding_for_scene, props_for_scene
 
@@ -164,16 +165,52 @@ def _contains(text: str, *tokens: str) -> bool:
     return any(token.casefold() in lowered for token in tokens)
 
 
+def _camera_direction_context(scene: Scene | None, text: str = "") -> str:
+    return " ".join(
+        part
+        for part in (
+            str(text or "").strip(),
+            str(getattr(scene, "camera_direction", "") or "").strip(),
+            str(getattr(scene, "action_description", "") or "").strip(),
+        )
+        if part
+    )
+
+
+def _explicit_camera_view(scene: Scene | None, text: str = "") -> str:
+    context = _camera_direction_context(scene, text)
+    if _contains(context, "过肩", "over shoulder", "over-the-shoulder"):
+        return "过肩"
+    if _contains(context, "背面跟拍", "背后跟拍", "背影", "背对镜头", "从背后拍", "背拍"):
+        return "背面"
+    if _contains(context, "侧后方", "侧背面"):
+        return "侧后方"
+    if _contains(context, "三分之二侧", "四分之三侧", "侧面", "侧拍", "侧脸", "侧身"):
+        return "三分之二侧前方"
+    if _contains(context, "正面", "面对镜头", "直视镜头"):
+        return "正面"
+    return ""
+
+
 def _camera_label(scene: Scene | None, text: str) -> str:
-    if _contains(text, "大特写", "extreme close", "macro"):
-        return "大特写/插入"
-    if _contains(text, "特写", "close-up", "closeup"):
-        return "特写/正面缓慢推近"
-    if _contains(text, "过肩", "over shoulder", "over-the-shoulder"):
+    context = _camera_direction_context(scene, text)
+    view = _explicit_camera_view(scene, text)
+    push_in = _contains(context, "推近", "推进", "dolly in", "缓慢推")
+    if _contains(context, "大特写", "extreme close", "macro"):
+        if view == "过肩":
+            return "大特写/过肩缓慢推近" if push_in else "大特写/过肩固定"
+        return f"大特写/{view or '插入'}"
+    if _contains(context, "特写", "close-up", "closeup"):
+        return f"特写/{view or '三分之二侧前方'}{'缓慢推近' if push_in or not view else '固定'}"
+    if view == "过肩":
         return "中近景/过肩固定"
-    if _contains(text, "全景", "远景", "wide"):
-        return "中景/环境带人物"
-    return str(getattr(scene, "camera_direction", "") or "中近景/正面固定")
+    if _contains(context, "全景", "远景", "wide"):
+        return f"中景/{view + '环境带人物' if view else '环境带人物'}"
+    authored = str(getattr(scene, "camera_direction", "") or "").strip()
+    if authored and view:
+        return authored
+    framing = authored or "中近景"
+    return f"{framing}/三分之二侧前方固定"
 
 
 def _visible_character_names(scene: Scene | None, text: str = "", script: ScriptBreakdown | None = None) -> list[str]:
@@ -213,13 +250,181 @@ def _visible_character_names(scene: Scene | None, text: str = "", script: Script
     return list(dict.fromkeys(names))
 
 
+def _explicit_core_intent(text: str) -> str:
+    """Return the authored core-intent line without unrelated prompt prose."""
+    cleaned = _strip_binding_prop_section(_strip_model_prompt_supplement(text or ""))
+    match = re.search(
+        r"核心分镜意图\s*[:：]\s*(.*?)(?=\n(?:【|(?:切镜头，)?\d)|$)",
+        cleaned,
+        flags=re.S,
+    )
+    return _preview_core_intent(match.group(1)) if match else ""
+
+
+def _prompt_current_scope(scene: Scene, original: str) -> tuple[str, bool, bool]:
+    """Resolve the portion of a compact prompt that describes this shot.
+
+    A Scene can contain several authored actions, while a generated ShotPrompt
+    may intentionally cover only one of them.  Once the prompt contains a
+    concrete subject state, action timeline, or core intent, that text is the
+    current-shot boundary; the complete scene action must not be treated as
+    additional trigger evidence.  A generic placeholder timeline is the one
+    deliberate exception: it asks the composer to materialize the whole
+    structured scene action.
+    """
+    cleaned = _strip_binding_prop_section(_strip_model_prompt_supplement(original or ""))
+    sections = _sections(cleaned)
+    subject = _section_value(sections, "主体状态", "角色状态")
+    timeline = _section_value(sections, "动作时间轴")
+    core_intent = _explicit_core_intent(cleaned)
+    key_prop = _section_value(sections, "关键道具")
+    scoped_parts = [part for part in (subject, timeline, core_intent, key_prop) if part]
+    if scoped_parts:
+        full_scene_directive = bool(timeline) and (
+            _placeholder_only_timeline(timeline)
+            or _contains(
+                timeline,
+                "按顺序完成当前场景动作",
+                "完整完成当前场景动作",
+                "完成本镜头全部动作",
+                "完整表现当前场景动作",
+                "保持安静，等待危险过去",
+                "保持当前状态",
+                "保持动作起点清楚",
+            )
+        )
+        return " ".join(scoped_parts), True, full_scene_directive
+    if not sections:
+        fallback = _normalize_prompt_text(cleaned)
+        # A bare/free-form compact response does not establish a reliable
+        # shot boundary; retain the canonical-action fallback. An explicit
+        # core-intent line is included in scoped_parts above.
+        return fallback, False, False
+    return "", False, False
+
+
+def _split_action_fragments(text: str) -> list[str]:
+    """Split canonical actions without losing temporal clause boundaries."""
+    fragments: list[str] = []
+    for raw in re.split(r"[，,；;。！？!?\n]+", _normalize_prompt_text(text or "")):
+        for piece in re.split(
+            r"(?=(?:随后|然后|接着|之后|后来|随即|紧接着))",
+            raw,
+        ):
+            fragment = _normalize_prompt_text(piece).strip("。；;，, ")
+            if len(fragment) >= 4 and fragment not in fragments:
+                fragments.append(fragment)
+    return fragments
+
+
+def _fragment_is_in_scope(fragment: str, scope: str) -> bool:
+    fragment_key = re.sub(r"\s+", "", _normalize_prompt_text(fragment).casefold())
+    scope_key = re.sub(r"\s+", "", _normalize_prompt_text(scope).casefold())
+    if not fragment_key or not scope_key:
+        return False
+    variants = [
+        fragment_key,
+        re.sub(r"^(?:随后|然后|接着|之后|后来|随即|紧接着)", "", fragment_key),
+    ]
+    return any(
+        key and (key in scope_key or (len(scope_key) >= 8 and scope_key in key))
+        for key in variants
+    )
+
+
+def _current_action_fragments(scene: Scene | None, original: str) -> list[str]:
+    """Return only canonical action clauses supported by the current prompt."""
+    if scene is None:
+        return []
+    canonical = _normalize_prompt_text(getattr(scene, "action_description", "") or "")
+    if not canonical:
+        return []
+    scope, has_scope, allow_full = _prompt_current_scope(scene, original)
+    fragments = _split_action_fragments(canonical)
+    if not has_scope or allow_full:
+        return fragments
+    return [fragment for fragment in fragments if _fragment_is_in_scope(fragment, scope)]
+
+
+def _current_action_source(scene: Scene | None, original: str) -> str:
+    """Return a safe canonical action source for current-shot decisions."""
+    return "；".join(_current_action_fragments(scene, original))
+
+
+def _scoped_scene_action_source(scene: Scene | None, prompt_text: str) -> str:
+    """Return canonical action evidence that is safe for this shot.
+
+    A scene action is often a compact sequence rather than one atomic event.
+    Coverage and repair code still needs the scene's concrete nouns (for
+    example a phone or an envelope), but it must not use a later clause as
+    evidence for a shot whose prompt only describes the opening state.  When
+    the current prompt names a later clause, keep that matched clause; when it
+    names no clause, keep the stable prefix before the first explicit temporal
+    transition.  Untimed actions without a temporal marker remain available as
+    same-shot evidence for backwards-compatible compact prompts.
+    """
+    if scene is None:
+        return ""
+    fragments = _split_action_fragments(
+        _normalize_prompt_text(getattr(scene, "action_description", "") or "")
+    )
+    if not fragments:
+        return ""
+
+    scope, has_scope, allow_full_scene = _prompt_current_scope(scene, prompt_text)
+    if not has_scope or allow_full_scene:
+        return "；".join(fragments)
+
+    scoped_fragments = [
+        fragment for fragment in fragments if _fragment_is_in_scope(fragment, scope)
+    ]
+    if scoped_fragments:
+        return "；".join(scoped_fragments)
+
+    temporal_index = next(
+        (
+            index
+            for index, fragment in enumerate(fragments)
+            if index > 0
+            and re.match(r"^(?:随后|然后|接着|之后|后来|随即|紧接着)", fragment)
+        ),
+        None,
+    )
+    if temporal_index is not None:
+        return "；".join(fragments[:temporal_index])
+    return "；".join(fragments)
+
+
+def _scoped_scene_context(scene: Scene | None, prompt_text: str) -> str:
+    """Build stable scene evidence without importing later timed actions."""
+    if scene is None:
+        return ""
+    action_source = _scoped_scene_action_source(scene, prompt_text)
+    dialogue = " ".join(
+        f"{line.character} {line.line} {line.emotion or ''}"
+        for line in getattr(scene, "dialogue", []) or []
+    )
+    return " ".join(
+        part
+        for part in (
+            str(getattr(scene, "location", "") or ""),
+            action_source,
+            str(getattr(scene, "camera_direction", "") or ""),
+            str(getattr(scene, "emotion_tone", "") or ""),
+            dialogue,
+        )
+        if part
+    )
+
+
 def _scene_trigger_text(scene: Scene, original: str) -> str:
     original = _strip_model_prompt_supplement(original)
     sections = _sections(original)
-    core_intent = _preview_core_intent(original)
+    core_intent = _explicit_core_intent(original) or _preview_core_intent(original)
+    current_action = _current_action_source(scene, original)
     parts = [
         scene.location,
-        scene.action_description,
+        current_action,
         scene.camera_direction,
         scene.emotion_tone,
         _section_value(sections, "主体状态", "角色状态"),
@@ -236,7 +441,7 @@ def _current_event_text(scene: Scene, original: str) -> str:
     """Return only the current shot evidence used to trigger hard story beats."""
     original = _strip_binding_prop_section(_strip_model_prompt_supplement(original))
     sections = _sections(original)
-    core_intent = _preview_core_intent(original)
+    core_intent = _explicit_core_intent(original) or _preview_core_intent(original)
     structured_parts = [
         _section_value(sections, "主体状态", "角色状态"),
         _section_value(sections, "动作时间轴"),
@@ -244,15 +449,12 @@ def _current_event_text(scene: Scene, original: str) -> str:
         core_intent,
     ]
     parts = [part for part in structured_parts if part]
-    # The compact LLM contract is intentionally allowed to omit details. Keep
-    # the canonical action as a same-shot source of truth so deterministic
-    # event rules still fire when a model returns a generic subject state.
-    canonical_action = _normalize_prompt_text(getattr(scene, "action_description", ""))
-    if canonical_action:
-        parts.append(canonical_action)
+    current_action = _current_action_source(scene, original)
+    if current_action:
+        parts.append(current_action)
     if parts:
         return " ".join(parts)
-    return " ".join(part for part in [original, scene.action_description] if part)
+    return " ".join(part for part in [original, current_action] if part)
 
 
 
@@ -379,22 +581,28 @@ def _revealed_name(text: str, names: list[str]) -> str:
     if not text or not names:
         return ""
 
-    # Prefer an explicit ``...露出<name>...`` phrase.  Search all occurrences
-    # because the compact shot summary can mention ``露出真面目`` before the
-    # canonical scene action names the revealed character.
-    reveal_matches: list[tuple[int, int, str]] = []
-    for match in re.finditer(r"露出", text):
-        after = text[match.end() : match.end() + 24]
-        for name in names:
-            offset = after.find(name)
-            if offset >= 0:
-                reveal_matches.append((match.start(), offset, name))
-    if reveal_matches:
-        return sorted(reveal_matches, key=lambda item: (item[0], item[1]))[-1][2]
+    # Only accept a name immediately attached to ``露出``.  Looking for any
+    # character name within a broad window lets a later generic phrase such as
+    # ``陆临露出真面目，顾衡与他扭打`` incorrectly overwrite the explicit
+    # ``露出陆临的脸`` evidence with 顾衡.
+    explicit_matches: list[tuple[int, str]] = []
+    for name in names:
+        if not name:
+            continue
+        pattern = rf"露出(?:了)?\s*{re.escape(name)}(?:的)?(?:脸|身份|真面目)?"
+        explicit_matches.extend(
+            (match.start(), name) for match in re.finditer(pattern, text)
+        )
+    if explicit_matches:
+        return max(explicit_matches, key=lambda item: item[0])[1]
 
     # For a bare ``<name>露出真面目`` cue the actor immediately before the
     # cue is the only reliable subject available in the current shot.
-    return _last_named_before(text, "露出真面目", names)
+    for cue in ("露出真面目", "露出身份", "身份揭露"):
+        actor = _last_named_before(text, cue, names)
+        if actor:
+            return actor
+    return ""
 
 
 def _first_context_token(text: str, tokens: tuple[str, ...], fallback: str) -> str:
@@ -525,7 +733,8 @@ def _frame_label_for_characters(scene: Scene | None, names: list[str] | None = N
     if count == 2:
         return "中景双人/侧面固定"
     if count == 1:
-        return "中近景单人/正面固定"
+        view = _explicit_camera_view(scene)
+        return f"中近景单人/{view or '三分之二侧前方'}固定"
     return "中景/侧面固定"
 
 
@@ -552,6 +761,64 @@ def _missing_dialogue_addendum(scene: Scene | None, text: str) -> str:
         "【对白/独白】"
         + " / ".join(missing)
         + "。对白和独白原文必须完整保留；voice_only只控制画面是否出现说话者，不能删除声音内容。"
+    )
+
+
+def _missing_canonical_action_addendum(
+    scene: Scene | None,
+    rendered: str,
+    source_text: str,
+    *,
+    prompt_text: str = "",
+) -> str:
+    """Restore concrete structured-scene actions lost by a template branch.
+
+    The source is restricted to ``Scene.action_description``.  We only add
+    atomic fragments that are absent verbatim from the rendered prompt, and we
+    reuse the existing stale-event guard so a single-character current-shot
+    prompt cannot re-introduce a known future-event template.
+    """
+    if scene is None:
+        return ""
+    prompt_scope, has_scope, allow_full_scene = _prompt_current_scope(scene, prompt_text)
+    source_fragments = _current_action_fragments(scene, prompt_text)
+    if not source_fragments:
+        return ""
+    rendered_compact = re.sub(r"\s+", "", rendered.casefold())
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for fragment in source_fragments:
+        if re.fullmatch(r"(?:\d+|[一二三四五六七八九十百零两]+)点整", fragment):
+            continue
+        key = re.sub(r"\s+", "", fragment.casefold())
+        if not key or key in seen or key in rendered_compact:
+            continue
+        seen.add(key)
+        # When a structured prompt describes only one local state/action, only
+        # a canonical clause that matches that scope may be restored.  A
+        # placeholder timeline that explicitly requests the whole scene is the
+        # intentional exception handled by _current_action_fragments.
+        if has_scope and not allow_full_scene and not _fragment_is_in_scope(fragment, prompt_scope):
+            continue
+        # Ask the existing current-shot stale-event repair whether this
+        # fragment would be rejected as a known future/template event.  The
+        # trusted source is the prompt-bounded scope, not the whole Scene.
+        candidate = f"0s，{fragment}"
+        repaired_candidate = _repair_stale_event_line(
+            candidate,
+            _scene_source_text(scene),
+            source_text or prompt_scope,
+            scene,
+        )
+        if key not in re.sub(r"\s+", "", repaired_candidate.casefold()):
+            continue
+        fragments.append(fragment)
+    if not fragments:
+        return ""
+    return (
+        "【剧本动作补全】"
+        + "；".join(fragments)
+        + "。只补回结构化剧本本镜动作，不新增未被剧本支持的事件。"
     )
 
 
@@ -620,20 +887,78 @@ def _placeholder_only_timeline(value: str) -> bool:
     )
 
 
+def _has_authored_edit_evidence(text: str, scene: Scene | None = None) -> bool:
+    """Return whether authored shot evidence requires more than one edit beat.
+
+    This deliberately ignores the generated continuity guards.  Phrases such as
+    ``不切镜头`` are policy text, not evidence that the source scene is a
+    single take; positive cut language must come from a camera/action section,
+    a timed segment, or the structured scene itself.
+    """
+    cleaned = _strip_model_prompt_supplement(text or "")
+    sections = _sections(cleaned)
+    evidence_parts = [
+        _section_value(sections, "动作意图", "动作时间轴"),
+        _section_value(sections, "镜头语言", "镜头"),
+        _preview_core_intent(cleaned),
+    ]
+    for line in cleaned.splitlines():
+        parsed = _timed_line_parts(line)
+        if parsed:
+            if parsed[0]:
+                return True
+            evidence_parts.append(parsed[2])
+    if scene is not None:
+        evidence_parts.extend([
+            str(getattr(scene, "camera_direction", "") or ""),
+            _current_action_source(scene, cleaned),
+        ])
+
+    evidence = " ".join(part for part in evidence_parts if part)
+    # Remove policy sentences before looking for positive edit evidence.
+    evidence = re.sub(r"严格按上述时间轴执行，只在写明[“\"']?切镜头[”\"']?的位置切换[^。\n]*", "", evidence)
+    evidence = re.sub(r"(?:单镜头连续完成|单镜头贯穿|不切镜头|不切换镜头|不得切镜头)", "", evidence)
+    positive_patterns = (
+        r"切镜头",
+        r"镜头\s*切(?:到|至|为)?",
+        r"(?:再|随后)?切(?:换|到|至|为)?(?:镜头|中景|近景|特写|大特写|远景|全景|侧面|正面|过肩)",
+        r"反打",
+        # “插入镜头式推近/插入镜头感” can still be one continuous
+        # camera move; only explicit cut/反打/闪回 language is evidence here.
+        r"闪回",
+        r"蒙太奇",
+    )
+    return any(re.search(pattern, evidence, flags=re.IGNORECASE) for pattern in positive_patterns)
+
+
 def _has_complex_edit_need(text: str, scene: Scene | None) -> bool:
-    text = _text(scene, text)
-    if has_planned_editing(text) and "【动作时间轴】" not in text:
+    original = _strip_model_prompt_supplement(text or "")
+    current_text = _current_event_text(scene, original) if scene is not None else original
+    scene_context: list[str] = []
+    if scene is not None:
+        scene_context = [
+            str(getattr(scene, "location", "") or ""),
+            _current_action_source(scene, original),
+            str(getattr(scene, "camera_direction", "") or ""),
+            str(getattr(scene, "emotion_tone", "") or ""),
+            _dialogue_text(getattr(scene, "dialogue", []) or []),
+        ]
+    evidence = " ".join(part for part in (original, current_text, *scene_context) if part)
+    if has_planned_editing(original) and "【动作时间轴】" not in original:
+        return True
+    if _has_authored_edit_evidence(original, scene):
         return True
     if scene and len(getattr(scene, "characters", []) or []) >= 2 and getattr(scene, "dialogue", []):
         return True
+    fallback_text = re.sub(r"插入镜头(?:式|感)?", "", evidence)
     return _contains(
-        text,
+        fallback_text,
         "闪回", "旧报纸", "旧信", "照片背面", "回头", "街道尽头", "红绿灯",
         "对峙", "把信给我", "不要交给你", "追逐", "奔跑", "打斗", "扭打",
         "摄像头", "红光", "布控", "储物柜", "手电", "躲藏", "黑衣人", "逼近", "钟声", "录音机", "磁带",
         "摘下口罩", "露出真面目", "火漆", "泡开", "铁盒", "铜钟", "暗道",
         "齿轮", "下沉", "灯灭", "进入暗道", "电话那头", "打电话", "拨号", "拨通", "通话", "接电话", "来电", "苍老",
-        "大特写", "插入", "反打", "快速摇摄", "切镜头", "切到", "切回",
+        "大特写", "反打", "快速摇摄", "切镜头", "切到", "切回",
     )
 
 
@@ -804,14 +1129,14 @@ def _single_take_segments(scene: Scene, original: str, total: float, script: Scr
     sections = _sections(original)
     visible_names = _visible_character_names(scene, original, script)
     subject = _main_subject(scene, visible_names)
-    subject_state = _section_value(sections, "主体状态", "角色状态") or scene.action_description
-    # The compact visual contract may return a generic state such as
-    # "保持动作起点清楚".  Keep the canonical scene action alongside it so
-    # new topics (lab work, medical procedures, classroom actions, etc.) do
-    # not lose their concrete verbs and objects during timed expansion.
-    canonical_action = _normalize_prompt_text(getattr(scene, "action_description", ""))
-    if canonical_action and canonical_action not in subject_state:
-        subject_state = _dedupe_sentences(subject_state, canonical_action)
+    subject_state = _section_value(sections, "主体状态", "角色状态")
+    # A compact prompt may contain a generic state.  Supplement it with only
+    # canonical actions that the current-shot scope authorizes; do not pull a
+    # later action from the same Scene into this single-take shot.
+    current_action = _current_action_source(scene, original)
+    subject_state = subject_state or current_action or scene.action_description
+    if current_action and current_action not in subject_state:
+        subject_state = _dedupe_sentences(subject_state, current_action)
     camera = _section_value(sections, "镜头语言", "镜头") or scene.camera_direction or "中近景缓慢推近"
     lighting = _section_value(sections, "光线与色调", "灯光与环境") or scene.emotion_tone
     prop_state = _section_value(sections, "关键道具")
@@ -828,8 +1153,9 @@ def _single_take_segments(scene: Scene, original: str, total: float, script: Scr
         ]
         diff = round(total - sum(duration for duration, _ in parsed), 1)
         parsed[-1] = (max(0.8, round(parsed[-1][0] + diff, 1)), parsed[-1][1])
-    if _has_sms_visual_cue(original) and not getattr(scene, "dialogue", []) and len(visible_names) <= 1:
-        parsed[0] = (parsed[0][0], _current_prop_insert_description(original, subject=subject))
+    current_evidence = _current_event_text(scene, original)
+    if _has_sms_visual_cue(current_evidence) and not getattr(scene, "dialogue", []) and len(visible_names) <= 1:
+        parsed[0] = (parsed[0][0], _current_prop_insert_description(current_evidence, subject=subject))
 
     segments = []
     elapsed = 0.0
@@ -1237,12 +1563,33 @@ def _coverage_addendum(
     script: ScriptBreakdown | None = None,
     *,
     current_event_text: str = "",
+    prompt_text: str = "",
+    current_scope: str = "",
+    has_explicit_scope: bool = False,
+    allow_full_scene_action: bool = False,
 ) -> str:
     if scene is None:
         return ""
 
+    if prompt_text:
+        resolved_scope, resolved_has_scope, resolved_allow_full = _prompt_current_scope(
+            scene, prompt_text
+        )
+        current_scope = current_scope or resolved_scope
+        has_explicit_scope = resolved_has_scope
+        allow_full_scene_action = resolved_allow_full
+
+    # Use the full scene source to discover current prop identities, but strip
+    # explicitly later action clauses before using it as event evidence.  This
+    # lets a generic current-state prompt recover a phone/envelope while
+    # preventing a later "随后拿起手机" clause from being pulled into shot 1.
+    coverage_source = (
+        _scoped_scene_context(scene, prompt_text or current_scope or current_event_text)
+        if prompt_text or current_scope or current_event_text
+        else source_text
+    )
     rendered_text = rendered.casefold()
-    prop_source = " ".join(part for part in (current_event_text, source_text) if part)
+    prop_source = " ".join(part for part in (current_event_text, coverage_source) if part)
     candidate_prop_names = _prop_labels(
         _prop_names(script, scene, prop_source),
         prop_source,
@@ -1253,9 +1600,11 @@ def _coverage_addendum(
         "铁门", "铁盒", "铜钟", "暗道", "火漆", "躲藏", "摄像头", "电箱", "奔跑",
         "打斗", "扭打", "回头", "入口", *candidate_prop_names,
     )
-    event_scope = current_event_text if current_scope_has_detail else source_text
+    event_scope = current_event_text if current_scope_has_detail else coverage_source
     additions: list[str] = []
-    visible_names = _visible_character_names(scene, source_text, script)
+    visible_names = _visible_character_names(scene, current_event_text, script)
+    if not visible_names:
+        visible_names = _visible_character_names(scene, coverage_source, script)
     prop_anchor = _prop_anchor_label(event_scope, candidate_prop_names)
     if visible_names:
         if len(visible_names) >= 3:
@@ -1523,7 +1872,13 @@ def _current_prop_insert_description(
     )
 
 
-def _repair_unmentioned_prop_insert(line: str, source_text: str, scene: Scene | None = None) -> str:
+def _repair_unmentioned_prop_insert(
+    line: str,
+    source_text: str,
+    scene: Scene | None = None,
+    *,
+    replacement_source_text: str | None = None,
+) -> str:
     mismatched_props = ("录音机", "录音笔", "铁盒", "铜钟", "铜钥匙", "旧地图", "地图", "照片")
     content = line.split(TEXT_OVERLAY_NOTE, 1)[0].split("所有可读中文文字优先作为后期叠加", 1)[0]
     if not _contains(content, *mismatched_props):
@@ -1537,12 +1892,70 @@ def _repair_unmentioned_prop_insert(line: str, source_text: str, scene: Scene | 
     prefix = "切镜头，" if line.startswith("切镜头，") else ""
     duration_match = re.search(r"(\d+(?:\.\d+)?s)[，,]", line)
     duration = f"{duration_match.group(1)}，" if duration_match else ""
-    return f"{prefix}{duration}{_current_prop_insert_description(source_text, subject=_scene_subject(scene, source_text))}"
+    replacement_source = replacement_source_text or source_text
+    return f"{prefix}{duration}{_current_prop_insert_description(replacement_source, subject=_scene_subject(scene, replacement_source))}"
 
 
 def _total_duration_from_prompt(text: str) -> float | None:
     match = re.search(r"总时长约(\d+(?:\.\d+)?)s", text or "")
     return float(match.group(1)) if match else None
+
+
+def _replace_declared_prompt_duration(text: str, total: float | None) -> str:
+    """Make a finalized prompt's declared total agree with its shot budget."""
+    if total is None or total <= 0:
+        return text
+    formatted = _fmt_seconds(total)
+    return re.sub(r"总时长约\s*\d+(?:\.\d+)?s", f"总时长约{formatted}", text)
+
+
+_INLINE_TIMELINE_RANGE_RE = re.compile(
+    r"(?P<start>\d+(?:\.\d+)?)\s*(?P<start_unit>s|秒)?\s*[-到]\s*"
+    r"(?P<end>\d+(?:\.\d+)?)(?P<unit>s|秒)(?P<separator>[：:,，])"
+)
+
+
+def _normalize_inline_timeline_ranges(text: str, total: float) -> str:
+    """Normalize inline action schedules as well as standalone timed lines."""
+    output: list[str] = []
+    for line in text.splitlines():
+        matches = list(_INLINE_TIMELINE_RANGE_RE.finditer(line))
+        if not matches:
+            output.append(line)
+            continue
+        # Standalone executable lines are handled by _canonicalize_timed_prompt;
+        # this pass targets model prose such as “动作意图：0-3秒……4-6秒……”.
+        if _timed_line_parts(line):
+            output.append(line)
+            continue
+        durations = [
+            max(0.1, float(match.group("end")) - float(match.group("start")))
+            for match in matches
+        ]
+        scaled = _rebalance_positive_durations(total, durations)
+        elapsed = 0.0
+        replacements: list[tuple[int, int, str]] = []
+        for match, duration in zip(matches, scaled):
+            start = elapsed
+            end = min(total, start + duration)
+            elapsed = end
+            unit = match.group("unit") or match.group("start_unit") or "s"
+            start_text = _fmt_timepoint(start).removesuffix("s")
+            end_text = _fmt_timepoint(end).removesuffix("s")
+            replacements.append((match.start(), match.end(), f"{start_text}-{end_text}{unit}{match.group('separator')}"))
+        for start, end, replacement in reversed(replacements):
+            line = line[:start] + replacement + line[end:]
+        output.append(line)
+    return "\n".join(output)
+
+
+def _normalize_finalized_timeline(text: str, total: float | None) -> str:
+    """Rescale finalized timeline ranges to the executable shot duration."""
+    if total is None or total <= 0:
+        return text
+    updated = _replace_declared_prompt_duration(text, total)
+    updated = _canonicalize_timed_prompt(updated, total)
+    return _normalize_inline_timeline_ranges(updated, float(total))
 
 
 def _repair_timed_duration_coverage(lines: list[str], total: float | None) -> list[str]:
@@ -1589,10 +2002,21 @@ def _repair_timed_duration_coverage(lines: list[str], total: float | None) -> li
 
 
 def _apply_duration_cap_to_prompt(text: str, cap: float | None) -> str:
-    """Keep a finalized prompt's timed segments aligned with a provider cap."""
+    """Validate a finalized prompt against a provider cap without shortening it.
+
+    Finalized timelines are already authored/assembled content.  Rebalancing their
+    durations here silently removes narrative time and makes the request look
+    executable even though the parent shot still contains too much content.  The
+    caller must materialize/split the shot before this function is reached.
+    """
     if cap is None:
         return text
-    cap = max(2.0, float(cap))
+    cap = float(cap)
+    if cap < 3.0:
+        raise ValueError(
+            f"provider duration cap {cap:g}s is below the executable 3s minimum"
+        )
+
     range_pattern = re.compile(
         r"(?P<boundary>^|[；;\n。])(?P<spacing>\s*)"
         r"(?P<cut>切镜头[，,:：]\s*)?"
@@ -1608,31 +2032,13 @@ def _apply_duration_cap_to_prompt(text: str, cap: float | None) -> str:
         ]
         current_total = sum(range_durations)
         declared_total = _total_duration_from_prompt(text)
-        if current_total <= cap and (declared_total is None or declared_total <= cap):
-            return _canonicalize_timed_prompt(text, declared_total or current_total)
-        scaled = _rebalance_positive_durations(cap, range_durations)
-        cursor = 0.0
-        replacement_index = 0
-
-        def replace_range(match: re.Match[str]) -> str:
-            nonlocal cursor, replacement_index
-            duration = scaled[replacement_index]
-            replacement_index += 1
-            start = cursor
-            cursor = round(cursor + duration, 2)
-            return (
-                f"{match.group('boundary')}{match.group('spacing')}"
-                f"{match.group('cut') or ''}{_fmt_seconds(start)}-"
-                f"{_fmt_seconds(cursor)}{match.group('comma')}"
+        effective_total = max(current_total, declared_total or 0.0)
+        if effective_total > cap + 0.01:
+            raise ValueError(
+                f"finalized timed prompt duration {effective_total:g}s exceeds "
+                f"provider duration cap {cap:g}s; split the shot before execution"
             )
-
-        rendered = range_pattern.sub(replace_range, text)
-        return re.sub(
-            r"总时长约\d+(?:\.\d+)?s",
-            f"总时长约{_fmt_seconds(cap)}",
-            rendered,
-            count=1,
-        )
+        return _canonicalize_timed_prompt(text, declared_total or current_total)
 
     timed_pattern = re.compile(
         r"(?P<boundary>^|[；;\n。])(?P<spacing>\s*)"
@@ -1643,31 +2049,16 @@ def _apply_duration_cap_to_prompt(text: str, cap: float | None) -> str:
     matches = list(timed_pattern.finditer(text))
     durations = [float(match.group("duration")) for match in matches]
     declared_total = _total_duration_from_prompt(text)
-    if not durations and (declared_total is None or declared_total <= cap):
-        return text
     current_total = sum(durations)
-    if current_total <= cap and (declared_total is None or declared_total <= cap):
-        return _canonicalize_timed_prompt(text, declared_total or current_total)
-    scaled = _rebalance_positive_durations(cap, durations) if durations else []
-    replacement_index = 0
-
-    def replace_timed_prefix(match: re.Match[str]) -> str:
-        nonlocal replacement_index
-        duration = scaled[replacement_index]
-        replacement_index += 1
-        return (
-            f"{match.group('boundary')}{match.group('spacing')}"
-            f"{match.group('cut') or ''}{_fmt_seconds(duration)}{match.group('comma')}"
+    effective_total = max(current_total, declared_total or 0.0)
+    if effective_total > cap + 0.01:
+        raise ValueError(
+            f"finalized timed prompt duration {effective_total:g}s exceeds "
+            f"provider duration cap {cap:g}s; split the shot before execution"
         )
-
-    rendered = timed_pattern.sub(replace_timed_prefix, text) if durations else text
-    rendered = re.sub(
-        r"总时长约\d+(?:\.\d+)?s",
-        f"总时长约{_fmt_seconds(cap)}",
-        rendered,
-        count=1,
-    )
-    return _canonicalize_timed_prompt(rendered, cap)
+    if not durations:
+        return text
+    return _canonicalize_timed_prompt(text, declared_total or current_total)
 
 
 def _lint_and_repair_prompt(
@@ -1680,19 +2071,35 @@ def _lint_and_repair_prompt(
     text = re.sub(r"(?m)^单镜头时间轴】", "【单镜头时间轴】", text)
     core_intent = _core_intent_from_finalized(text)
     scene_text = _scene_source_text(scene)
-    authored_timeline = _section_value(_sections(text), "动作时间轴")
-    source_text = " ".join([core_intent, authored_timeline, scene_text])
+    full_source_text = _text(scene, text) if scene is not None else core_intent
+    current_source_text = _current_event_text(scene, text) if scene is not None else core_intent
+    scoped_scene_context = _scoped_scene_context(scene, text) if scene is not None else ""
+    repair_source_text = " ".join(
+        part for part in (current_source_text, scoped_scene_context) if part
+    )
     lines: list[str] = []
+    role_anchor_changed = False
     for line in text.splitlines():
-        line = _repair_direction_template_artifacts(line, source_text, scene)
-        line = _repair_conflicting_envelope_reveal(line, source_text, scene)
-        line = _repair_stale_event_line(line, scene_text, source_text, scene)
-        line = _repair_context_sound(line, source_text)
+        original_line = line
+        line = _sanitize_role_anchor_line(line, scene, text)
+        role_anchor_changed = role_anchor_changed or line != original_line
+        # Event/template repairs use the prompt-bounded source.  Stable prop
+        # and sound repairs may use the full scene source, but never as a
+        # reason to create a new timed event.
+        line = _repair_direction_template_artifacts(line, repair_source_text, scene)
+        line = _repair_conflicting_envelope_reveal(line, repair_source_text, scene)
+        line = _repair_stale_event_line(line, scene_text, repair_source_text, scene)
+        line = _repair_context_sound(line, full_source_text)
         line = _repair_voice_only_sources(line, scene)
-        line = _repair_false_reaction_pan(line, source_text, scene)
-        line = _repair_unmentioned_prop_insert(line, source_text, scene)
+        line = _repair_false_reaction_pan(line, repair_source_text, scene)
+        line = _repair_unmentioned_prop_insert(
+            line,
+            repair_source_text,
+            scene,
+            replacement_source_text=full_source_text,
+        )
         if not preserve_authored_timeline:
-            line = _repair_stale_flashback(line, source_text, scene)
+            line = _repair_stale_flashback(line, repair_source_text, scene)
         if not line:
             continue
         if "完成情绪落点" in line:
@@ -1712,8 +2119,14 @@ def _lint_and_repair_prompt(
     lines = _repair_duplicate_timed_segments(lines, scene)
     lines = _repair_timed_duration_coverage(lines, _total_duration_from_prompt(text))
     repaired = "\n".join(lines)
+    if role_anchor_changed and "本镜发型、帽子和服装以" not in repaired:
+        repaired = repaired + ("\n" if repaired else "") + (
+            "【状态优先级】本镜发型、帽子和服装以【主体状态】、【角色状态】及动作时间轴为准；"
+            "角色锚点仅用于稳定身份，不覆盖本镜状态。"
+        )
     repaired = _repair_dual_point_of_view(repaired, scene)
     repaired = _repair_visible_character_count(repaired, scene)
+    repaired = _repair_camera_structure_conflicts(repaired)
     if scene:
         for name in getattr(scene, "characters", []) or []:
             if name:
@@ -1730,16 +2143,94 @@ def _lint_and_repair_prompt(
         "，重点表现呼吸、脚步、手部操作和铁门摩擦声，动作连续可读。",
         "，重点表现呼吸、脚步、手部动作和环境声，动作连续可读。",
     )
-    coverage = _coverage_addendum(scene, repaired, source_text, current_event_text=core_intent)
+    coverage = _coverage_addendum(
+        scene,
+        repaired,
+        full_source_text,
+        current_event_text=current_source_text,
+        prompt_text=text,
+        current_scope=_prompt_current_scope(scene, text)[0] if scene is not None else "",
+        has_explicit_scope=_prompt_current_scope(scene, text)[1] if scene is not None else False,
+        allow_full_scene_action=_prompt_current_scope(scene, text)[2] if scene is not None else False,
+    )
     dialogue_addendum = _missing_dialogue_addendum(scene, repaired)
-    additions = [item for item in (coverage, dialogue_addendum) if item]
+    action_addendum = _missing_canonical_action_addendum(
+        scene,
+        repaired,
+        repair_source_text,
+        prompt_text=text,
+    )
+    additions = [item for item in (coverage, dialogue_addendum, action_addendum) if item]
     if additions:
         repaired = "\n".join([repaired, *additions])
     repaired = _canonicalize_timed_prompt(repaired, _total_duration_from_prompt(repaired) or (float(scene.duration_sec) if scene else None))
     return _normalize_prompt_text(repaired)
 
 
-def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
+def _has_rendered_cut_segment(text: str) -> bool:
+    for line in str(text or "").splitlines():
+        parsed = _timed_line_parts(line)
+        if parsed and parsed[0]:
+            return True
+        # Legacy prompts sometimes keep multiple authored ranges on one line.
+        # Detect an actual cut prefix after a separator, but not the policy
+        # phrase “只在写明‘切镜头’的位置切换”。
+        if re.search(r"(?:^|[；;\n])\s*切镜头[，,:：]", line):
+            return True
+    return False
+
+
+def _repair_camera_structure_conflicts(text: str) -> str:
+    """Make camera-language prose agree with an explicitly cut timeline."""
+    if not _has_rendered_cut_segment(text):
+        return text
+    repaired: list[str] = []
+    for line in str(text or "").splitlines():
+        match = re.match(r"^(【(?:镜头语言|镜头)】)(.*)$", line.strip())
+        if not match or not _contains(
+            match.group(2), "单镜头贯穿", "单镜头连续完成", "不切镜头", "不切换镜头"
+        ):
+            repaired.append(line)
+            continue
+        value = match.group(2)
+        value = re.sub(
+            r"单镜头贯穿|单镜头连续完成|不切换镜头|不切镜头",
+            "",
+            value,
+        ).strip(" ：:，,；;。")
+        repaired.append(
+            f"{match.group(1)}按时间轴分段剪辑：{value}" if value else f"{match.group(1)}按时间轴分段剪辑。"
+        )
+    return "\n".join(repaired)
+
+
+def _recompose_single_take_as_multi_cut(text: str) -> str:
+    """Convert an incorrectly locked single-take draft into explicit cut beats."""
+    output: list[str] = []
+    timed_count = 0
+    for raw_line in str(text or "").splitlines():
+        line = raw_line
+        stripped = line.strip()
+        if stripped == "【单镜头时间轴】":
+            line = "【时间轴分镜】"
+        parsed = _timed_line_parts(line)
+        if parsed:
+            if timed_count > 0 and not line.lstrip().startswith("切镜头，"):
+                prefix = line[: len(line) - len(line.lstrip())]
+                line = prefix + "切镜头，" + line.lstrip()
+            timed_count += 1
+        if "总时长约" in line and ("单镜头" in line or "不切镜头" in line):
+            match = re.search(r"总时长约\s*([^，,。；\s]+)", line)
+            if match:
+                line = (
+                    line[: match.start()]
+                    + f"总时长约{match.group(1)}，严格按上述时间轴执行，只在写明“切镜头”的位置切换。"
+                )
+        output.append(line)
+    return "\n".join(output)
+
+
+def _repair_finalized_timed_prompt(text: str, scene: Scene | None, total: float | None = None) -> str:
     text = re.sub(r"(?m)^时间轴分镜】", "【时间轴分镜】", text)
     text = re.sub(r"(?m)^单镜头时间轴】", "【单镜头时间轴】", text)
     text = re.sub(
@@ -1749,7 +2240,14 @@ def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
     )
     core_intent = _core_intent_from_finalized(text)
     scene_text = _scene_source_text(scene)
-    source_text = " ".join([core_intent, scene_text])
+    # Keep a full scene source for replacement details, but use the scoped
+    # scene context for decisions so a later canonical event cannot validate
+    # stale template text in the current finalized shot.
+    full_source_text = " ".join([core_intent, scene_text])
+    scoped_scene_context = _scoped_scene_context(scene, text) if scene is not None else ""
+    repair_source_text = " ".join(
+        part for part in (core_intent, scoped_scene_context) if part
+    )
     has_stale_artifacts = (
         re.search(r"模拟[^，。；\n]*、[^，。；\n]*视角", text) is not None
         or "不得额外增加镜头、反打、插入物" in text
@@ -1762,19 +2260,28 @@ def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
             and not _allows_envelope_water_reveal(core_intent)
         )
     )
+    target_total = total
+    if target_total is None and scene is not None:
+        target_total = float(getattr(scene, "duration_sec", 0) or 0)
     if not has_stale_artifacts:
-        return _lint_and_repair_prompt(text, scene)
+        return _normalize_finalized_timeline(_lint_and_repair_prompt(text, scene), target_total)
 
     text = _repair_dual_point_of_view(text, scene)
     lines: list[str] = []
     for line in text.splitlines():
-        line = _repair_direction_template_artifacts(line, " ".join([core_intent, scene_text]), scene)
-        line = _repair_conflicting_envelope_reveal(line, core_intent, scene)
-        line = _repair_stale_event_line(line, scene_text, source_text, scene)
-        line = _repair_stale_flashback(line, source_text, scene)
+        line = _repair_direction_template_artifacts(line, repair_source_text, scene)
+        line = _repair_conflicting_envelope_reveal(line, repair_source_text, scene)
+        line = _repair_stale_event_line(line, scene_text, repair_source_text, scene)
+        line = _repair_stale_flashback(line, repair_source_text, scene)
         if not line:
             continue
-        line = _repair_stale_prop_insert(line, source_text, scene)
+        line = _repair_unmentioned_prop_insert(
+            line,
+            repair_source_text,
+            scene,
+            replacement_source_text=full_source_text,
+        )
+        line = _repair_stale_prop_insert(line, repair_source_text, scene)
         lines.append(line)
 
     repaired = "\n".join(lines)
@@ -1798,10 +2305,254 @@ def _repair_finalized_timed_prompt(text: str, scene: Scene | None) -> str:
         "形状、材质、颜色、状态不变；",
         "重点表现手部动作、材质、光线反应和当前状态；",
     )
-    coverage = _coverage_addendum(scene, repaired, source_text, current_event_text=core_intent)
+    scope, has_scope, allow_full_scene = _prompt_current_scope(scene, text) if scene is not None else ("", False, False)
+    coverage = _coverage_addendum(
+        scene,
+        repaired,
+        full_source_text,
+        current_event_text=core_intent,
+        prompt_text=text,
+        current_scope=scope,
+        has_explicit_scope=has_scope,
+        allow_full_scene_action=allow_full_scene,
+    )
     if coverage:
         repaired = "\n".join([repaired, coverage])
-    return _lint_and_repair_prompt(repaired, scene)
+    return _normalize_finalized_timeline(_lint_and_repair_prompt(repaired, scene), target_total)
+
+
+
+_APPROACH_STEP_RE = re.compile(
+    r"(?P<prefix>(?:向|朝)(?:着)?[^，,。；;\n]{0,16}?)"
+    r"走出(?P<count>[一二两三四五六七八九十百千万几\d]+)步"
+)
+_ROLE_ANCHOR_RE = re.compile(r"^(?P<head>【(?:角色锚点|出镜角色与身份锚点)】)(?P<body>.*)$")
+_HAIR_STATE_CUES = (
+    "长发", "短发", "短卷", "卷发", "发髻", "盘发", "马尾", "辫发", "解开长发", "剪发", "剪掉", "剪去",
+)
+_HEADWEAR_STATE_CUES = (
+    "帽子", "帽", "摘下帽", "摘掉帽", "戴上帽", "戴好帽", "脱下帽", "未戴帽", "没戴帽",
+)
+_COSTUME_STATE_CUES = (
+    "穿着", "身穿", "穿上", "脱下", "换上", "换掉", "外衣", "外套", "大衣", "衣裙", "长裙", "短裙", "制服",
+)
+
+
+def _normalize_approach_direction_phrases(text: str) -> str:
+    """Disambiguate ``向某人走出几步`` from physically leaving a place."""
+    value = str(text or "")
+    return _APPROACH_STEP_RE.sub(
+        lambda match: f"{match.group('prefix')}走近{match.group('count')}步",
+        value,
+    )
+
+
+def _is_character_approach_phrase(text: str) -> bool:
+    normalized = _normalize_approach_direction_phrases(text)
+    return re.search(
+        r"(?:向|朝)(?:着)?[^，,。；;\n]{1,16}走近(?:[一二两三四五六七八九十百千万几\d]+步)?",
+        normalized,
+    ) is not None
+
+
+def _state_evidence_without_role_anchor(text: str, scene: Scene | None = None) -> str:
+    """Collect current-shot state evidence without letting the anchor define itself."""
+    cleaned = re.sub(
+        r"【(?:角色锚点|出镜角色与身份锚点)】.*?(?=\n【|\Z)",
+        "",
+        str(text or ""),
+        flags=re.S,
+    )
+    sections = _sections(cleaned)
+    parts = [
+        _section_value(sections, "主体状态", "角色状态"),
+        _section_value(sections, "动作意图", "动作时间轴"),
+        _explicit_core_intent(cleaned),
+    ]
+    if scene is not None:
+        parts.append(str(getattr(scene, "action_description", "") or ""))
+    return _normalize_prompt_text(" ".join(part for part in parts if part))
+
+
+def _name_has_state_cue(evidence: str, name: str, cues: tuple[str, ...], *, single_name: bool = False) -> bool:
+    """Check state cues in the clause that actually names this character.
+
+    A broad character-name window is unsafe for multi-character shots: a state
+    cue belonging to the first character can otherwise leak into the next
+    character's anchor.  Prefer conservative clause-local attribution and only
+    use the whole evidence when the scene has one named character.
+    """
+    if not evidence:
+        return False
+    if not name:
+        return any(cue in evidence for cue in cues)
+    if single_name:
+        return name in evidence and any(cue in evidence for cue in cues) or (
+            name not in evidence and any(cue in evidence for cue in cues)
+        )
+
+    clauses = re.split(r"[；;。.!！?？\n]", evidence)
+    for clause in clauses:
+        clause = clause.strip()
+        if name in clause and any(cue in clause for cue in cues):
+            return True
+    return False
+
+
+_VARIABLE_CLOTHING_CUES = (
+    "外套", "大衣", "毛呢", "风衣", "夹克", "衣裙", "连衣裙", "长裙", "短裙",
+    "衬衫", "裤子", "长裤", "短裤", "制服", "衣服", "裙子", "上衣", "袍",
+)
+_VARIABLE_HEADWEAR_CUES = ("帽子", "帽", "头盔", "口罩", "围巾", "手套")
+_VARIABLE_HAIR_CUES = (
+    "头发", "长发", "短发", "短卷", "卷发", "发髻", "盘发", "马尾", "辫发",
+    "发色", "银发", "黑发", "棕发", "褐发",
+)
+_VARIABLE_APPEARANCE_CONTINUATIONS = ("梳", "修剪", "披散", "垂落", "扎起", "束起")
+
+
+def _is_variable_role_appearance_clause(clause: str) -> bool:
+    """Return whether a comma-delimited role-anchor clause is variable."""
+    compact = re.sub(r"\s+", "", str(clause or "")).strip("，,。；; ")
+    if not compact:
+        return False
+    if any(cue in compact for cue in _VARIABLE_HAIR_CUES):
+        return True
+    if any(cue in compact for cue in _VARIABLE_HEADWEAR_CUES) and re.search(
+        r"(?:戴|头戴|摘|脱|未戴|没戴|口罩|帽|头盔|围巾|手套)", compact
+    ):
+        return True
+    if any(cue in compact for cue in _VARIABLE_CLOTHING_CUES) and re.search(
+        r"(?:穿|身穿|内穿|换|脱|衣|裙|裤|袍|外套|大衣|风衣|夹克|制服)", compact
+    ):
+        return True
+    # Continuation fragments commonly follow a removed hair clause, e.g.
+    # ``深棕短发修剪利落，向右后梳``.
+    return any(cue in compact for cue in _VARIABLE_APPEARANCE_CONTINUATIONS)
+
+
+def _strip_variable_role_appearance_group(group: str) -> str:
+    """Remove variable comma-delimited attributes without leaving fragments."""
+    if not group or not group.strip():
+        return group
+
+    leading = re.match(r"^\s*", group).group(0)
+    trailing_match = re.search(r"([。.!！?？]+)\s*$", group)
+    terminal = trailing_match.group(1) if trailing_match else ""
+    body_end = trailing_match.start() if trailing_match else len(group)
+    body = group[len(leading):body_end].strip()
+    if not body:
+        return ""
+
+    # Role-anchor attributes are authored as short comma-separated clauses.
+    # Filtering whole clauses (rather than regex spans) keeps ``内穿`` and
+    # ``向右后梳`` attached to the variable attribute they elaborate.
+    atoms = [atom.strip() for atom in re.split(r"[，,]", body) if atom.strip()]
+    if not atoms:
+        return ""
+
+    kept: list[str] = []
+    for atom in atoms:
+        if _is_variable_role_appearance_clause(atom):
+            continue
+        kept.append(atom)
+
+    if not kept:
+        return ""
+    return leading + "，".join(kept) + terminal
+
+
+def _strip_variable_role_appearance(segment: str) -> str:
+    """Keep stable identity while removing shot-varying appearance clauses.
+
+    Semicolons delimit one role's attribute groups.  We retain those
+    delimiters, including the separator before the next role label, so
+    cleaning one character can never concatenate two role anchors.
+    """
+    value = str(segment or "")
+    if not value:
+        return value
+
+    label = ""
+    body = value
+    label_match = re.match(r"^(?P<label>[^：:\n]+[：:])(?P<body>.*)$", value, flags=re.S)
+    if label_match:
+        label = label_match.group("label")
+        body = label_match.group("body")
+
+    # Split while retaining semicolons.  A removed group leaves the preceding
+    # separator in place, which is exactly the boundary needed for the next
+    # surviving group or character label.
+    pieces = re.split(r"([；;])", body)
+    cleaned: list[str] = []
+    for piece in pieces:
+        if piece in {"；", ";"}:
+            if cleaned and cleaned[-1] not in {"；", ";"}:
+                cleaned.append(piece)
+            continue
+        cleaned_piece = _strip_variable_role_appearance_group(piece)
+        if cleaned_piece:
+            cleaned.append(cleaned_piece)
+
+    result = label + "".join(cleaned)
+    # Do not strip a terminal semicolon: it may separate this role from the
+    # next role label in the same anchor line.
+    result = re.sub(r"[，,]\s*([；;])", r"\1", result)
+    result = re.sub(r"([；;])\s*([；;])", r"\1", result)
+    return result
+
+
+def _sanitize_role_anchor_line(line: str, scene: Scene | None, prompt_text: str) -> str:
+    """Prevent a static asset anchor from contradicting the current shot state."""
+    if scene is None:
+        return line
+    match = _ROLE_ANCHOR_RE.match(str(line).strip())
+    if not match:
+        return line
+    body = match.group("body")
+    names = [
+        str(name or "").strip()
+        for name in getattr(scene, "characters", []) or []
+        if str(name or "").strip()
+    ]
+    if not names:
+        return line
+    evidence = _state_evidence_without_role_anchor(prompt_text, scene)
+    if not any(cue in evidence for cue in (*_HAIR_STATE_CUES, *_HEADWEAR_STATE_CUES, *_COSTUME_STATE_CUES)):
+        return line
+    label_pattern = re.compile(
+        r"(?P<name>" + "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True)) + r")\s*[：:]"
+    )
+    labels = list(label_pattern.finditer(body))
+    if not labels:
+        stripped = _strip_variable_role_appearance(body)
+        return f"{match.group('head')}{stripped}" if stripped != body else line
+
+    pieces: list[str] = []
+    cursor = 0
+    changed = False
+    for index, label in enumerate(labels):
+        end = labels[index + 1].start() if index + 1 < len(labels) else len(body)
+        segment = body[label.start():end]
+        name = label.group("name")
+        relevant = (
+            _name_has_state_cue(evidence, name, _HAIR_STATE_CUES, single_name=len(names) == 1)
+            or _name_has_state_cue(evidence, name, _HEADWEAR_STATE_CUES, single_name=len(names) == 1)
+            or _name_has_state_cue(evidence, name, _COSTUME_STATE_CUES, single_name=len(names) == 1)
+        )
+        replacement = _strip_variable_role_appearance(segment) if relevant else segment
+        if replacement != segment:
+            changed = True
+        pieces.append(body[cursor:label.start()])
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(body[cursor:])
+    if not changed:
+        return line
+    repaired = "".join(pieces)
+    repaired = re.sub(r"；{2,}", "；", repaired)
+    repaired = re.sub(r"[，,]{2,}", "，", repaired)
+    return f"{match.group('head')}{repaired}"
 
 
 def _direction_is_negated(text: str, start: int) -> bool:
@@ -1816,7 +2567,7 @@ def _direction_is_negated(text: str, start: int) -> bool:
 
 def detect_entry_exit_direction(text: str) -> Literal["enter", "exit", "none"]:
     """Return the explicit doorway direction in the current-shot evidence."""
-    normalized = _normalize_prompt_text(text or "")
+    normalized = _normalize_approach_direction_phrases(_normalize_prompt_text(text or ""))
     # Camera-language phrases describe leaving the frame/eyeline, not leaving
     # the location. They must not activate the physical exit beat.
     camera_only_exit = ("\u8d70\u51fa\u753b\u9762", "\u8d70\u51fa\u89c6\u7ebf", "\u79bb\u5f00\u753b\u9762", "\u79bb\u5f00\u89c6\u7ebf")
@@ -1864,20 +2615,42 @@ def _repair_direction_template_artifacts(
     character enters. This repair is deliberately narrow and only touches a
     timed line plus phrases with explicit template wording.
     """
-    if not re.match(r"^(?:切镜头，)?\d+(?:\.\d+)?s[，,]", line.strip()):
-        return line
-    direction = detect_entry_exit_direction(source_text)
-    if direction != "enter":
+    if _timed_line_parts(line) is None:
         return line
 
-    repaired = line
+    # Normalize approach-to-a-person wording before direction inference.
+    # ``向吉姆走出两三步`` means move closer, not leave the room.
+    repaired = _normalize_approach_direction_phrases(line)
+    approach_line = _is_character_approach_phrase(repaired)
+    direction = detect_entry_exit_direction(source_text)
+    if direction != "enter":
+        return repaired
+
     if not _contains(source_text, "推门", "推开", "开门", "打开玻璃门", "打开木门"):
         repaired = re.sub(r"[^，。；\n]*门被推开，", "", repaired, count=1)
     if not _contains(source_text, "对视", "四目相对", "目光交汇"):
         repaired = repaired.replace("两人短暂对视，", "").replace("两人短暂对视", "")
     if not _contains(source_text, "门铃"):
         repaired = repaired.replace("门铃轻响，", "").replace("门铃轻响", "")
-    repaired = repaired.replace("走出", "进入")
+    if approach_line:
+        # A broad entry template can leave its door/entry sensory tail on the
+        # later approach beat. Keep the approach itself and remove only that
+        # template residue.
+        repaired = re.sub(
+            r"重点表现(?:手推门、门轴声、脚步和人物进入空间的方向|手推门、门轴声、脚步、人物进入空间的方向)",
+            "重点表现靠近动作、脚步、视线和两人距离",
+            repaired,
+        )
+        repaired = repaired.replace("手推门、门轴声、脚步和人物进入空间的方向", "靠近动作、脚步、视线和两人距离")
+        repaired = repaired.replace("手推门、门轴声", "靠近动作、脚步")
+    # Only rewrite the historical canned ``门被推开……走出`` wording.
+    # Never rewrite an authored ``向某人走出几步`` phrase (already normalized).
+    if not approach_line:
+        repaired = re.sub(
+            r"走出(?=(?:房间|屋|店|门|空间|[；。 ，,]))",
+            "进入",
+            repaired,
+        )
     repaired = re.sub(r"，{2,}", "，", repaired)
     repaired = re.sub(r"；{2,}", "；", repaired)
     repaired = re.sub(r"，([。；])", r"\1", repaired)
@@ -1886,6 +2659,7 @@ def _repair_direction_template_artifacts(
 
 def _has_entrance_cue(text: str) -> bool:
     """Whether the current shot explicitly describes a doorway entry."""
+    text = _normalize_approach_direction_phrases(text)
     if detect_entry_exit_direction(text) != "enter":
         return False
     if _contains(
@@ -1924,15 +2698,22 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
     sections = _sections(original)
     text = _scene_trigger_text(scene, original)
     event_text = _current_event_text(scene, original)
+    # The prompt-bounded event text protects against later-action leakage.
+    # Add only the safe scene context so concrete current actions that the
+    # compact response paraphrased (including reveal details) remain eligible
+    # for beat generation.
+    scoped_context = _scoped_scene_context(scene, original)
+    event_text = " ".join(part for part in (event_text, scoped_context) if part)
     direction_text = _direction_evidence_text(scene, original)
     visible_names = _visible_character_names(scene, original, script)
     subject = _main_subject(scene, visible_names)
     pov_subject = _pov_subject(scene, visible_names)
-    action = _clean_action(scene.action_description)
+    action = _clean_action(_current_action_source(scene, original) or event_text)
     camera = _camera_label(scene, text)
-    props = _prop_names(script, scene, text)
-    current_prop_state = _section_value(sections, "关键道具")
     dialogue = _dialogue_text(scene.dialogue)
+    prop_context = " ".join(part for part in (event_text, dialogue) if part)
+    props = _prop_names(script, scene, prop_context)
+    current_prop_state = _section_value(sections, "关键道具")
     voiceover = _voiceover_text(scene, text)
     beats: list[tuple[str, str]] = []
     special_event = False
@@ -2140,12 +2921,12 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
         beats.append(("physical_action", description))
         exit_event_added = True
 
-    if _has_sms_visual_cue(text):
+    if _has_sms_visual_cue(event_text):
         beats.append((
             "phone",
             "中近景/过肩固定，手机屏幕蓝光照亮人物眉眼，短信提示音尖锐短促，手部和手机位置稳定。",
         ))
-    elif _has_phone_call_cue(text):
+    elif _has_phone_call_cue(event_text):
         beats.append((
             "phone",
             "中近景/过肩固定，手机拨号或通话界面投出冷光，接通提示音短促，手部和手机位置稳定；电话内容只用声音表现。",
@@ -2154,7 +2935,7 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
     if not exit_event_added and _contains(event_text, "奔跑", "跑", "逃", "追逐", "冲进", "冲向", "小巷", "开锁", "钥匙", "铁门", "推门", "撞门", "撬锁"):
         beats.append((
             "physical_action",
-            _physical_action_description(scene, subject, action, " ".join([event_text, scene.action_description or ""])),
+            _physical_action_description(scene, subject, action, event_text),
         ))
 
     if _has_reaction_pan_cue(event_text):
@@ -2163,23 +2944,23 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
             f"快速摇摄或反应镜头，模拟{pov_subject}视角回头看向动静来源，衣服摩擦声和心跳声增强。",
         ))
 
-    prop_labels = _prop_labels(props, text)
-    if prop_labels and _has_explicit_prop_insert(text):
+    prop_labels = _prop_labels(props, prop_context)
+    if prop_labels and _has_explicit_prop_insert(event_text):
         beats.append((
             "prop_insert",
-            _prop_state_change_description(text, prop_labels, subject),
+            _prop_state_change_description(event_text, prop_labels, subject),
         ))
-    elif prop_labels and _has_emphasis_prop_cue(text) and len(beats) < 4:
+    elif prop_labels and _has_emphasis_prop_cue(prop_context) and len(beats) < 4:
         state_note = f"；当前状态：{current_prop_state}" if current_prop_state else ""
         beats.append((
             "prop_emphasis",
             f"短促道具强调特写，{'、'.join(prop_labels[:2])}保持在原位置{state_note}；只强调手部动作、材质和光线反应，不新增道具或文字内容。",
         ))
 
-    if _has_explicit_flashback(text):
+    if _has_explicit_flashback(event_text):
         beats.append((
             "flashback",
-            _flashback_description(text, subject, action),
+            _flashback_description(event_text, subject, action),
         ))
 
     if dialogue:
@@ -2189,7 +2970,9 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
                 _dialogue_staging(scene, dialogue, text, visible_names),
             ))
         else:
-            beats.append(("dialogue_close", f"中近景/正面固定，{dialogue}，口型轻微自然，不夸张表演。"))
+            frame = _frame_label_for_characters(scene, visible_names)
+            neutral_view = "人物身体三分之二侧对镜头，视线落向剧情对象，不直视镜头；" if "三分之二侧前方" in frame else ""
+            beats.append(("dialogue_close", f"{frame}，{neutral_view}{dialogue}，口型轻微自然，不夸张表演。"))
 
     # Compact visual responses occasionally contain only a placeholder
     # timeline.  Preserve the current scene's concrete action for arbitrary
@@ -2211,9 +2994,11 @@ def _base_beats(scene: Scene, original: str, script: ScriptBreakdown | None = No
         beats.append(("establish", f"{camera}，固定镜头或缓慢推近，建立{scene.location}中的{subject}。"))
         beats.append(("action", f"中近景，{subject}{action}，动作按顺序完成所有明确节拍。"))
     elif not any(kind.startswith("dialogue") for kind, _ in beats):
+        frame = _frame_label_for_characters(scene, visible_names)
+        neutral_view = "人物身体三分之二侧对镜头，视线遵循当前动作对象，不直视镜头；" if "三分之二侧前方" in frame else ""
         beats.append((
             "emotion_landing",
-            f"近景/正面固定，{subject}对上一动作结果产生明确反应，手部或视线发生一个可见变化，"
+            f"{frame}，{neutral_view}{subject}对上一动作结果产生明确反应，手部或视线发生一个可见变化，"
             f"{scene.emotion_tone or '情绪'}从内收推进，不新增剧情事件。",
         ))
 
@@ -2319,6 +3104,49 @@ def _enrichment_duration(kind: str, source_text: str, total: float) -> float:
     return defaults.get(kind, 0.0)
 
 
+def _timing_capacity_diagnostic(
+    scene: Scene,
+    total: float,
+    duration_cap_sec: float | None = None,
+) -> str:
+    """Explain timing pressure without silently changing the source schedule.
+
+    The composer still keeps its historical canonical timeline output for
+    compatibility, but the provider-facing prompt must not make an overloaded
+    scene look like it fits cleanly.  Planning runs on a private scene copy so
+    neither the source scene nor the project total can be rewritten.
+    """
+    try:
+        planning_scene = scene.model_copy(deep=True)
+        planning_scene.duration_sec = max(3, min(30, int(round(total))))
+        report = estimate_scene_capacity(
+            planning_scene,
+            provider_max_duration_sec=duration_cap_sec,
+        )
+    except Exception:
+        # Capacity diagnostics are advisory; prompt composition must remain
+        # compatible with legacy/partially migrated payloads.
+        return ""
+
+    if report.status == "clean":
+        return ""
+
+    required = _fmt_seconds(report.required_total_duration_sec)
+    available = _fmt_seconds(total)
+    if report.status == "auto_split" and report.recommended_shot_count > 1:
+        return (
+            "【时间容量诊断】当前镜头的结构化事实预计需要约"
+            f"{required}，单镜有效窗口约{available}，建议拆为"
+            f"{report.recommended_shot_count}个可执行镜头；本提示词保留全部已识别事实，"
+            "不得把多个关键事件挤压到同一时间段。"
+        )
+    return (
+        "【时间容量诊断】预计完整执行需要约"
+        f"{required}，当前有效窗口约{available}；本提示词保留全部已识别动作和对白，"
+        "不得通过加速、跳过或压缩关键内容解决，应拆分镜头或由上游明确调整时长。"
+    )
+
+
 def _elastic_total_duration(base_total: float, beats: list[tuple[str, str]], source_text: str) -> float:
     """Keep the generation duration fixed; use beats only to divide that duration."""
     return base_total
@@ -2337,13 +3165,9 @@ def _sync_duration_targets(
         return
     rounded = int(round(new_total))
     shot.duration_sec = rounded
-    if not sync_script:
-        return
-    previous_scene_duration = int(scene.duration_sec or old_total)
-    scene.duration_sec = max(previous_scene_duration, rounded)
-    if script:
-        current_total = int(script.duration_sec or 0)
-        script.duration_sec = max(current_total, sum(int(item.duration_sec or 0) for item in script.scenes))
+    # The composer owns the generated shot duration only. Source scene and
+    # project durations are the schedule of record and must never be rewritten.
+    del script, scene, sync_script
 
 
 def _fit_beats_to_duration(beats: list[tuple[str, str]], total: float) -> list[tuple[str, str]]:
@@ -2430,9 +3254,30 @@ def build_timed_shot_prompt(
     original = re.sub(r"(?m)^时间轴分镜】", "【时间轴分镜】", original)
     original = re.sub(r"(?m)^单镜头时间轴】", "【单镜头时间轴】", original)
 
+    if duration_cap_sec is not None:
+        cap = float(duration_cap_sec)
+        if cap < 3.0:
+            raise ValueError(
+                f"provider duration cap {cap:g}s is below the executable 3s minimum"
+            )
+        requested_duration = float(shot.duration_sec or 0)
+        if requested_duration > cap + 0.01:
+            raise ValueError(
+                f"shot duration {requested_duration:g}s exceeds provider duration cap "
+                f"{cap:g}s; split the shot before execution"
+            )
+
     scene = _scene_for_shot(script, shot.scene_id)
+    child_id = str(getattr(shot, "shot_id", "") or "").strip()
+    if child_id and "【动作时间轴】" in original:
+        # Child units already carry a scoped executable timeline. Re-running the
+        # scene composer would paste the parent action_description back in.
+        return _apply_duration_cap_to_prompt(original, duration_cap_sec)
+    if "【单镜头时间轴】" in original and _has_authored_edit_evidence(original, scene):
+        original = _recompose_single_take_as_multi_cut(original)
     if "【单镜头时间轴】" in original or "【时间轴分镜】" in original:
-        finalized = _repair_finalized_timed_prompt(original, scene)
+        shot_total = float(shot.duration_sec or (scene.duration_sec if scene is not None else 0) or 0)
+        finalized = _repair_finalized_timed_prompt(original, scene, shot_total)
         return _apply_duration_cap_to_prompt(finalized, duration_cap_sec)
     if has_planned_editing(original) and "【动作时间轴】" not in original:
         if scene is not None and "核心分镜意图" in original:
@@ -2442,8 +3287,8 @@ def build_timed_shot_prompt(
     if scene is None:
         return original
 
-    cap = 60.0 if duration_cap_sec is None else max(2.0, float(duration_cap_sec))
-    total = max(2.0, min(float(shot.duration_sec or scene.duration_sec or 5), cap))
+    total = max(3.0, float(shot.duration_sec or scene.duration_sec or 5))
+    timing_diagnostic = _timing_capacity_diagnostic(scene, total, duration_cap_sec)
     if not _has_complex_edit_need(original, scene):
         sections = _sections(original)
         visual = _section_value(sections, "项目视觉")
@@ -2479,6 +3324,7 @@ def build_timed_shot_prompt(
             f"镜头：{camera_guidance}。" if camera_guidance else "",
             f"道具锚点：{prop_state}。" if prop_state else "",
             f"模型补充：{legacy_note}。" if legacy_note else "",
+            timing_diagnostic,
             *segments,
             "【连续锁定】",
             *locks,
@@ -2500,7 +3346,34 @@ def build_timed_shot_prompt(
     beats = _fit_beats_to_duration(beats, total)
     authored_timeline = _section_value(_sections(original), "动作时间轴")
     authored_segments = _timeline_from_text(authored_timeline, total) if authored_timeline else []
+    _, _, allow_full_scene_action = _prompt_current_scope(scene, original)
     if authored_segments:
+        # A generic full-scene directive is an explicit request to materialize
+        # every structured action in this shot.  Do this before comparing the
+        # generated/template beats so the authored timeline cannot silently
+        # collapse the canonical action sequence into one entrance or dialogue
+        # beat.  Local current-state prompts do not enter this branch.
+        if allow_full_scene_action:
+            canonical_fragments = [
+                fragment
+                for fragment in _current_action_fragments(scene, original)
+                if not re.fullmatch(r"(?:\d+|[一二三四五六七八九十百零两]+)点整", fragment)
+            ]
+            authored_compact = re.sub(
+                r"\s+", "", " ".join(description for _, description in authored_segments).casefold()
+            )
+            missing_fragments = [
+                fragment
+                for fragment in canonical_fragments
+                if re.sub(r"\s+", "", fragment.casefold()) not in authored_compact
+            ]
+            if missing_fragments:
+                duration, description = authored_segments[-1]
+                authored_segments[-1] = (
+                    duration,
+                    f"{description}；补足剧本动作：{'；'.join(missing_fragments)}",
+                )
+
         authored_text = " ".join(description for _, description in authored_segments)
         missing_canonical_beats: list[tuple[str, str]] = []
         for kind, description in beats:
@@ -2559,6 +3432,7 @@ def build_timed_shot_prompt(
             "【时间轴分镜】",
             *fixed_context,
             original_line,
+            timing_diagnostic,
             *segments,
             "【连续锁定】",
             *locks,
@@ -2572,10 +3446,15 @@ def apply_timed_prompt_structure(
     script: ScriptBreakdown | None,
     *,
     protected_scene_ids: set[int] | None = None,
+    duration_cap_sec: float | None = None,
 ) -> None:
     """Mutate shot prompts in place unless the user supplied an explicit override."""
     protected_scene_ids = protected_scene_ids or set()
     for shot in prompts:
         if shot.scene_id in protected_scene_ids:
             continue
-        shot.prompt = build_timed_shot_prompt(shot, script)
+        shot.prompt = build_timed_shot_prompt(
+            shot,
+            script,
+            duration_cap_sec=duration_cap_sec,
+        )

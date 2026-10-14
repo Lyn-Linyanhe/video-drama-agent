@@ -15,6 +15,60 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from .state import DramaState
 from src.config import MAX_REVIEW_LOOPS
+from src.services.video_capabilities import VIDEO_CAPABILITIES, default_video_policy, video_agent_for_policy
+
+
+def _policy_from_video_agent(default_agent) -> dict:
+    """Build a capability-bearing policy from the agent used by legacy states.
+
+    Older states leave ``video_generation_policy`` empty. The injected default
+    agent is still the source of truth for those states, so visual planning and
+    execution must receive the same provider/model capability instead of letting
+    the planner run uncapped and discovering the limit only at execution time.
+    """
+    client = getattr(default_agent, "api_client", None)
+    provider = str(getattr(client, "provider_name", "") or "").strip().lower()
+    if provider == "seedence":
+        provider = "seedance"
+    model = str(getattr(client, "model", "") or "").strip()
+    resolution = str(getattr(client, "resolution", "") or "1080p").strip().lower()
+    models = VIDEO_CAPABILITIES.get(provider, {}).get("models", {})
+    if provider in VIDEO_CAPABILITIES:
+        if model not in models:
+            model = next(iter(models), "")
+        capability = models.get(model)
+        if capability:
+            return {
+                "provider": provider,
+                "model": model,
+                "resolution": resolution or "1080p",
+                "unit_price_rmb_per_sec": 0.0,
+                "capability": dict(capability),
+            }
+
+    # A custom/legacy wrapper may not expose an API client. Fall back to the
+    # configured default, but still attach its registry capability when known.
+    fallback = dict(default_video_policy())
+    fallback_provider = str(fallback.get("provider") or "mock").strip().lower()
+    fallback_model = str(fallback.get("model") or "").strip()
+    fallback_capability = VIDEO_CAPABILITIES.get(fallback_provider, {}).get("models", {}).get(fallback_model)
+    if fallback_capability:
+        fallback["capability"] = dict(fallback_capability)
+    return fallback
+
+
+def _video_policy_for_state(default_agent, state: DramaState) -> dict:
+    """Return the explicit project policy, or the injected legacy default."""
+    policy = dict(getattr(state, "video_generation_policy", {}) or {})
+    return policy or _policy_from_video_agent(default_agent)
+
+
+def _video_agent_for_state(default_agent, state: DramaState):
+    """Resolve a project-scoped video agent without changing legacy empty states."""
+    policy = dict(getattr(state, "video_generation_policy", {}) or {})
+    if not policy:
+        return default_agent
+    return video_agent_for_policy(policy)
 
 
 def build_drama_graph(
@@ -46,12 +100,14 @@ def build_drama_graph(
 
     async def node_visual_prompt(state: DramaState) -> dict:
         state.log("🎨🔧 视觉与提示 Agent: 设计视觉风格 + 生成视频 prompt...")
+        video_generation_policy = _video_policy_for_state(video_gen_agent, state)
         visual, prompts = await visual_prompt_agent.run(
             state.script,
             character_images=state.character_images,
             scene_images=state.scene_images,
             prompt_overrides=state.prompt_overrides,
             creative_profile=state.creative_profile,
+            video_generation_policy=video_generation_policy,
             source_text=state.script_draft_text or (
                 state.user_input if state.input_mode == "script" else ""
             ),
@@ -153,7 +209,9 @@ Modern convenience store interior, late night with cool white fluorescent light 
                     shot.prompt = state.prompt_overrides[str(shot.scene_id)]
                     state.log(f"   ✏️ 镜头 {shot.scene_id} 使用了用户修改的 prompt")
 
-        assets = await video_gen_agent.run(
+        video_generation_policy = _video_policy_for_state(video_gen_agent, state)
+        selected_video_agent = _video_agent_for_state(video_gen_agent, state)
+        assets = await selected_video_agent.run(
             state.generation_prompts,
             character_images=state.character_images,
             scene_images=state.scene_images,
@@ -163,6 +221,7 @@ Modern convenience store interior, late night with cool white fluorescent light 
             project_id=state.project_id,
             prompt_policy=state.prompt_policy,
             creative_profile=state.creative_profile,
+            video_generation_policy=video_generation_policy,
         )
         success_count = sum(1 for s in assets.shots if s.success)
         state.log(f"   成功: {success_count}/{len(assets.shots)} | 成本: ${assets.total_cost:.2f}")
@@ -209,6 +268,7 @@ Modern convenience store interior, late night with cool white fluorescent light 
             state.subtitle_enabled,
             state.subtitle_mode,
             state.assembly_audio_override,
+            generation_prompts=state.generation_prompts,
         )
         state.log(f"   输出: {path}")
         return {"output_video_path": path}
@@ -272,9 +332,11 @@ def create_stage1_graph(script_agent, visual_prompt_agent):
 
     async def node_visual_prompt(state: DramaState) -> dict:
         state.log("🎨🔧 视觉与提示 Agent: 设计视觉风格 + 生成视频 prompt...")
+        video_generation_policy = _video_policy_for_state(None, state)
         visual, prompts = await visual_prompt_agent.run(
             state.script,
             prompt_overrides=state.prompt_overrides,
+            video_generation_policy=video_generation_policy,
             source_text=state.script_draft_text or (
                 state.user_input if state.input_mode == "script" else ""
             ),
@@ -346,7 +408,9 @@ def create_stage4_graph(video_gen_agent):
             for shot in state.generation_prompts.shots:
                 if str(shot.scene_id) in state.prompt_overrides:
                     shot.prompt = state.prompt_overrides[str(shot.scene_id)]
-        assets = await video_gen_agent.run(
+        video_generation_policy = _video_policy_for_state(video_gen_agent, state)
+        selected_video_agent = _video_agent_for_state(video_gen_agent, state)
+        assets = await selected_video_agent.run(
             state.generation_prompts,
             character_images=state.character_images,
             scene_images=state.scene_images,
@@ -356,6 +420,7 @@ def create_stage4_graph(video_gen_agent):
             project_id=state.project_id,
             prompt_policy=state.prompt_policy,
             creative_profile=state.creative_profile,
+            video_generation_policy=video_generation_policy,
         )
         success_count = sum(1 for s in assets.shots if s.success)
         state.log(f"   成功: {success_count}/{len(assets.shots)} | 成本: ${assets.total_cost:.2f}")
@@ -404,6 +469,7 @@ def create_stage6_graph(assembly_agent):
         path = await assembly_agent.run(
             state.script, state.generated_assets, state.audio_assets, state.project_id,
             state.subtitle_enabled, state.subtitle_mode, state.assembly_audio_override,
+            generation_prompts=state.generation_prompts,
         )
         state.log(f"   输出: {path}")
         return {"output_video_path": path}
@@ -544,7 +610,7 @@ class _LegacyVisualPromptWrapper:
         self._visual = visual_agent
         self._prompt = prompt_agent
 
-    async def run(self, script, character_images=None, scene_images=None, prompt_overrides=None):
+    async def run(self, script, character_images=None, scene_images=None, prompt_overrides=None, video_generation_policy=None):
         visual = await self._visual.run(script)
         prompts = await self._prompt.run(
             script, visual,

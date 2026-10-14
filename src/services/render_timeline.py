@@ -71,43 +71,72 @@ def build_render_timeline(
 
 
 def active_video_durations(state: object) -> dict[int, float]:
-    """Best-effort measured durations for a project audio preview.
-
-    The function reads the active shot version first, then legacy generated
-    assets. Projects without local video files simply fall back to script
-    durations in ``build_render_timeline``.
-    """
-
-    candidates: dict[int, str] = {}
+    """Return measured duration per parent scene, summing executable children."""
+    candidates: dict[int, list[object]] = {}
     productions = getattr(state, "shot_productions", {}) or {}
     for scene_id, production in productions.items():
-        active_id = str(getattr(production, "active_version_id", "") or "")
         versions = getattr(production, "video_versions", []) or []
+        child_versions = [
+            item for item in versions
+            if getattr(item, "shot_id", None) and item.success and item.local_path
+        ]
+        if child_versions:
+            active_by_shot = getattr(production, "active_version_by_shot_id", {}) or {}
+            selected_by_shot: dict[str, object] = {}
+            for item in child_versions:
+                shot_id = str(getattr(item, "shot_id", "") or "")
+                active_id = str(active_by_shot.get(shot_id, "") or "")
+                if active_id:
+                    if str(getattr(item, "version_id", "")) == active_id:
+                        selected_by_shot[shot_id] = item
+                else:
+                    # Legacy child records have no per-shot active map; the
+                    # last retained successful version is the readable fallback.
+                    selected_by_shot[shot_id] = item
+            child_versions = list(selected_by_shot.values())
+            child_versions.sort(key=lambda item: _shot_order(item))
+            candidates[int(scene_id)] = [item.local_path for item in child_versions]
+            continue
+        active_id = str(getattr(production, "active_version_id", "") or "")
         version = next((item for item in versions if str(getattr(item, "version_id", "")) == active_id), None)
         if version is None and versions:
             version = versions[-1]
         path = str(getattr(version, "local_path", "") or "") if version else ""
         if path:
-            candidates[int(scene_id)] = path
+            candidates[int(scene_id)] = [path]
 
     legacy = getattr(getattr(state, "generated_assets", None), "shots", []) or []
     for asset in legacy:
         scene_id = int(getattr(asset, "scene_id", 0) or 0)
-        if scene_id and scene_id not in candidates:
-            path = str(getattr(asset, "local_path", "") or "")
-            if path:
-                candidates[scene_id] = path
+        path = str(getattr(asset, "local_path", "") or "")
+        if scene_id and path and scene_id not in candidates:
+            candidates[scene_id] = [path]
 
     durations: dict[int, float] = {}
-    for scene_id, path in candidates.items():
-        try:
-            from moviepy import VideoFileClip
-
-            clip = VideoFileClip(path)
-            duration = float(clip.duration or 0.0)
-            clip.close()
-            if duration > 0:
-                durations[scene_id] = duration
-        except Exception:
-            continue
+    for scene_id, paths in candidates.items():
+        total = 0.0
+        for path in paths:
+            try:
+                from moviepy import VideoFileClip
+                clip = VideoFileClip(path)
+                duration = float(clip.duration or 0.0)
+                clip.close()
+                total += max(0.0, duration)
+            except Exception:
+                continue
+        if total > 0:
+            durations[scene_id] = total
     return durations
+
+
+def _shot_order(asset: object) -> tuple[int, str]:
+    explicit_order = getattr(asset, "shot_order", None)
+    if explicit_order is not None:
+        try:
+            return (int(explicit_order), str(getattr(asset, "shot_id", "") or ""))
+        except (TypeError, ValueError):
+            pass
+    import re
+    shot_id = str(getattr(asset, "shot_id", "") or "")
+    match = re.search(r"(?:shot|unit)-(\d+)$", shot_id)
+    return (int(match.group(1)) if match else 10**9, shot_id)

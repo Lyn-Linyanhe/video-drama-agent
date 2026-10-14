@@ -311,3 +311,50 @@ def test_dark_passage_entrance_stays_inside_the_basement_location():
         manifest.locations[0].location_id,
         manifest.locations[0].location_id,
     ]
+
+
+def test_curated_location_anchors_survive_enrichment_without_derived_noise():
+    # 手工整理的静态空间锚点是权威数据：修复流程不得（a）把短静态词误杀，
+    # （b）无条件并入从场景文本派生的动态句（如"身影在巷口渐渐变小"）。
+    from src.schemas.script import (
+        LocationAsset,
+        LocationState,
+        Scene,
+        ScriptBreakdown,
+        VisualAssetManifest,
+        ShotVisualBinding,
+    )
+    from src.utils.visual_asset_manifest import enrich_manifest_descriptions
+
+    scene = Scene(
+        scene_id=15, duration_sec=8, location="杨家院门外小路(上午,室外)",
+        characters=["孔君平"],
+        action_description="孔君平沿门前小路慢慢走远，脚步渐渐放缓，身影在巷口渐渐变小。",
+        dialogue=[], camera_direction="全景", emotion_tone="平静",
+    )
+    location = LocationAsset(
+        location_id="loc_path", canonical_name="杨家院门外小路",
+        identity_description="院门外的青石小路：路面青石铺就，两侧院墙延伸。",
+        fixed_dressing="青石路面与两侧院墙为固定结构。",
+        anchor_points=["青石小路", "两侧院墙", "远处院门"],
+        representative_scene_id=15, shot_ids=[15],
+        states=[LocationState(state_id="st1", time_condition="上午", representative_scene_id=15, shot_ids=[15])],
+    )
+    script = ScriptBreakdown(
+        title="测试", genre="剧情", logline="", duration_sec=8, narration_style="无旁白",
+        scenes=[scene],
+        asset_manifest=VisualAssetManifest(
+            characters=[], locations=[location], props=[],
+            shot_bindings=[ShotVisualBinding(scene_id=15, location_id="loc_path", state_id="st1")],
+        ),
+    )
+
+    enriched = enrich_manifest_descriptions(script)
+    anchors = enriched.asset_manifest.locations[0].anchor_points
+
+    assert anchors[:3] == ["青石小路", "两侧院墙", "远处院门"]
+    assert all("渐渐变小" not in a for a in anchors)
+    assert all("走远" not in a for a in anchors)
+    location_after = enriched.asset_manifest.locations[0]
+    assert "渐渐变小" not in (location_after.environment_description or "")
+    assert "渐渐变小" not in (location_after.fixed_dressing or "")

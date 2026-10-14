@@ -142,6 +142,114 @@ _SPEECH_VOICE_PHRASES = (
 )
 
 
+_SOURCE_SCENE_HEADER_RE = re.compile(
+    r"^\s*(?:第\s*)?(?P<scene_id>\d+)\s*(?:[.．、]|场(?:景)?|镜)\s*"
+)
+_SOURCE_DIALOGUE_LABEL_RE = re.compile(r"^\s*对白\s*[:：]\s*(?P<body>.*)$")
+_SOURCE_DIALOGUE_SPEAKER_RE = re.compile(
+    r"(?:(?<=^)|(?<=[/／])|(?<=\n))\s*(?P<speaker>[^：:\n/／]{1,40}?)\s*[:：]"
+)
+_SOURCE_DIALOGUE_PLACEHOLDERS = {"prompt", "prompt:"}
+
+
+def _dialogue_compare_key(value: str) -> str:
+    """Normalize punctuation/spacing while preserving the spoken words."""
+    return re.sub(
+        r"[\s，,。！？!?；;：:“”\"'‘’（）()【】\[\]…—-]+",
+        "",
+        str(value or ""),
+    ).casefold()
+
+
+def _source_dialogue_items(body: str) -> list[tuple[str, str]]:
+    """Parse explicit ``角色：台词 / 角色：台词`` source notation only."""
+    body = str(body or "").strip()
+    if not body or body.casefold().rstrip("：:") in _SOURCE_DIALOGUE_PLACEHOLDERS:
+        return []
+    matches = list(_SOURCE_DIALOGUE_SPEAKER_RE.finditer(body))
+    items: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        speaker = match.group("speaker").strip(" ，,、")
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        line = body[match.end():end].strip(" \t/／")
+        if not speaker or not line or line.casefold().rstrip("：:") in _SOURCE_DIALOGUE_PLACEHOLDERS:
+            continue
+        items.append((speaker, line))
+    return items
+
+
+def _source_dialogue_by_scene(source_text: str) -> dict[int, list[tuple[str, str, int]]]:
+    """Collect explicit dialogue under numbered source scenes."""
+    result: dict[int, list[tuple[str, str, int]]] = {}
+    current_scene_id: int | None = None
+    continuation_scene_id: int | None = None
+    for line_number, raw_line in enumerate(str(source_text or "").splitlines(), start=1):
+        header = _SOURCE_SCENE_HEADER_RE.match(raw_line)
+        if header:
+            current_scene_id = int(header.group("scene_id"))
+            continuation_scene_id = None
+            continue
+        if current_scene_id is None:
+            continue
+        dialogue_label = _SOURCE_DIALOGUE_LABEL_RE.match(raw_line)
+        if dialogue_label:
+            body = dialogue_label.group("body")
+            items = _source_dialogue_items(body)
+            if items:
+                result.setdefault(current_scene_id, []).extend(
+                    (speaker, line, line_number) for speaker, line in items
+                )
+                continuation_scene_id = current_scene_id
+            else:
+                # A bare ``对白：`` may be followed by explicit speaker lines;
+                # ``对白：PROMPT:`` is intentionally ignored.
+                continuation_scene_id = current_scene_id if not body.strip() else None
+            continue
+        if continuation_scene_id == current_scene_id:
+            items = _source_dialogue_items(raw_line)
+            if items:
+                result.setdefault(current_scene_id, []).extend(
+                    (speaker, line, line_number) for speaker, line in items
+                )
+                continue
+            if raw_line.strip():
+                continuation_scene_id = None
+    return result
+
+
+def _source_scene_ids(source_text: str) -> list[int]:
+    """Return explicit numbered source-scene ids in authored order."""
+    ids: list[int] = []
+    for raw_line in str(source_text or "").splitlines():
+        header = _SOURCE_SCENE_HEADER_RE.match(raw_line)
+        if not header:
+            continue
+        scene_id = int(header.group("scene_id"))
+        if scene_id not in ids:
+            ids.append(scene_id)
+    return ids
+
+
+def _source_scene_cardinality_error(script: ScriptBreakdown, source_text: str) -> str:
+    """Reject an existing-script parse that silently drops numbered source beats."""
+    expected_ids = _source_scene_ids(source_text)
+    if not expected_ids:
+        return ""
+    actual_ids = [int(scene.scene_id) for scene in script.scenes]
+    if len(actual_ids) < len(expected_ids):
+        missing = [scene_id for scene_id in expected_ids if scene_id not in actual_ids]
+        missing_text = "、".join(str(scene_id) for scene_id in missing) or "未编号尾部场景"
+        return (
+            "遗漏原始编号场景："
+            f"原稿有{len(expected_ids)}个编号场景（{'、'.join(map(str, expected_ids))}），"
+            f"结构化结果仅有{len(actual_ids)}个（{'、'.join(map(str, actual_ids))}），"
+            f"缺少{missing_text}。"
+        )
+    if len(actual_ids) != len(set(actual_ids)):
+        return f"结构化剧本 scene_id 重复：{'、'.join(map(str, actual_ids))}。"
+    return ""
+
+
 def _extract_quoted_speech(action: str, known_names: list[str]) -> list[tuple[str, str, int, int]]:
     """Extract named-speaker quoted lines from action text.
 
@@ -279,7 +387,11 @@ class ScriptAgent:
         )
         user_prompt += "\n\n" + SCENE_PARSE_RULES
         return await self._generate_validated(
-            user_prompt, temperature=0.2, telemetry=telemetry, phase="script.analyze",
+            user_prompt,
+            temperature=0.2,
+            telemetry=telemetry,
+            phase="script.analyze",
+            source_text=source_text,
         )
 
     async def generate_draft(
@@ -343,10 +455,17 @@ class ScriptAgent:
         temperature: float,
         telemetry: dict | None = None,
         phase: str = "script.generate",
+        source_text: str = "",
     ) -> ScriptBreakdown:
         """Generate the script and repair one semantically invalid manifest response."""
         if getattr(self.llm, "provider", "") in {"kimi", "deepseek", "qwen"}:
-            return await self._generate_compact(user_prompt, temperature, telemetry, phase)
+            return await self._generate_compact(
+                user_prompt,
+                temperature,
+                telemetry,
+                phase,
+                source_text=source_text,
+            )
 
         prompt = user_prompt + VISUAL_ASSET_RULES
         last_error: ValueError | None = None
@@ -375,7 +494,11 @@ class ScriptAgent:
                 )
                 continue
             try:
-                validated = self._validate_visual_assets(script, require_manifest=True)
+                ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+                source_error = _source_scene_cardinality_error(script, source_text)
+                if source_error:
+                    raise ValueError(source_error)
+                validated = self._validate_visual_assets(script, require_manifest=True, source_text=source_text)
                 if telemetry is not None:
                     telemetry.update(request_telemetry)
                     telemetry["attempts"] = total_attempts
@@ -386,11 +509,18 @@ class ScriptAgent:
                 last_error = exc
                 if attempt == 0:
                     semantic_retries += 1
-                    prompt += (
-                        "\n\n上一次输出的视觉资产清单未通过生产校验："
-                        f"{exc}。请保留剧本剧情与所有分镜，仅修正 asset_manifest，"
-                        "确保每个分镜恰有一个地点绑定，且只有 on_screen 角色出现在画面角色列表。"
-                    )
+                    if "遗漏原始编号场景" in str(exc):
+                        prompt += (
+                            "\n\n上一次结构化结果遗漏了原稿编号场景："
+                            f"{exc}。不得遗漏、合并或跳过任何一个以编号开头的原始场景；"
+                            "请完整重新输出 scenes，并保留每场的角色、对白和关键动作。"
+                        )
+                    else:
+                        prompt += (
+                            "\n\n上一次输出的视觉资产清单未通过生产校验："
+                            f"{exc}。请保留剧本剧情与所有分镜，仅修正 asset_manifest，"
+                            "确保每个分镜恰有一个地点绑定，且只有 on_screen 角色出现在画面角色列表。"
+                        )
         if telemetry is not None:
             telemetry.update({
                 "attempts": total_attempts,
@@ -405,6 +535,7 @@ class ScriptAgent:
         temperature: float,
         telemetry: dict | None = None,
         phase: str = "script.generate",
+        source_text: str = "",
     ) -> ScriptBreakdown:
         """Keep plain-JSON providers on a small first-stage contract."""
         prompt = user_prompt + """
@@ -414,6 +545,14 @@ class ScriptAgent:
 scene_id 必须从 1 连续递增，scenes 控制在 5-20 个容量范围内；必须保留输入剧本的全部有效节拍，不得为满足数量合并或删减镜头。
 location 只写稳定的物理地点身份和室内/室外边界，不得包含人物动作、操作结果、镜头机位或瞬时状态；人物走向、停下、开门、拿取、站起、离开和消失等全部写入 action_description。"""
         prompt += "\n\n" + SCENE_PARSE_RULES
+        source_scene_ids = _source_scene_ids(source_text)
+        if source_scene_ids:
+            prompt += (
+                "\n\n原稿含明确编号场景："
+                f"{'、'.join(map(str, source_scene_ids))}。"
+                "必须逐一保留这些剧情节拍；不得遗漏、合并或跳过任一编号场景。"
+                f"输出 scenes 不得少于{len(source_scene_ids)}个。"
+            )
         prompt += """
 可选输出 critical_props：仅列出剧本中实际可见、至少在两个分镜出现或被使用、并直接承担线索/证据/身份/交接/动作连续性的实体道具。普通物品、家具、背景陈设、短信/录音内容和只出现一次的物品不要列出。每项必须给出规范名称、可见外观、critical_reason、critical_evidence、shot_ids；不要为了凑数量添加道具。"""
         last_error: ValueError | None = None
@@ -442,16 +581,19 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
                 scenes=compact.scenes,
                 asset_manifest=None,
             )
-            # Deterministic dialogue/action repair keeps the compact contract
-            # clean before the local manifest builder reads the scenes.
-            ScriptAgent._repair_scene_semantics(script)
             # Preserve the compact candidate list only long enough for the
             # deterministic manifest builder; it is never stored as a second
             # source of truth in the project state.
             critical_props = list(compact.critical_props or [])
-            script.asset_manifest = build_manifest_from_scenes(script, critical_props=critical_props)
             try:
-                validated = self._validate_visual_assets(script, require_manifest=True)
+                # Deterministic dialogue/action repair keeps the compact contract
+                # clean before the local manifest builder reads the scenes.
+                ScriptAgent._repair_scene_semantics(script, source_text=source_text)
+                source_error = _source_scene_cardinality_error(script, source_text)
+                if source_error:
+                    raise ValueError(source_error)
+                script.asset_manifest = build_manifest_from_scenes(script, critical_props=critical_props)
+                validated = self._validate_visual_assets(script, require_manifest=True, source_text=source_text)
                 if telemetry is not None:
                     telemetry.update(request_telemetry)
                     telemetry["attempts"] = total_attempts
@@ -463,11 +605,18 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
                 last_error = exc
                 if attempt == 0:
                     semantic_retries += 1
-                    prompt += (
-                        "\n\n上一次分镜结构未通过本地资产清单校验："
-                        f"{exc}。请只修正 scenes 的地点、角色、动作和连续性字段，"
-                        "不要输出 asset_manifest，不要改变核心剧情。"
-                    )
+                    if "遗漏原始编号场景" in str(exc):
+                        prompt += (
+                            "\n\n上一次结构化结果遗漏了原稿编号场景："
+                            f"{exc}。不得遗漏、合并或跳过任何一个以编号开头的原始场景；"
+                            "请完整重新输出 scenes，并保留每场的角色、对白和关键动作。"
+                        )
+                    else:
+                        prompt += (
+                            "\n\n上一次分镜结构未通过本地资产清单校验："
+                            f"{exc}。请只修正 scenes 的地点、角色、动作和连续性字段，"
+                            "不要输出 asset_manifest，不要改变核心剧情。"
+                        )
         if telemetry is not None:
             telemetry.update({
                 "attempts": total_attempts,
@@ -478,7 +627,10 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
         raise last_error or ValueError("Kimi 紧凑剧本解析失败")
 
     @staticmethod
-    def _repair_scene_semantics(script: ScriptBreakdown) -> ScriptBreakdown:
+    def _repair_scene_semantics(
+        script: ScriptBreakdown,
+        source_text: str = "",
+    ) -> ScriptBreakdown:
         """Deterministic dialogue/action separation repair (no LLM call).
 
         - Strips parenthetical stage directions from dialogue lines and moves
@@ -538,7 +690,109 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
                 repaired_dialogue.append(line)
             scene.dialogue = repaired_dialogue
             scene.action_description = action.strip(" ，,、")
+        if str(source_text or "").strip():
+            ScriptAgent._restore_explicit_source_dialogue(script, source_text)
         return script
+
+    @staticmethod
+    def _restore_explicit_source_dialogue(
+        script: ScriptBreakdown,
+        source_text: str,
+    ) -> int:
+        """Reconcile explicit source dialogue with its numbered source scene.
+
+        The source screenplay is authoritative for explicit ``对白：角色：台词``
+        entries.  Compact model parses can omit an on-screen speaker from the
+        correct scene and place their lines in the next scene; reconcile every
+        source-backed occurrence globally, move it back to its source scene,
+        and leave only model-only lines where the model put them.
+        """
+        restored_count = 0
+        source_by_scene = _source_dialogue_by_scene(source_text)
+        if not source_by_scene:
+            return restored_count
+
+        scenes_by_id = {int(scene.scene_id): scene for scene in script.scenes}
+        entries: list[tuple[int, int, str, str, str]] = []
+        for scene_id, source_lines in source_by_scene.items():
+            if scene_id not in scenes_by_id:
+                # A separate source-scene cardinality guard reports a missing
+                # scene.  Do not silently attach its dialogue to a neighbour.
+                continue
+            for source_index, (speaker, source_line, _) in enumerate(source_lines):
+                source_key = _dialogue_compare_key(source_line)
+                if speaker and source_key:
+                    entries.append((scene_id, source_index, speaker, source_line, source_key))
+        if not entries:
+            return restored_count
+
+        used_entry_indexes: set[int] = set()
+        matched_items: dict[int, DialogueLine] = {}
+        unmatched_by_scene: dict[int, list[DialogueLine]] = {
+            int(scene.scene_id): [] for scene in script.scenes
+        }
+
+        for scene in script.scenes:
+            current_scene_id = int(scene.scene_id)
+            for item in list(scene.dialogue or []):
+                speaker = str(item.character or "").strip()
+                item_key = _dialogue_compare_key(item.line)
+                if not speaker or not item_key:
+                    unmatched_by_scene[current_scene_id].append(item)
+                    continue
+                candidates = [
+                    index
+                    for index, (_, _, source_speaker, _, source_key) in enumerate(entries)
+                    if source_speaker == speaker
+                    and (source_key in item_key or item_key in source_key)
+                ]
+                available = [index for index in candidates if index not in used_entry_indexes]
+                if available:
+                    chosen = min(
+                        available,
+                        key=lambda index: (
+                            entries[index][0] != current_scene_id,
+                            entries[index][4] != item_key,
+                            abs(entries[index][0] - current_scene_id),
+                            entries[index][0],
+                            entries[index][1],
+                        ),
+                    )
+                    used_entry_indexes.add(chosen)
+                    matched_items[chosen] = item
+                    continue
+                if candidates:
+                    # This is a duplicate/misassigned copy of an explicit
+                    # source line already mapped to its source occurrence.
+                    continue
+                unmatched_by_scene[current_scene_id].append(item)
+
+        entries_by_scene: dict[int, list[int]] = {}
+        for index, (scene_id, _, _, _, _) in enumerate(entries):
+            entries_by_scene.setdefault(scene_id, []).append(index)
+
+        for scene in script.scenes:
+            scene_id = int(scene.scene_id)
+            source_indexes = entries_by_scene.get(scene_id, [])
+            if not source_indexes:
+                scene.dialogue = unmatched_by_scene[scene_id]
+                continue
+
+            source_backed: list[DialogueLine] = []
+            for entry_index in source_indexes:
+                _, source_order, speaker, source_line, _ = entries[entry_index]
+                if speaker not in scene.characters:
+                    scene.characters.append(speaker)
+                item = matched_items.get(entry_index)
+                if item is None:
+                    item = DialogueLine(character=speaker, line=source_line)
+                    restored_count += 1
+                item.character = speaker
+                item.order = source_order + 1
+                source_backed.append(item)
+            scene.dialogue = source_backed + unmatched_by_scene[scene_id]
+        return restored_count
+
 
     @staticmethod
     def _scene_semantic_errors(script: ScriptBreakdown) -> list[str]:
@@ -559,10 +813,14 @@ location 只写稳定的物理地点身份和室内/室外边界，不得包含�
         return errors
 
     @staticmethod
-    def _validate_visual_assets(script: ScriptBreakdown, require_manifest: bool) -> ScriptBreakdown:
+    def _validate_visual_assets(
+        script: ScriptBreakdown,
+        require_manifest: bool,
+        source_text: str = "",
+    ) -> ScriptBreakdown:
         # Deterministic dialogue/action separation first so every downstream
         # consumer (manifest builder, TTS, prompt composer) sees clean scenes.
-        ScriptAgent._repair_scene_semantics(script)
+        ScriptAgent._repair_scene_semantics(script, source_text=source_text)
         # Preserve every LLM-produced beat while enforcing the video pipeline's
         # practical minimum duration. This is a deterministic repair, not a
         # narrative rewrite.

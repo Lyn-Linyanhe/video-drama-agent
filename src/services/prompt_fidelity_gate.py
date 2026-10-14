@@ -49,7 +49,7 @@ def generation_snapshot_digest(snapshot: dict[str, Any]) -> str:
     fields = {
         key: snapshot.get(key)
         for key in (
-            "scene_id", "source_prompt", "source_duration_sec", "effective_duration_sec",
+            "scene_id", "shot_id", "source_prompt", "source_duration_sec", "effective_duration_sec",
             "raw_prompt", "raw_negative_prompt", "prepared_shot", "provider",
             "effective_prompt", "effective_negative_prompt", "provider_prompt",
             "provider_negative_prompt", "negative_prompt_mode", "policy",
@@ -97,11 +97,63 @@ def audit_generation_snapshot(state: Any, snapshot: dict[str, Any] | None, scene
             f"scene_id={requested_scene_id}",
         ))
 
-    current_shot = next(
-        (shot for shot in (getattr(getattr(state, "generation_prompts", None), "shots", []) or [])
-         if int(getattr(shot, "scene_id", 0) or 0) == int(scene_id)),
-        None,
-    )
+    shot_id = str(snapshot.get("shot_id") or "").strip()
+    current_shot = None
+    if shot_id:
+        try:
+            from src.services.shot_prompt_materializer import materialize_shot_prompts
+            from src.services.video_capabilities import normalize_video_policy
+
+            duration_cap_sec = None
+            provider_min_duration_sec = 3
+            duration_options = None
+            policy_payload = snapshot.get("policy")
+            if isinstance(policy_payload, dict) and policy_payload:
+                try:
+                    policy = normalize_video_policy(policy_payload, None)
+                    capability = dict(policy.get("capability") or {})
+                    duration_cap_sec = capability.get("duration_max")
+                    if duration_cap_sec is None:
+                        durations = capability.get("durations") or []
+                        duration_cap_sec = max(durations) if durations else None
+                    provider_min_duration_sec = int(capability.get("duration_min") or 3)
+                    duration_options = capability.get("durations") if capability.get("discrete_durations") else None
+                except Exception:
+                    duration_cap_sec = None
+                    provider_min_duration_sec = 3
+                    duration_options = None
+            current_shot = next(
+                (shot for shot in materialize_shot_prompts(
+                    state.generation_prompts,
+                    state.script,
+                    duration_cap_sec=duration_cap_sec,
+                    provider_min_duration_sec=provider_min_duration_sec,
+                    duration_options=duration_options,
+                )
+                 if int(getattr(shot, "scene_id", 0) or 0) == int(scene_id)
+                 and str(getattr(shot, "shot_id", "") or "") == shot_id),
+                None,
+            )
+        except Exception:
+            current_shot = None
+    if shot_id and current_shot is None:
+        issues.append(_snapshot_issue(
+            scene_id,
+            "snapshot_shot_not_found",
+            "视频任务快照中的子镜头不存在于当前 ShotPlan，不能回退到父镜头提示词",
+            f"shot_id={shot_id} 存在于当前 ShotPlan",
+            f"shot_id={shot_id} 未找到",
+            "shot_id",
+        ))
+    if shot_id and current_shot is None:
+        # Keep the parent prompt out of the comparison for an unknown child.
+        current_shot = None
+    elif current_shot is None:
+        current_shot = next(
+            (shot for shot in (getattr(getattr(state, "generation_prompts", None), "shots", []) or [])
+             if int(getattr(shot, "scene_id", 0) or 0) == int(scene_id)),
+            None,
+        )
     source_prompt = str(snapshot.get("source_prompt") or "").strip()
     raw_prompt = str(snapshot.get("raw_prompt") or "").strip()
     current_prompt = str(getattr(current_shot, "prompt", "") or "").strip()
@@ -155,6 +207,15 @@ def audit_generation_snapshot(state: Any, snapshot: dict[str, Any] | None, scene
                 "prepared_shot 的镜头编号与任务目标不一致",
                 f"scene_id={scene_id}",
                 f"scene_id={prepared.scene_id}",
+                "prepared_shot",
+            ))
+        if shot_id and str(getattr(prepared, "shot_id", "") or "") != shot_id:
+            issues.append(_snapshot_issue(
+                scene_id,
+                "snapshot_prepared_shot_mismatch",
+                "prepared_shot 的子镜头编号与任务快照不一致",
+                f"shot_id={shot_id}",
+                f"shot_id={getattr(prepared, 'shot_id', '')}",
                 "prepared_shot",
             ))
         prepared_prompt = str(prepared.prompt or "").strip()

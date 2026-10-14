@@ -1170,6 +1170,7 @@ async def generate_prop_reference_views(
                 for record in candidate_histories.get(failed_view, [])
                 if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
             ),
+            "",
         )
         retry_of_version_by_view[failed_view] = first_candidate_id
         neighbor_path = next((path for path in references if path != master.image_path), "")
@@ -1183,6 +1184,7 @@ async def generate_prop_reference_views(
                 for record in candidate_histories.get(neighbor_view, [])
                 if record.get("candidate") and int(record.get("attempt_no") or 0) == 1
             ),
+            "",
         )
         repair_reference_ids_by_view[failed_view] = [master.version_id, *([neighbor_id] if neighbor_id else [])]
     blocked_views = [view for view in requested if not _quality_allows_activation(quality_reports.get(view))]

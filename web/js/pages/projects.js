@@ -40,21 +40,29 @@ async function loadProjects() {
       return;
     }
     container.innerHTML = projects.map(p => `
-      <div class="card" style="cursor:pointer" onclick="StudioActions.openProject('${p.id}')">
-        <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:8px">
-          <h4 style="font-size:14px;margin:0">${escapeHtml(p.title.slice(0,30))}</h4>
-          <span style="font-size:10px;padding:2px 8px;border-radius:4px;background:${p.status==='completed'?'#064e3b':'#1e293b'};color:${p.status==='completed'?'#10b981':'#94a3b8'}">${p.status}</span>
+      <article class="card project-card" onclick="StudioActions.openProject('${p.id}')">
+        <div class="project-card-head">
+          <div>
+            <span class="project-card-kicker">WORKSPACE</span>
+            <h4>${escapeHtml(p.title.slice(0,30))}</h4>
+          </div>
+          <span class="project-card-status ${p.status === 'completed' ? 'is-complete' : ''}">${escapeHtml(p.status || 'created')}</span>
         </div>
-        <div style="font-size:11px;color:#71717a">${escapeHtml(p.user_input?.slice(0,50)||'')}</div>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
-          <span style="font-size:10px;color:#52525b">${p.created_at}</span>
-          <span class="card-actions" style="display:flex;gap:4px" onclick="event.stopPropagation()">
-            <button class="btn-secondary btn-sm" onclick="StudioActions.openEditModal('${p.id}')" title="修改">🔧</button>
-            <button class="btn-secondary btn-sm" onclick="StudioActions.copyProject('${p.id}')" title="复制">📋</button>
-            <button class="btn-secondary btn-sm" style="color:#ef4444" onclick="StudioActions.deleteProject('${p.id}')" title="删除">🗑️</button>
+        <p class="project-card-description">${escapeHtml(p.user_input?.slice(0,80) || '从创意、剧本到镜头生成的连续工作区')}</p>
+        <div class="project-card-meta">
+          <span>${escapeHtml(p.video_ratio || '9:16')}</span>
+          <span>${escapeHtml(p.genre_tags || '未设置类型')}</span>
+          <time>${escapeHtml(p.created_at || '')}</time>
+        </div>
+        <div class="project-card-footer">
+          <span class="project-card-open">继续创作 <span aria-hidden="true">↗</span></span>
+          <span class="card-actions project-card-actions" onclick="event.stopPropagation()">
+            <button class="btn-secondary btn-sm" onclick="StudioActions.openEditModal('${p.id}')" title="修改" aria-label="修改项目">编辑</button>
+            <button class="btn-secondary btn-sm" onclick="StudioActions.copyProject('${p.id}')" title="复制" aria-label="复制项目">复制</button>
+            <button class="btn-secondary btn-sm danger" onclick="StudioActions.deleteProject('${p.id}')" title="删除" aria-label="删除项目">删除</button>
           </span>
         </div>
-      </div>
+      </article>
     `).join('');
   } catch(e) {
     console.error('加载项目失败:', e);

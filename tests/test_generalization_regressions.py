@@ -633,3 +633,30 @@ def test_generic_dialogue_shot_keeps_canonical_action_instead_of_only_dialogue()
 
     assert "hands Lina the school badge" in rendered
     assert "locks the greenhouse door" in rendered
+
+
+def test_courtyard_gate_scale_lock_does_not_use_street_shop_or_iron_door():
+    from src.services.asset_prompt_composer import _scene_scale_lock
+
+    inner = _scene_scale_lock("杨家院门内侧(上午,室外)", "从院内望向院门", "", "上午")
+    doorway = _scene_scale_lock("杨家院门口(上午,室外)", "半开的院门口，深褐木门槛与石阶", "", "上午")
+    assert "临街建筑外立面" not in inner
+    assert "铁门" not in doorway
+    assert "从院内望向院门" in inner or "庭院" in inner or "门体" in inner
+    assert "门槛" in doorway or "院门" in doorway
+
+
+def test_stone_table_and_path_scale_lock_beat_generic_courtyard_tokens():
+    from src.services.asset_prompt_composer import _scene_scale_lock
+
+    table = _scene_scale_lock("梁国杨家院子石桌旁(上午,室外庭院)", "庭院一角的石桌区域", "", "上午")
+    path = _scene_scale_lock("杨家院门外小路(上午,室外)", "院门外的青石小路", "", "上午")
+    courtyard = _scene_scale_lock("梁国杨家院子(上午,室外庭院)", "古代民居庭院，一侧双扇木门", "", "上午")
+
+    assert "石桌石凳围合区域" in table
+    assert "双侧门楼" in table
+    assert "完整庭院边界" not in table
+    assert "青石小路纵深" in path
+    assert "禁止拍成院内天井" in path
+    assert "单侧一座双扇门体" in courtyard
+    assert "左右两侧各设一座门楼" in courtyard

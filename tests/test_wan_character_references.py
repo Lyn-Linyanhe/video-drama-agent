@@ -1312,3 +1312,35 @@ def test_scene_reference_group_warning_keeps_whole_group_as_candidates(tmp_path,
         None,
     )
     assert left is None or not left.image_path
+
+
+def test_prop_reference_single_failed_view_does_not_raise_stop_iteration(tmp_path, monkeypatch):
+    """A single derived view has no neighbor candidate; failed retry must still return a report."""
+    _enable_wan(monkeypatch)
+    _, project_id = _prepare_character_project(tmp_path, monkeypatch)
+    state = api_context._load_project_state(project_id)
+    from src.schemas.script import PropAsset
+
+    state.script.asset_manifest.props.append(PropAsset(prop_id="single_prop", name="道具", description="测试道具"))
+    api_context._save_project_state(state)
+    fake = FakeWanClient(tmp_path, count=1)
+    monkeypatch.setattr(asset_generation, "client_for_policy", lambda _policy: fake)
+    master = asyncio.run(asset_generation.generate_prop_master(project_id, "single_prop"))
+    asyncio.run(asset_generation.confirm_prop_master(project_id, "single_prop", master["version_id"]))
+
+    async def reject(*_args, **_kwargs):
+        raise MediaQualityFailure(
+            "hard visual failure",
+            {"visual_review": {
+                "status": "warning", "passed": False, "hard_fail": True,
+                "evidence_confidence": "high", "issues": ["底视图错误"],
+            }},
+        )
+
+    monkeypatch.setattr(asset_generation, "_validate_generated_image", reject)
+    result = asyncio.run(asset_generation.generate_prop_reference_views(project_id, "single_prop", ("bottom",)))
+
+    assert result["generated"] == []
+    assert result["retry_performed"] is True
+    assert {record.get("attempt_no") for record in result["candidate_histories"]["bottom"] if record.get("candidate")} == {1, 2}
+    assert fake.edit_calls

@@ -92,12 +92,38 @@
 .version-item video { display: block; width: 100%; aspect-ratio: 9 / 16; border-radius: 4px; background: #000; object-fit: cover; }
 .version-item span { display: block; margin-top: 4px; font-size: 10px; }
 
-.production-timeline { display: flex; gap: 10px; max-height: 112px; margin-top: 0; padding: 12px; overflow-x: auto; overflow-y: hidden; }
+.production-timeline {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  max-height: none;
+  margin-top: 0;
+  padding: 12px;
+  overflow-x: auto;
+  overflow-y: auto;
+}
+.production-timeline-group {
+  display: grid;
+  flex: 0 0 auto;
+  align-content: start;
+  gap: 6px;
+  min-width: 150px;
+}
+.production-timeline-parent { justify-self: start; white-space: nowrap; }
+.production-timeline-parent.active { border-color: var(--production-accent); color: var(--production-text); background: var(--production-accent-soft); }
+.production-timeline-group-label { padding: 0 2px; color: #a1a1aa; font-size: 11px; }
+.production-timeline-shots {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: nowrap;
+  gap: 8px;
+}
 .timeline-shot { position: relative; flex: 0 0 112px; padding: 4px; border: 1px solid #3f3f46; border-radius: 6px; background: #111114; color: #d4d4d8; cursor: pointer; text-align: left; }
 .timeline-shot.active { border-color: #60a5fa; }
-.timeline-shot img, .timeline-shot video { display: block; width: 100%; height: 72px; border-radius: 4px; background: #09090b; object-fit: cover; }
-.timeline-shot span { display: block; margin-top: 4px; font-size: 10px; }
-.timeline-status { position: absolute; top: 8px; left: 8px; padding: 2px 4px; border-radius: 3px; background: #18181b; font-size: 9px; }
+.timeline-shot img, .timeline-shot video { display: block; width: 100%; height: 64px; border-radius: 4px; background: #09090b; object-fit: cover; }
+.timeline-shot > span:last-child { display: block; margin-top: 4px; font-size: 10px; }
+.timeline-status { position: absolute; top: 8px; left: 8px; margin-top: 0; padding: 2px 4px; border-radius: 3px; background: #18181b; font-size: 9px; }
 .production-empty { padding: 48px; color: #a1a1aa; text-align: center; }
 .production-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .production-feedback { min-height: 62px; resize: vertical; }
@@ -112,7 +138,7 @@
 
 /* The audio workspace owns its internal scroll. The surrounding page remains
    available for older, taller projects instead of clipping controls. */
-#page-shots { min-height: calc(100vh - 53px); }
+#page-shots { min-height: calc(100vh - 53px); min-width: 0; max-width: 100%; overflow-x: hidden; }
 #shot-production-workspace { display: grid; gap: 10px; }
 #production-audio-workspace { height: min(440px, 45vh); min-height: 300px; }
 #production-preview-download { display: inline-flex; }
@@ -170,13 +196,42 @@
   margin-bottom: 12px;
   padding: 2px 2px 0;
 }
-.production-toolbar-title {
-  display: flex;
+.production-toolbar-title { display: flex;
   align-items: baseline;
   gap: 10px;
   min-width: 0;
   margin-right: auto;
 }
+.production-context-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.production-context-scope { max-width: 280px; overflow: hidden; color: var(--production-muted); text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.production-context-status { padding: 5px 8px; border: 1px solid rgba(32, 199, 165, .45); border-radius: 5px; color: #b9eee3; background: var(--production-accent-soft); font-size: 11px; }
+.production-project-tools { flex: 0 0 auto; min-width: min(100%, 280px); }
+.production-project-tools > summary { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 1px solid var(--production-border-strong); border-radius: 6px; color: var(--production-muted); cursor: pointer; font-size: 11px; list-style-position: inside; }
+.production-project-tools > summary::marker { color: var(--production-warning); }
+.production-project-tools[open] > summary { color: var(--production-text); border-color: var(--production-warning); background: rgba(243, 189, 98, .08); }
+.production-project-tools-label { color: inherit; font-weight: 700; }
+.production-project-tools-meta { color: var(--production-subtle); font-size: 10px; }
+.production-project-tools-body { display: grid; gap: 7px; margin-top: 7px; padding: 8px; border: 1px solid var(--production-border); border-radius: 6px; background: var(--production-panel-raised); }
+.production-project-tools-note { color: var(--production-muted); font-size: 10px; line-height: 1.45; }
+.production-project-tools .production-toolbar-actions { display: flex; align-items: stretch; gap: 6px; flex-direction: column; }
+.production-project-tools .production-toolbar-actions .btn-secondary { width: 100%; text-align: left; }
+.production-readonly-note { padding: 10px 12px; border-left: 3px solid var(--production-warning); background: rgba(243, 189, 98, .08); color: var(--production-muted); font-size: 11px; line-height: 1.55; }
+.production-preview-error { max-width: 100%; margin-top: 8px; padding: 10px; color: #fca5a5; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.production-preview-output { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; overflow-y: auto; }
+.preview-stage:has(.production-preview-error) { overflow-y: auto; }
+.preview-stage > div:has(> .production-preview-error) { max-width: 100%; max-height: 100%; overflow-y: auto; }
+.preview-stage .production-preview-output video { flex: 1 1 auto; min-height: 120px; height: auto; }
+.production-timeline-parent .timeline-status { position: static; display: inline-block; margin-left: 6px; }
+.production-preview-job-actions { display: flex; justify-content: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.production-version-scope { flex: 0 0 auto; align-self: center; color: var(--production-subtle); font-size: 10px; }
 .production-toolbar-title h3 { margin: 0; color: var(--production-text); font-size: 20px; font-weight: 650; letter-spacing: 0; }
 .production-toolbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .production-global-status { min-width: 80px; color: var(--production-muted); font-size: 12px; }
@@ -405,8 +460,9 @@ select:focus { border-color: var(--production-accent); outline: 2px solid var(--
 .version-item.active { border-color: var(--production-accent); box-shadow: 0 0 0 1px var(--production-accent-soft); }
 .version-item span { color: var(--production-muted); font-size: 11px; }
 
-.production-toolbar-actions .btn-primary,
-.production-editor-footer-actions .btn-primary { border-color: transparent; background: var(--production-accent); color: #061a16; font-weight: 700; }
+  .production-toolbar-actions .btn-primary,
+  .production-editor-footer-actions .btn-primary { border-color: transparent; background: var(--production-accent); color: #061a16; font-weight: 700; }
+  .production-context-actions .btn-primary { border-color: transparent; background: var(--production-accent); color: #061a16; font-weight: 700; }
 .production-toolbar-actions .btn-primary:hover,
 .production-editor-footer-actions .btn-primary:hover { background: #48d5b9; }
 .production-toolbar-actions .btn-secondary,
@@ -446,5 +502,562 @@ select:focus { border-color: var(--production-accent); outline: 2px solid var(--
   .production-hard-cut-chip { margin-left: 0; }
   .production-editor-footer-actions { align-items: stretch; flex-direction: column; }
   .production-footer-buttons { justify-content: flex-end; }
-  .production-save-hint { line-height: 1.45; }
+  }
+
+#shot-production-workspace .production-context-actions {
+  padding: 7px 8px;
+  border: 1px solid rgba(32, 199, 165, .35);
+  border-radius: 7px;
+  background: rgba(32, 199, 165, .055);
 }
+#shot-production-workspace .production-project-tools {
+  align-self: stretch;
+}
+#shot-production-workspace .production-project-tools > summary {
+  border-color: rgba(243, 189, 98, .42);
+}
+#shot-production-workspace .production-project-tools[open] > summary {
+  box-shadow: 0 0 0 1px rgba(243, 189, 98, .08);
+}
+
+/* Graphite Stage production canvas overrides. */
+  #shot-production-workspace {
+    --production-bg: #0b0f12;
+    --production-panel: #151b20;
+    --production-panel-raised: #1d272d;
+    --production-border: #2c3a42;
+    --production-border-strong: #40515c;
+    --production-text: #edf2f4;
+    --production-muted: #93a2aa;
+    --production-subtle: #6d7c84;
+    --production-accent: #20c7a5;
+    --production-accent-soft: rgba(32, 199, 165, .14);
+    --production-warning: #f3bd62;
+    position: relative;
+    padding: 2px 0 22px;
+    background:
+      linear-gradient(rgba(112, 214, 255, .025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(112, 214, 255, .025) 1px, transparent 1px),
+      var(--production-bg);
+    background-size: 28px 28px;
+  }
+  #shot-production-workspace::before {
+    content: 'STUDIO / SHOT ASSEMBLY';
+    display: block;
+    padding: 0 2px 8px;
+    color: var(--production-subtle);
+    font: 10px/1.2 var(--stage-mono, monospace);
+    letter-spacing: .12em;
+  }
+  #shot-production-workspace .production-workspace-toolbar {
+    min-height: 54px;
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--production-border);
+    border-radius: 8px;
+    background: rgba(21, 27, 32, .92);
+    box-shadow: 0 12px 24px rgba(0, 0, 0, .14);
+    backdrop-filter: blur(10px);
+  }
+  #shot-production-workspace .production-toolbar-title { gap: 9px; }
+  #shot-production-workspace .production-toolbar-title h3 { font-size: 17px; }
+  #shot-production-workspace .production-eyebrow { color: var(--production-accent); font-family: var(--stage-mono, monospace); letter-spacing: .1em; }
+  #shot-production-workspace .production-global-status { font-family: var(--stage-mono, monospace); }
+  #shot-production-workspace .production-shell { grid-template-columns: minmax(190px, 220px) minmax(0, 1fr) minmax(270px, 320px); gap: 9px; min-height: 0; }
+  #shot-production-workspace .production-panel { border-color: var(--production-border); border-radius: 8px; box-shadow: 0 12px 28px rgba(0, 0, 0, .1); }
+  #shot-production-workspace .production-assets, #shot-production-workspace .production-preview { padding: 13px; background: rgba(21, 27, 32, .96); }
+  #shot-production-workspace .production-assets { border-top: 2px solid rgba(32, 199, 165, .55); }
+  #shot-production-workspace .production-preview { border-top: 2px solid rgba(112, 214, 255, .5); }
+  #shot-production-workspace .production-editor { background: rgba(11, 15, 18, .97); border-top: 2px solid var(--production-accent); }
+  #shot-production-workspace .production-editor-header { padding: 15px 16px 13px; background: rgba(29, 39, 45, .64); border-bottom-color: var(--production-border); }
+  #shot-production-workspace .production-shot-title h3 { font-size: 17px; }
+  #shot-production-workspace .production-shot-title p { color: var(--production-muted); }
+  #shot-production-workspace .production-chip { border-color: var(--production-border-strong); background: #19242a; border-radius: 5px; }
+  #shot-production-workspace .production-status-chip { color: #b7f4e5; border-color: rgba(32, 199, 165, .45); background: var(--production-accent-soft); }
+  #shot-production-workspace .production-editor-section { padding: 14px 16px; border-bottom-color: var(--production-border); }
+  #shot-production-workspace .production-section-heading { margin-bottom: 10px; }
+  #shot-production-workspace .production-section-heading h4 { font-size: 13px; }
+  #shot-production-workspace .production-section-note { color: var(--production-subtle); }
+  #shot-production-workspace .production-reference-summary, #shot-production-workspace .production-reference-manager, #shot-production-workspace .production-provider-preview { border-color: var(--production-border); background: #11191d; border-radius: 6px; }
+  #shot-production-workspace .reference-row { border-color: var(--production-border); background: #0e1418; }
+  #shot-production-workspace .reference-chip { border-color: var(--production-border-strong); background: #1d292f; }
+  #shot-production-workspace .reference-chip:hover { border-color: var(--production-accent); }
+  #shot-production-workspace #production-prompt, #shot-production-workspace #production-negative, #shot-production-workspace #production-feedback { background: #0b1114; border-color: var(--production-border-strong); border-radius: 6px; }
+  #shot-production-workspace #production-prompt:focus, #shot-production-workspace #production-negative:focus, #shot-production-workspace #production-feedback:focus { border-color: var(--production-accent); outline: 2px solid var(--production-accent-soft); }
+  #shot-production-workspace .production-settings-grid { gap: 8px; }
+  #shot-production-workspace select { background-color: #10181c; border-color: var(--production-border-strong); }
+  #shot-production-workspace .production-ai-section { background: rgba(20, 34, 36, .75); }
+  #shot-production-workspace .production-editor-footer-actions { padding: 12px 16px; background: rgba(21, 27, 32, .98); border-top-color: var(--production-border); }
+  #shot-production-workspace .production-toolbar-actions .btn-primary, #shot-production-workspace .production-editor-footer-actions .btn-primary { background: var(--production-accent); color: #061a16; }
+  #shot-production-workspace .production-context-actions .btn-primary { background: var(--production-accent); color: #061a16; border-color: transparent; }
+  #shot-production-workspace .production-context-actions .btn-primary:hover { background: #48d5b9; }
+  #shot-production-workspace .production-toolbar-actions .btn-secondary, #shot-production-workspace .production-editor-footer-actions .btn-secondary, #shot-production-workspace .production-ai-button { background: var(--production-panel-raised); border-color: var(--production-border-strong); }
+  #shot-production-workspace .production-toolbar-actions .btn-secondary:hover, #shot-production-workspace .production-editor-footer-actions .btn-secondary:hover, #shot-production-workspace .production-ai-button:hover { border-color: var(--production-accent); background: #26343b; }
+  #shot-production-workspace .preview-stage { min-height: 300px; border-color: var(--production-border); background: #070b0d; }
+  #shot-production-workspace .version-item { border-color: var(--production-border); background: #0e1418; }
+  #shot-production-workspace .version-item.active { border-color: var(--production-accent); box-shadow: 0 0 0 1px var(--production-accent-soft); }
+  #shot-production-workspace .production-audio-workspace, #shot-production-workspace .production-timeline { border-color: var(--production-border); background: rgba(21, 27, 32, .96); }
+  #shot-production-workspace .production-timeline { margin-top: 9px; }
+  #shot-production-workspace .timeline-shot { border-color: var(--production-border); background: #0e1418; }
+  #shot-production-workspace .timeline-shot.active { border-color: var(--production-accent); box-shadow: 0 0 0 1px var(--production-accent-soft); }
+
+  @media (max-width: 1100px) {
+    #shot-production-workspace .production-shell { grid-template-columns: 210px minmax(0, 1fr); }
+  }
+
+
+/* Round 2 / phase 1: keep the shot edit path above secondary project tools. */
+#shot-production-workspace {
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  overflow: visible;
+}
+
+#shot-production-workspace .production-shell {
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  align-items: start;
+  min-height: 0;
+  height: auto;
+}
+
+#shot-production-workspace .production-editor,
+#shot-production-workspace .production-assets,
+#shot-production-workspace .production-preview {
+  max-height: none;
+  overflow: visible;
+}
+
+#shot-production-workspace .production-stage-shell > .production-preview {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+#shot-production-workspace .production-editor {
+  min-width: 0;
+}
+
+#shot-production-workspace .production-editor-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+}
+
+.production-secondary-section {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 12px;
+  border: 1px solid var(--production-border);
+  border-radius: 8px;
+  background: rgba(21, 27, 32, .94);
+  overflow: clip;
+}
+
+.production-secondary-section > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 46px;
+  padding: 9px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.production-secondary-section > summary::-webkit-details-marker { display: none; }
+.production-secondary-section > summary::before {
+  content: '›';
+  order: 2;
+  color: var(--production-accent);
+  font-size: 20px;
+  line-height: 1;
+  transition: transform .16s ease;
+}
+.production-secondary-section[open] > summary::before { transform: rotate(90deg); }
+.production-secondary-section > summary > span:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  margin-right: auto;
+}
+.production-secondary-section > summary strong { color: var(--production-text); font-size: 13px; font-weight: 650; }
+.production-secondary-meta {
+  order: 1;
+  max-width: 48%;
+  overflow: hidden;
+  color: var(--production-subtle);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.production-secondary-section > summary:hover,
+.production-secondary-section > summary:focus-visible { background: rgba(32, 199, 165, .07); outline: none; }
+.production-secondary-section > .production-panel,
+.production-secondary-section > #production-audio-workspace {
+  margin: 0;
+  border: 0;
+  border-top: 1px solid var(--production-border);
+  border-radius: 0;
+}
+.production-assets-section .production-assets { padding: 14px; }
+.production-audio-section #production-audio-workspace { height: min(620px, 68vh); min-height: 320px; }
+.production-timeline-section .production-timeline {
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 12px;
+}
+
+/* Stage: filmstrip selects the shot, the frame stays large, the inspector switches panes. */
+.production-filmstrip {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 100%;
+}
+.production-filmstrip .timeline-shot { flex-basis: 72px; }
+.production-filmstrip .timeline-shot img,
+.production-filmstrip .timeline-shot video,
+.production-filmstrip .timeline-shot > div { height: 48px; }
+.production-filmstrip .production-timeline-group { min-width: 0; gap: 4px; }
+.production-filmstrip .production-timeline-parent { justify-self: start; max-width: 132px; overflow: hidden; padding: 1px 6px; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.production-filmstrip .production-timeline-group-label { display: none; }
+.production-filmstrip-head {
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--production-border, #2c3a42);
+  border-radius: 8px;
+  background: #12191e;
+}
+.production-filmstrip-head strong { color: var(--production-text, #edf2f4); font-size: 13px; }
+.production-filmstrip-head span:last-child { color: var(--production-subtle, #6d7c84); font-size: 11px; line-height: 1.35; }
+.production-filmstrip .production-timeline {
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.production-review-fold, .storyboard-quality-diagnostics, .production-policy-slot { margin: 0; }
+.production-review-fold { padding: 6px 10px; }
+.production-review-fold > summary { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 12px; }
+.production-review-fold > summary b { font-size: 12px; }
+.storyboard-quality-diagnostics { margin: 0; padding: 8px 12px; }
+.storyboard-quality-diagnostics > summary { display: flex; justify-content: space-between; gap: 12px; cursor: pointer; font-size: 13px; font-weight: 650; }
+#shot-production-workspace .production-stage-shell {
+  grid-template-columns: minmax(0, 1.05fr) minmax(420px, 520px);
+  align-items: stretch;
+  height: calc(100dvh - 168px);
+  min-height: 420px;
+  overflow: hidden;
+}
+#shot-production-workspace .production-stage-shell .production-preview {
+  position: static;
+  top: auto;
+  order: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+#shot-production-workspace .production-stage-shell .preview-stage,
+#shot-production-workspace #production-preview-stage {
+  flex: 1 1 auto;
+  width: auto;
+  max-width: 100%;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  margin-inline: auto;
+  aspect-ratio: 16 / 9;
+}
+#shot-production-workspace .production-stage-shell .preview-stage video,
+#shot-production-workspace #production-preview-stage video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+#shot-production-workspace .production-stage-settings {
+  flex: 0 0 auto;
+  overflow: visible;
+}
+#shot-production-workspace .production-version-section {
+  flex: 0 0 auto;
+  max-height: 92px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.production-inspector-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid var(--production-border, #2c3a42);
+  background: #12191e;
+  position: sticky;
+  top: 0;
+  z-index: 4;
+}
+.production-inspector-tabs button {
+  min-height: 36px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--production-muted, #93a2aa);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+.production-inspector-tabs button.is-active {
+  border-color: rgba(32, 199, 165, .55);
+  background: rgba(32, 199, 165, .14);
+  color: #edf2f4;
+}
+.production-inspector-tabs button:focus-visible { outline: 2px solid #20c7a5; outline-offset: 1px; }
+.production-inspector[data-inspector="look"] .production-prompt-section,
+.production-inspector[data-inspector="look"] .production-ai-section,
+.production-inspector[data-inspector="words"] .production-reference-section,
+.production-inspector[data-inspector="words"] .production-ai-section,
+.production-inspector[data-inspector="generate"] .production-reference-section,
+.production-inspector[data-inspector="generate"] .production-prompt-section { display: none; }
+.production-inspector[data-inspector="words"] .production-script { min-height: 180px; }
+
+@media (min-width: 1101px) {
+  #page-shots { overflow: visible; }
+  #shot-production-workspace .production-preview { position: sticky; top: 12px; }
+  #shot-production-workspace .production-stage-shell > .production-preview { position: static; overflow: hidden; }
+}
+
+@media (max-width: 1100px) {
+  .production-preview { grid-column: auto; }
+  #shot-production-workspace .production-shell { grid-template-columns: minmax(0, 1fr) minmax(250px, 34%); }
+  #shot-production-workspace .production-stage-shell {
+    grid-template-columns: minmax(0, 1fr) minmax(320px, 42%);
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+  #shot-production-workspace .production-stage-shell .production-editor {
+    min-height: 0;
+    max-height: calc(100dvh - 220px);
+    overflow-y: auto;
+  }
+  #shot-production-workspace .production-stage-shell .production-preview {
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+}
+
+@media (max-width: 720px) {
+  .production-filmstrip { grid-template-columns: minmax(0, 1fr); }
+  .production-preview { grid-column: auto; }
+  #shot-production-workspace .production-shell { display: flex; flex-direction: column; gap: 8px; }
+  #shot-production-workspace .production-stage-shell {
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+  #shot-production-workspace .production-stage-shell .production-preview { order: 1; width: 100%; position: static; overflow: visible; }
+  #shot-production-workspace .production-stage-shell .production-editor { order: 2; width: 100%; max-height: none; overflow: visible; }
+  #shot-production-workspace .production-editor-header { position: static; }
+  #shot-production-workspace .production-stage-shell .preview-stage,
+  #shot-production-workspace #production-preview-stage {
+    flex: 0 0 auto;
+    width: 100%;
+    height: clamp(240px, 42dvh, 520px);
+    max-height: none;
+    aspect-ratio: auto;
+  }
+  #shot-production-workspace .production-stage-shell .preview-stage video,
+  #shot-production-workspace #production-preview-stage video { width: 100%; height: 100%; object-fit: contain; }
+  .production-secondary-section { margin-top: 8px; }
+  .production-secondary-section > summary { min-height: 44px; padding: 8px 10px; }
+  .production-secondary-meta { max-width: 42%; }
+  .production-audio-section #production-audio-workspace { height: 560px; }
+}
+
+#shot-production-workspace {
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+
+/* Editing-desk layout: picture first, filmstrip below, no folded sections. */
+.production-workspace-toolbar { flex-wrap: wrap; row-gap: 8px; }
+.production-workspace-toolbar .production-project-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  width: 100%;
+  min-width: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--production-border);
+}
+.production-workspace-toolbar .production-project-tools-label { color: var(--production-warning); font-size: 11px; font-weight: 700; }
+.production-workspace-toolbar .production-project-tools-meta { color: var(--production-subtle); font-size: 11px; }
+.production-workspace-toolbar .production-project-tools .production-toolbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex-direction: row; margin-left: auto; }
+.production-workspace-toolbar .production-project-tools .production-toolbar-actions .btn-secondary { width: auto; text-align: center; }
+.production-workspace-toolbar .production-project-tools-note { margin-left: auto; color: var(--production-muted); font-size: 10px; }
+.production-notices { display: grid; gap: 6px; min-width: 0; max-width: 100%; margin-bottom: 10px; }
+.production-notices:empty { display: none; }
+.production-notices .production-panel { margin: 0; padding: 6px 10px; }
+.production-notices .production-stale-note { color: var(--production-warning); font-size: 11px; }
+.production-review-fold { display: grid; gap: 4px; max-height: 148px; overflow-y: auto; }
+.production-review-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+.production-review-bar .production-review-summary { flex: 1 1 240px; min-width: 0; overflow: hidden; color: var(--production-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.storyboard-quality-diagnostics { display: grid; gap: 4px; max-height: 148px; overflow-y: auto; }
+.storyboard-quality-diagnostics .production-diagnostics-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; font-weight: 650; }
+.storyboard-quality-diagnostics .production-diagnostics-body { display: grid; gap: 6px; }
+#shot-production-workspace .production-inspector[data-inspector="look"] .production-assets-section,
+#shot-production-workspace .production-inspector[data-inspector="words"] .production-assets-section,
+#shot-production-workspace .production-inspector[data-inspector="generate"] .production-assets-section { display: none; }
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-reference-section,
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-prompt-section,
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-ai-section { display: none; }
+.production-inspector-tabs { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.production-audio-section > .production-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px 4px; }
+.production-audio-section .production-audio-workspace { border: 0; border-radius: 0; background: transparent; }
+@media (max-width: 720px) {
+  .production-workspace-toolbar .production-project-tools .production-toolbar-actions { margin-left: 0; }
+}
+
+/* Compact generation strip under the picture; filmstrip pinned near the bottom. */
+#shot-production-workspace .production-stage-quickset {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-top: 1px solid var(--production-border);
+}
+.production-quickset-field { display: inline-flex; align-items: center; gap: 5px; color: var(--production-muted); font-size: 11px; }
+.production-quickset-field select { max-width: 128px; min-height: 28px; padding: 2px 6px; font-size: 11px; }
+#shot-production-workspace .production-stage-quickset .production-toggle { margin-left: auto; font-size: 11px; }
+#shot-production-workspace .production-inspector[data-inspector="words"] .production-reference-section { display: block; }
+#shot-production-workspace .production-inspector[data-inspector="words"] .production-generation-detail,
+#shot-production-workspace .production-inspector[data-inspector="words"] .production-assets-section { display: none; }
+#shot-production-workspace .production-inspector[data-inspector="generate"] .production-editor-header,
+#shot-production-workspace .production-inspector[data-inspector="generate"] .production-reference-section,
+#shot-production-workspace .production-inspector[data-inspector="generate"] .production-prompt-section,
+#shot-production-workspace .production-inspector[data-inspector="generate"] .production-ai-section,
+#shot-production-workspace .production-inspector[data-inspector="generate"] .production-assets-section { display: none; }
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-editor-header,
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-reference-section,
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-prompt-section,
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-ai-section,
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-generation-detail { display: none; }
+.production-inspector-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (min-width: 1101px) {
+  #shot-production-workspace .production-stage-shell .production-editor { min-height: 0; overflow-y: auto; }
+  .production-filmstrip { position: sticky; bottom: 10px; z-index: 6; border: 1px solid var(--production-border); border-radius: 8px; background: #0e1418; box-shadow: 0 10px 26px rgba(0, 0, 0, .45); }
+}
+
+/* Versions float over the lower video edge; notices stay one line each. */
+#shot-production-workspace .production-stage-shell .production-preview { position: relative; }
+#shot-production-workspace .production-stage-shell .production-version-section {
+  position: absolute;
+  right: 12px;
+  bottom: 58px;
+  left: 12px;
+  max-height: 96px;
+  padding: 6px 8px;
+  border: 1px solid var(--production-border);
+  border-radius: 8px;
+  background: rgba(10, 14, 17, .84);
+}
+#shot-production-workspace .production-stage-shell .production-version-section .production-section-heading { margin-bottom: 4px; }
+#shot-production-workspace .production-stage-shell .production-version-section .version-item video { height: 40px; }
+.storyboard-quality-diagnostics { max-height: 108px; }
+.production-filmstrip .timeline-shot { flex-basis: 64px; }
+.production-filmstrip .timeline-shot img,
+.production-filmstrip .timeline-shot video,
+.production-filmstrip .timeline-shot > div { height: 44px; }
+.production-filmstrip .production-timeline { padding: 8px; }
+.production-filmstrip .timeline-shot > span:last-child { font-size: 9px; }
+
+/* Tighter top chrome so the picture earns the viewport. */
+.storyboard-quality-diagnostics { max-height: 64px; }
+.production-workspace-toolbar { padding: 6px 10px; min-height: 0; }
+#shot-production-workspace .production-toolbar-title h3 { font-size: 15px; }
+#shot-production-workspace .production-toolbar-title { gap: 7px; }
+.production-workspace-toolbar .production-project-tools { padding-top: 6px; }
+#shot-production-workspace .production-stage-shell .production-version-section { bottom: 50px; max-height: 88px; }
+.production-notices { gap: 5px; margin-bottom: 8px; }
+#shot-production-workspace .production-stage-shell { min-height: 0; }
+#shot-production-workspace .production-inspector[data-inspector="generate"] .production-notices,
+#shot-production-workspace .production-inspector[data-inspector="assets"] .production-notices { display: none; }
+#shot-production-workspace .production-stage-shell .production-version-section { bottom: 102px; }
+
+/* Collapse the empty top chrome: one toolbar row, no decorative label, no empty action well. */
+body:has(#page-shots.active) .steps#step-nav { min-height: 36px; padding: 4px 12px; }
+#page-shots { padding-top: 6px; }
+#shot-production-workspace { grid-template-columns: minmax(0, 1fr); min-width: 0; padding-top: 0; }
+#shot-production-workspace::before { display: none; content: none; }
+#shot-production-workspace .production-workspace-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  min-height: 0;
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--production-border);
+  border-radius: 8px;
+}
+#shot-production-workspace .production-toolbar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  flex: 0 1 auto;
+}
+#shot-production-workspace .production-toolbar-title h3 { font-size: 15px; }
+#shot-production-workspace .production-context-actions {
+  flex: 0 0 auto;
+  justify-content: flex-start;
+  flex-wrap: nowrap;
+}
+#shot-production-workspace .production-context-scope { max-width: 180px; }
+#shot-production-workspace .production-project-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+  min-width: 0;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+}
+#shot-production-workspace .production-project-tools .production-toolbar-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+#shot-production-workspace .production-project-tools .production-toolbar-actions .btn-secondary { width: auto; }
+#shot-production-workspace .production-project-tools-note { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+#shot-production-workspace .production-preview-header {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 2;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+#shot-production-workspace .production-stage-shell .production-preview { padding-top: 8px; }

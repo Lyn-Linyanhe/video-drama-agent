@@ -4,7 +4,7 @@ import {readFile} from 'node:fs/promises';
 const studio = await readFile(new URL('../studio.html', import.meta.url), 'utf8');
 assert.match(
   studio,
-  /\/static\/js\/bootstrap\.js\?v=20260820-asset-review-fallback-1/,
+  /\/static\/js\/bootstrap\.js\?v=20260906-reasonable-expansion-1/,
   'the script progress UI must invalidate the browser module cache',
 );
 

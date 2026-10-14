@@ -139,7 +139,16 @@ class DramaState:
     """Whether final assembly burns dialogue subtitles into the video."""
 
     subtitle_mode: str = "dialogue"
-    """Final subtitle mode: off, dialogue, or speaker."""
+    """Final subtitle mode: off, dialogue, speaker, narration, or all."""
+
+    subtitle_style: dict = field(default_factory=dict)
+    """Subtitle burn-in style overrides (font, size, colour, outline, margin)."""
+
+    subtitle_narration_text: str = ""
+    """Narration/voiceover text used when narration subtitles are enabled."""
+
+    subtitle_path: str = ""
+    """Last SRT written for this project, so a burn can be reproduced."""
 
     assembly_audio_override: str = ""
     """One-shot final-assembly override, e.g. explicit no-dialogue confirmation."""

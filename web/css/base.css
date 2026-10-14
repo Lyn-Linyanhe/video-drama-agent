@@ -448,3 +448,134 @@
   .status-dot.green { background: #10b981; }
   .status-dot.yellow { background: #f59e0b; }
   .status-dot.gray { background: #71717a; }
+
+  /* Graphite Stage shell: a compact creator workspace around the existing
+     renderer contracts. */
+  :root {
+    --stage-bg: #0b0f12;
+    --stage-sidebar: #10171b;
+    --stage-panel: #151b20;
+    --stage-raised: #1d272d;
+    --stage-border: #2c3a42;
+    --stage-border-strong: #40515c;
+    --stage-text: #edf2f4;
+    --stage-muted: #93a2aa;
+    --stage-subtle: #6d7c84;
+    --stage-accent: #20c7a5;
+    --stage-accent-soft: rgba(32, 199, 165, .14);
+    --stage-blue: #70d6ff;
+    --stage-warning: #f3bd62;
+    --stage-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  }
+
+  html { background: var(--stage-bg); }
+  body {
+    background:
+      radial-gradient(circle at 78% -12%, rgba(32, 199, 165, .07), transparent 32rem),
+      var(--stage-bg);
+    color: var(--stage-text);
+    letter-spacing: 0;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #0e1418; }
+  ::-webkit-scrollbar-thumb { background: #33434b; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #4c626c; }
+
+  .sidebar {
+    width: 184px;
+    background: var(--stage-sidebar);
+    border-right-color: var(--stage-border);
+    box-shadow: 12px 0 32px rgba(0, 0, 0, .12);
+  }
+  .sidebar-brand { padding: 18px 16px 16px; border-bottom-color: var(--stage-border); }
+  .sidebar-brand > div:first-child {
+    color: var(--stage-text) !important;
+    background: none !important;
+    -webkit-text-fill-color: currentColor !important;
+    letter-spacing: .01em;
+  }
+  .sidebar-brand > div:first-child::before {
+    content: '◈'; display: inline-block; margin-right: 8px;
+    color: var(--stage-accent); font-size: 13px;
+  }
+  .sidebar-brand > div:last-child { color: var(--stage-subtle) !important; }
+  .sidebar-nav { padding: 14px 10px; }
+  .sidebar-nav a {
+    margin: 3px 0; padding: 10px 12px; border: 1px solid transparent;
+    border-left-width: 2px; border-radius: 6px; color: var(--stage-muted); font-size: 12px;
+  }
+  .sidebar-nav a:hover, .sidebar-nav a.active {
+    color: var(--stage-text); background: var(--stage-accent-soft);
+    border-color: rgba(32, 199, 165, .22); border-left-color: var(--stage-accent);
+  }
+  .sidebar-footer {
+    padding: 12px 16px; border-top-color: var(--stage-border); color: var(--stage-subtle);
+    font-family: var(--stage-mono); font-size: 10px;
+  }
+  .main { margin-left: 184px; }
+  .steps {
+    min-height: 58px; padding: 10px 22px; background: rgba(16, 23, 27, .94);
+    border-bottom-color: var(--stage-border); box-shadow: 0 5px 24px rgba(0, 0, 0, .14);
+    backdrop-filter: blur(14px);
+  }
+  .step-item {
+    padding: 6px 10px; border: 1px solid transparent; border-radius: 5px;
+    color: var(--stage-subtle); font-size: 11px;
+  }
+  .step-item.done { color: #8bd7c5; }
+  .step-item.active { color: var(--stage-text); background: var(--stage-accent-soft); border-color: rgba(32, 199, 165, .3); }
+  .step-divider { border-color: var(--stage-border-strong); }
+  .step-divider.done { border-color: var(--stage-accent); }
+  .project-jobs-trigger { border-color: var(--stage-border-strong); background: var(--stage-raised); color: var(--stage-text); font-family: var(--stage-mono); }
+  .project-jobs-count { background: var(--stage-accent); color: #061a16; }
+  .page { padding: 22px; }
+  .card { background: var(--stage-panel); border-color: var(--stage-border); border-radius: 8px; box-shadow: 0 10px 30px rgba(0, 0, 0, .08); }
+  .card:hover { border-color: rgba(32, 199, 165, .62); }
+  .btn-primary { background: var(--stage-accent); color: #061a16; border-radius: 6px; box-shadow: none; }
+  .btn-primary:hover { transform: translateY(-1px); background: #48d5b9; box-shadow: 0 6px 18px rgba(32, 199, 165, .18); }
+  .btn-secondary { background: var(--stage-raised); color: var(--stage-muted); border-color: var(--stage-border-strong); border-radius: 6px; }
+  .btn-secondary:hover { background: #26343b; color: var(--stage-text); border-color: var(--stage-accent); }
+  input[type="text"], input[type="password"], input[type="url"], input[type="number"], textarea, select { background: #0e1418; border-color: var(--stage-border-strong); border-radius: 6px; color: var(--stage-text); }
+  input:focus, textarea:focus, select:focus { border-color: var(--stage-accent); box-shadow: 0 0 0 3px var(--stage-accent-soft); }
+  button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--stage-blue); outline-offset: 2px; }
+  .grid-cards { gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  .project-card { min-height: 190px; padding: 16px; cursor: pointer; display: flex; flex-direction: column; }
+  .project-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .project-card-kicker { display: block; color: var(--stage-accent); font: 9px/1.2 var(--stage-mono); letter-spacing: .12em; }
+  .project-card h4 { margin: 6px 0 0; color: var(--stage-text); font-size: 15px; font-weight: 650; }
+  .project-card-status { flex: 0 0 auto; padding: 3px 7px; border: 1px solid var(--stage-border-strong); border-radius: 4px; color: var(--stage-muted); font: 10px/1.2 var(--stage-mono); }
+  .project-card-status.is-complete { color: #8be3c9; border-color: rgba(32, 199, 165, .42); background: var(--stage-accent-soft); }
+  .project-card-description { min-height: 38px; margin: 16px 0 12px; color: var(--stage-muted); font-size: 12px; line-height: 1.55; }
+  .project-card-meta { display: flex; flex-wrap: wrap; gap: 6px; color: var(--stage-subtle); font-size: 10px; }
+  .project-card-meta span { padding: 3px 6px; border: 1px solid var(--stage-border); border-radius: 4px; background: #11191d; }
+  .project-card-meta time { margin-left: auto; padding-top: 4px; font-family: var(--stage-mono); }
+  .project-card-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; padding-top: 14px; border-top: 1px solid rgba(64, 81, 92, .5); }
+  .project-card-open { color: #b7f4e5; font-size: 12px; font-weight: 600; }
+  .project-card-actions { display: flex; gap: 4px; }
+  .project-card-actions .danger { color: #f3a5a5; }
+  .tag { background: #172126; border-color: var(--stage-border); color: var(--stage-muted); border-radius: 5px; }
+  .tag.selected { background: var(--stage-accent-soft); border-color: var(--stage-accent); color: #b7f4e5; }
+  .modal-overlay { background: rgba(4, 8, 10, .78); backdrop-filter: blur(8px); }
+  .modal { background: var(--stage-panel); border-color: var(--stage-border-strong); border-radius: 10px; }
+  .project-jobs-drawer { width: min(420px, calc(100vw - 184px)); background: #10171b; border-left-color: var(--stage-border); }
+  .project-job-state.running, .project-job-state.validating, .project-job-state.queued { color: #a7e6f7; background: rgba(112, 214, 255, .12); }
+  .project-job-state.succeeded { color: #8be3c9; background: var(--stage-accent-soft); }
+  .api-progress { border-color: var(--stage-accent); background: var(--stage-panel); }
+  .api-progress-fill { background: var(--stage-accent); }
+  .spin { border-color: var(--stage-border-strong); border-top-color: var(--stage-accent); }
+
+  @media (max-width: 760px) {
+    .sidebar { position: sticky; top: 0; width: 100%; height: auto; min-height: 0; flex-direction: row; align-items: stretch; overflow-x: auto; z-index: 120; }
+    .sidebar-brand { display: none; }
+    .sidebar-nav { display: flex; flex: 1; padding: 6px; gap: 4px; overflow-x: auto; }
+    .sidebar-nav a { flex: 0 0 auto; margin: 0; padding: 9px 11px; border-left-width: 1px; }
+    .sidebar-footer { display: none; }
+    .main { margin-left: 0; }
+    .steps { position: sticky; top: 48px; z-index: 110; overflow-x: auto; white-space: nowrap; }
+    .page { padding: 14px; }
+    .project-jobs-drawer { width: min(420px, 100vw); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
+  }

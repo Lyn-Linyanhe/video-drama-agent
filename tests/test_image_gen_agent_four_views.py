@@ -480,3 +480,49 @@ if __name__ == "__main__":
     test_missing_character_asset_can_start_from_an_editable_draft()
     test_legacy_english_key_uses_the_saved_chinese_character_description()
     print("four-view-image-tests-ok")
+
+
+def test_character_anchor_does_not_duplicate_name_or_period():
+    # 外观描述本身以角色名开头且自带句号；锚点拼接不得造成
+    # "杨氏子，杨氏子，……浅痣。。"式重复。
+    from src.agents.image_gen_agent import build_character_image_prompt
+
+    description = "杨氏子，男，约七八岁，身形瘦小挺直。黑发梳成双总角，左眉尾有一粒浅痣。"
+    prompt = build_character_image_prompt("杨氏子", description, "front_half", art_style="电影级真人写实")
+
+    assert "杨氏子，杨氏子" not in prompt
+    assert "。。" not in prompt
+    assert "杨氏子，男，约七八岁" in prompt
+
+
+def test_character_style_layer_does_not_force_adult_proportions():
+    # 项目含儿童角色（杨氏子约七八岁）；风格执行层不得硬性要求成人比例。
+    from src.services.visual_styles import get_visual_style
+
+    for style_id in ("live_action_cinematic", "semi_realistic_anime"):
+        layer = get_visual_style(style_id)["prompt_layers"]["character"]
+        assert "成年人体比例" not in layer
+        assert "年龄" in layer
+
+
+def test_character_negative_prompt_has_no_duplicate_terms():
+    from src.agents.image_gen_agent import build_character_negative_prompt
+
+    negative = build_character_negative_prompt("front_half", art_style="电影级真人写实")
+    terms = [term.strip() for term in negative.replace("，", ",").split(",") if term.strip()]
+    assert len(terms) == len(set(terms)), [t for t in terms if terms.count(t) > 1]
+    assert negative.endswith(("换服装", "手办质感")) or not negative.endswith("，")
+
+
+def test_prop_view_prompt_has_no_double_period():
+    # 道具描述自带句号时，模板不得再补一个（"……叙事道具。。"）。
+    from src.agents.image_gen_agent import build_prop_view_prompt
+
+    prompt = build_prop_view_prompt(
+        "一盘鲜红杨梅",
+        "素色白瓷浅盘，盛放鲜红杨梅十余颗，是全片的关键叙事道具。",
+        "front",
+        style="电影级真人写实",
+    )
+    assert "。。" not in prompt
+    assert "关键叙事道具。" in prompt

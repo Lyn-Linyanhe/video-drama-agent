@@ -364,6 +364,8 @@ def test_uploaded_or_active_image_visual_review_is_explicit_and_does_not_replace
     assert Path(active_path).is_file()
     assert api_context._load_project_state(project_id).prop_images.props[0].version_id == active_version
     assert response.json()["review"]["review_verdict"] == "passed"
+    reviewed_active = next(item for item in response.json()["history"] if item.get("active"))
+    assert reviewed_active["quality_report"]["automatic_reference_allowed"] is True
 
     upload_path = _detailed_png(tmp_path / "uploaded.png", (300, 300))
     uploaded = client.post(
@@ -693,3 +695,32 @@ def test_review_endpoint_normalizes_warning_and_skipped_verdicts(tmp_path, monke
         reviewed = next(item for item in history if item.get("quality_report", {}).get("visual_review") == visual)
         verdict = reviewed["quality_report"]["review_verdict"]
         assert verdict in {"passed", "warning", "hard_fail", "unreviewed"}
+
+
+@pytest.mark.asyncio
+async def test_explicit_visual_review_grants_automatic_reference_after_unreviewed_asset(tmp_path, monkeypatch):
+    client, project_id = _client(tmp_path, monkeypatch)
+    generated = client.post(f"/api/projects/{project_id}/assets/prop/old_key/generate", json={})
+    assert generated.status_code == 200
+
+    manifest_path = api_context.project_store.get_project_dir(project_id) / "assets" / "asset_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = manifest["versions"]["prop:old_key:front"]
+    records[0]["quality_report"] = {
+        "status": "unreviewed",
+        "review_verdict": "unreviewed",
+        "automatic_reference_allowed": False,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    async def review(*_args, **_kwargs):
+        return {"status": "passed", "passed": True, "review_verdict": "passed", "issues": []}
+
+    monkeypatch.setattr("src.api.routes.assets.review_image_subjective", review)
+    response = client.post(
+        f"/api/projects/{project_id}/image-history/review",
+        json={"asset_type": "prop", "asset_id": "old_key", "view_type": "front"},
+    )
+    assert response.status_code == 200
+    active = next(item for item in response.json()["history"] if item.get("active"))
+    assert active["quality_report"]["automatic_reference_allowed"] is True

@@ -105,6 +105,7 @@ DYNAMIC_ENVIRONMENT_CUES = {
     "走入", "走出", "走上", "走下", "跑入", "跑出", "冲入", "冲出",
     "离开", "退出", "返回", "回到", "踏入", "踏出", "跨过", "奔向", "奔入",
     "爬上", "爬下", "钻入", "钻出",
+    "身影", "渐渐变小", "走远", "放缓", "脚步渐渐",
     # Narrative state, sound and preparation cues must not become reusable set
     # dressing. The static noun can still be recovered from a mixed clause.
     "生怕", "准备", "声音", "响起", "传来", "脚步声", "掌声", "录音", "通话", "对白",
@@ -194,6 +195,23 @@ PLOT_PROP_PATTERNS = {
     "medicine_bottle": ("药瓶", "medicine bottle", "plot"),
     "jade_pendant": ("玉佩", "jade pendant", "identity"),
     "ledger": ("账本", "ledger", "plot"),
+    # The gift objects in "麦琪的礼物" are not covered by the generic
+    # "手表"/"项链" vocabulary. Keep their aliases narrow so that a
+    # generic "表" or the verb "梳起头发" does not create false props.
+    "watch_chain": ("白金表链", "platinum watch chain", "plot"),
+    "tortoiseshell_comb": ("玳瑁发梳", "tortoiseshell hair comb set", "plot"),
+}
+PLOT_PROP_ALIASES = {
+    "watch_chain": ("表链", "白金表链", "白金链"),
+    "tortoiseshell_comb": ("发梳", "玳瑁梳", "整套发梳", "全套发梳"),
+}
+PLOT_PROP_DESCRIPTIONS = {
+    "watch_chain": (
+        "细长银白色白金表链，链节精细，链扣和长度保持一致；不得变成金黄色手表或普通项链。"
+    ),
+    "tortoiseshell_comb": (
+        "全套玳瑁发梳，深棕琥珀色斑纹，梳齿完整，保持成套轮廓；不得变成单把塑料梳或发夹。"
+    ),
 }
 
 
@@ -961,10 +979,32 @@ def _is_generic_character_description(value: str, name: str = "") -> bool:
     return not bool(_character_appearance_facts(text))
 
 
+def _plot_prop_default_description(name: str) -> str:
+    """Return the production-safe default description for a known plot prop."""
+    target = normalize_scene_name(name)
+    for prop_key, (canonical_name, _english_name, _reason) in PLOT_PROP_PATTERNS.items():
+        if target == normalize_scene_name(canonical_name):
+            return PLOT_PROP_DESCRIPTIONS.get(prop_key, "")
+    return ""
+
+
 def _is_generic_prop_description(value: str) -> bool:
     text = str(value or "").strip()
     if not text:
         return True
+    # The known plot-prop defaults are intentional production descriptions,
+    # not placeholders. Keep them intact across legacy-state enrichment.
+    if text in {str(item).strip() for item in PLOT_PROP_DESCRIPTIONS.values() if str(item).strip()}:
+        return False
+    # Also recognize the legacy ``name：<default>`` form.
+    if any(
+        text == f"{canonical_name}：{description}"
+        or text == f"{canonical_name}:{description}"
+        for prop_key, (canonical_name, _english_name, _reason) in PLOT_PROP_PATTERNS.items()
+        for description in [PLOT_PROP_DESCRIPTIONS.get(prop_key, "")]
+        if description
+    ):
+        return False
     # Very short placeholders are emitted by older analyzers without the
     # longer ``关键道具``/``保持一致`` marker phrases handled below.
     if normalize_scene_name(text) in {"道具", "物品", "实体道具", "prop", "plot prop"}:
@@ -987,6 +1027,11 @@ def _generated_prop_description_needs_repair(
         return False
     suffix = text[len(prefix):] if text.startswith(prefix) else text[len(legacy_prefix):]
     suffix = suffix.strip().strip("。")
+    # A detailed human/default description is valid even when the current
+    # script does not contain extractable physical-detail phrases. Do not
+    # downgrade it to the generic fallback merely because ``facts`` is empty.
+    if not facts and not _is_generic_prop_description(value):
+        return False
     expected = "；".join(facts)
     return suffix != expected
 
@@ -1203,6 +1248,11 @@ def _character_is_visible_in_scene(scene, name: str) -> bool:
     if len(visible_characters) == 1:
         return clean_name == visible_characters[0]
 
+    # 剧本已声明该角色在本场出镜，但文本可能只用"孩子/他"等泛称指代
+    # （杨氏子在场景 7/11 里从未被点名）。泛称存在说明有未归属的出场者，
+    # 纳入声明的缺失角色；泛称也没有则维持排除（如尚未出场的未来角色）。
+    if re.search(r"孩子|男孩|女孩|男人|女人|老者|来客|对方|那人|他|她", _scene_text(scene)):
+        return True
     return False
 
 
@@ -1488,14 +1538,20 @@ def build_manifest_from_scenes(
     for scene in script.scenes:
         text = _scene_visual_text(scene)
         for prop_key, (cn_name, english_name, reason) in PLOT_PROP_PATTERNS.items():
+            aliases = PLOT_PROP_ALIASES.get(prop_key, ())
             has_alias = prop_key == "letter" and (
                 any(alias in text for alias in ("信封", "信件"))
                 or bool(re.search(r"[一二三四五六七八九十百零两0-9]+封(?:旧)?信", text))
             )
-            if cn_name in text or english_name.casefold() in text.casefold() or has_alias:
+            has_named_match = any(
+                term and term.casefold() in text.casefold()
+                for term in (cn_name, english_name, *aliases)
+            )
+            if has_named_match or has_alias:
                 prop_scene_ids.setdefault(prop_key, set()).add(scene.scene_id)
                 prop_name_by_key[prop_key] = cn_name
                 prop_reason_by_key[prop_key] = reason
+                prop_aliases_by_key[prop_key] = list(aliases)
 
     # Compact providers intentionally omit the full manifest to reduce latency,
     # but they can still return a small, evidence-backed list of novel physical
@@ -1562,7 +1618,7 @@ def build_manifest_from_scenes(
         name = prop_name_by_key[prop_key]
         prop_id = _stable_asset_id("prop", prop_key)
         prop_id_by_key[prop_key] = prop_id
-        description = prop_description_by_key.get(prop_key) or (
+        description = prop_description_by_key.get(prop_key) or PLOT_PROP_DESCRIPTIONS.get(prop_key) or (
             f"{name}作为跨镜头可见线索道具，外观、位置和持有状态需要保持一致。"
         )
         critical_reason = prop_reason_by_key.get(prop_key, "plot")
@@ -2021,7 +2077,8 @@ def enrich_manifest_descriptions(
         if facts:
             prop.description = f"{prop.name}：{'；'.join(facts)}。"
         else:
-            prop.description = (
+            default_description = _plot_prop_default_description(prop.name)
+            prop.description = default_description or (
                 f"{prop.name}：单一实体道具；保持同一轮廓、材质、颜色、尺寸比例和可见状态，"
                 "不添加文字、水印或其他道具。"
             )
@@ -2042,7 +2099,20 @@ def enrich_manifest_descriptions(
             legacy_fragments,
             known_character_names,
         )
-        if cleaned_environment:
+        existing_identity = str(location.identity_description or "").strip()
+        existing_dressing_preview = str(location.fixed_dressing or "").strip()
+        curated_environment = bool(
+            existing_identity
+            and not _has_voice_or_action_cue(existing_identity)
+            and (
+                existing_dressing_preview
+                and not _has_voice_or_action_cue(existing_dressing_preview)
+            )
+        )
+        if curated_environment and not _has_voice_or_action_cue(existing_environment):
+            # 手工整理的地点身份/陈设是权威数据：不再把场景动作句推断成环境层。
+            environment = existing_environment or existing_identity
+        elif cleaned_environment:
             environment = _merge_environment_text(cleaned_environment, inferred_environment)
         elif existing_environment and not _has_voice_or_action_cue(existing_environment) and not (
             "可复用固定空间" in existing_environment or "固定空间" in existing_environment
@@ -2051,7 +2121,7 @@ def enrich_manifest_descriptions(
             # outside the deterministic vocabulary.
             environment = existing_environment
         else:
-            environment = inferred_environment
+            environment = inferred_environment if not _has_voice_or_action_cue(inferred_environment) else existing_identity
 
         # Keep all three reusable location fields on the same deterministic
         # cleaning path.  Previously this block was guarded by ``if
@@ -2075,26 +2145,37 @@ def enrich_manifest_descriptions(
         ):
             location.fixed_dressing = environment
 
-        clean_anchors: list[str] = []
-        for anchor in location.anchor_points or []:
-            cleaned_anchor = _clean_environment_description(
-                anchor,
-                location_scenes,
-                legacy_fragments,
-                known_character_names,
-            )
-            candidate = cleaned_anchor or (
-                str(anchor).strip()
-                if not _is_legacy_dynamic_fragment(str(anchor), legacy_fragments)
-                and not _has_voice_or_action_cue(str(anchor))
-                and any(term in str(anchor) for term in STATIC_ENVIRONMENT_TERMS)
-                else ""
-            )
-            if candidate:
-                clean_anchors.extend(_description_clauses(candidate))
-        location.anchor_points = list(dict.fromkeys(
-            clean_anchors + _stable_location_anchor_points(environment)
-        ))[:6]
+        existing_anchors = [str(a).strip() for a in (location.anchor_points or []) if str(a).strip()]
+        curated_static = bool(existing_anchors) and not any(
+            _has_voice_or_action_cue(anchor)
+            or _contains_legacy_dynamic_fragment(anchor, legacy_fragments)
+            for anchor in existing_anchors
+        )
+        if curated_static:
+            # 手工整理的静态空间锚点是权威数据：既不重清洗（短名词会被
+            # 瞬时词/道具名过滤误杀），也不并入场景文本派生的动态句。
+            location.anchor_points = existing_anchors[:6]
+        else:
+            clean_anchors: list[str] = []
+            for anchor in location.anchor_points or []:
+                cleaned_anchor = _clean_environment_description(
+                    anchor,
+                    location_scenes,
+                    legacy_fragments,
+                    known_character_names,
+                )
+                candidate = cleaned_anchor or (
+                    str(anchor).strip()
+                    if not _is_legacy_dynamic_fragment(str(anchor), legacy_fragments)
+                    and not _has_voice_or_action_cue(str(anchor))
+                    and any(term in str(anchor) for term in STATIC_ENVIRONMENT_TERMS)
+                    else ""
+                )
+                if candidate:
+                    clean_anchors.extend(_description_clauses(candidate))
+            location.anchor_points = list(dict.fromkeys(
+                clean_anchors + _stable_location_anchor_points(environment)
+            ))[:6]
 
         identity = str(location.identity_description or "").strip()
         if _location_identity_needs_repair(identity, location.canonical_name, environment, location_scenes):
